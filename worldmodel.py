@@ -13,6 +13,7 @@ class Object:
 class Position:
     x: float
     y: float
+    z: float
 
 @dataclass
 class Object:

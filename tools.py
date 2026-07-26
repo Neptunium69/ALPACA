@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import worldmodel as wm
-from dataclasses import dataclass
+from . import worldmodel as wm
+from . import vehicleadapter as va
+from dataclasses import dataclass,fields
 from typing import Any
+import rospy
 
 command_list=["query","robot_state","write","observe","scan","navigate","inspect","ask_user","finish"]
 
@@ -20,8 +22,9 @@ class Return:
     results: dict[str, Any]
 
 class ToolExecutor:
-    def __init__(self, model: wm.WorldModel) -> None:
+    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter) -> None:
         self.model = model
+        self.adapter = adapter
 
     def execute(self, commands: list[Command]) -> list[Return]:
         results=[]
@@ -73,7 +76,11 @@ class ToolExecutor:
             results={"Objects Found": objects},
         )
     def _tool_robot_state(self, command: Command) -> Return:
-        return Return(id=command.id, command_type=command.command_type, status="Success", results={"Placeholder":None})
+        state=self.adapter.get_state()
+        rv=Return(id=command.id, command_type=command.command_type, status="Success", results={})
+        for field in fields(state):
+            rv.results[field.name] = getattr(state, field.name)
+        return rv
 
     def _tool_write(self, command: Command) -> Return:
         object_data = command.arguments.get("object")
@@ -144,5 +151,30 @@ class ToolExecutor:
             status="Success",
             results={"Object Written": world_object},
         )
+    def _tool_scan(self, command: Command) -> Return:
+        try:
+            self.adapter.scan()
+        except rospy.ROSInterruptException as error:
+            return Return(
+                id=command.id,
+                command_type=command.command_type,
+                status="Interrupted",
+                results={"Reason": str(error)},
+            )
+        except Exception as error:
+            return Return(
+                id=command.id,
+                command_type=command.command_type,
+                status="Failed",
+                results={"Error": str(error)},
+            )
+
+        return Return(
+            id=command.id,
+            command_type=command.command_type,
+            status="Success",
+            results={"Scan": "Completed"},
+        )
+    
 
 
