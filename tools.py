@@ -91,7 +91,22 @@ class ToolExecutor:
             world_object = object_data
         elif isinstance(object_data, dict):
             try:
-                world_object = wm.Object(**object_data)
+                position_data = object_data.get("position")
+                if isinstance(position_data, dict):
+                    position = wm.Position(**position_data)
+                elif isinstance(position_data, wm.Position):
+                    position = position_data
+                else:
+                    raise TypeError(
+                        "position must be a Position instance or a position dictionary"
+                    )
+
+                world_object = wm.Object(
+                    **{
+                        **object_data,
+                        "position": position,
+                    }
+                )
             except TypeError as error:
                 return Return(
                     id=command.id,
@@ -122,6 +137,7 @@ class ToolExecutor:
         if (
             not isinstance(world_object.id, str)
             or not isinstance(world_object.class_name, str)
+            or not isinstance(world_object.position, wm.Position)
             or not isinstance(world_object.attributes, dict)
             or not all(
                 isinstance(name, str) for name in world_object.attributes
@@ -179,5 +195,4 @@ class ToolExecutor:
             results={"Scan": "Completed"},
         )
     
-
 

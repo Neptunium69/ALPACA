@@ -33,6 +33,9 @@ class YOLOAdapter():
         self.synchronizer.registerCallback(self._image_callback)
         rospy.spin()
 
+    def get_classes(self):
+        return list(self.model.names.values())
+    
     def _load_model(self, model_path: str) -> YOLO:
         model=YOLO(model_path)
         return model
