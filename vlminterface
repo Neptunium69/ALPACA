@@ -1,1 +1,22 @@
-# placeholder for vlminterface
+# This is where the VLM actually runs
+from dataclasses import dataclass
+
+import rospy
+
+
+class VLMInterface():
+    def __init__(self,system_prompt_think,system_prompt_act):
+        self.system_prompt_act=system_prompt_act
+        self.system_prompt_think=system_prompt_think
+
+    def init_vlm():
+        rospy.init_node("vlm_interface_node",anonymous=True)
+
+    def _load_model():
+        pass
+
+    def _predict():
+        pass
+
+    def _callback():
+        pass

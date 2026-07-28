@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from . import worldmodel as wm
 from . import vehicleadapter as va
+from . import risk as rcm
 from dataclasses import dataclass,fields
 from typing import Any
 import rospy
@@ -22,9 +23,10 @@ class Return:
     results: dict[str, Any]
 
 class ToolExecutor:
-    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter) -> None:
+    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal) -> None:
         self.model = model
         self.adapter = adapter
+        self.risk=riskcalibration
 
     def execute(self, commands: list[Command]) -> list[Return]:
         results=[]
@@ -153,6 +155,7 @@ class ToolExecutor:
         )
     def _tool_scan(self, command: Command) -> Return:
         try:
+            self.risk.inspect(command)
             self.adapter.scan()
         except rospy.ROSInterruptException as error:
             return Return(
