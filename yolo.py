@@ -1,9 +1,10 @@
 from std_msgs.msg import String
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image,CameraInfo
 from nav_msgs.msg import Odometry
 
 import message_filters
 import numpy as np
+from math import sqrt
 
 from ultralytics import YOLO
 import cv2
@@ -13,22 +14,22 @@ import rospy
 import json
 
 class YOLOAdapter():
-    def __init__(self, model_path: str, image_topic: str = "camera_color", depth_topic: str = "camera_depth"):
+    def __init__(self, model_path: str, cammountpos: tuple=(0.15, 0.0, 0.0), cammountrot: tuple=(0.0, np.deg2rad(20), 0.0)):
         self.model_path = model_path
         self.model = self._load_model(model_path)
-        self.image_topic = image_topic
-        self.depth_topic = depth_topic
-
+        self.cammountpos=np.asarray(cammountpos,dtype=float).reshape(3)
+        self.cammountrot=np.asarray(cammountrot,dtype=float).reshape(3)
     def init_yolo(self):
         rospy.init_node("yolo_node", anonymous=True)
         self.rate = rospy.Rate(15)
         self.publisher = rospy.Publisher("yolo_detections",String,queue_size=1)
         self.bridge = CvBridge()
 
-        self.color_subscriber = message_filters.Subscriber(self.image_topic, Image, queue_size=1)
-        self.depth_subscriber = message_filters.Subscriber(self.depth_topic, Image, queue_size=1)
+        self.color_subscriber = message_filters.Subscriber("camera_color", Image, queue_size=1)
+        self.camera_info_subscriber = message_filters.Subscriber("camera_info", CameraInfo, queue_size=1)
+        self.depth_subscriber = message_filters.Subscriber("camera_depth", Image, queue_size=1)
         self.pose_subscriber=message_filters.Subscriber("vehicle_pose",Odometry,queue_size=1)
-        self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber, self.depth_subscriber,self.pose_subscriber], queue_size=10, slop=0.05)
+        self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber, self.depth_subscriber,self.pose_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         self.synchronizer.registerCallback(self._image_callback)
         rospy.spin()
 
@@ -39,7 +40,7 @@ class YOLOAdapter():
     def _tometer(self, depth_value: float, encoding:str) -> float:
         """Convert depth value to meters."""
         encoding = encoding.lower()
-        if encoding in ["16uc1","mono16"]:
+        if encoding == "16uc1":
             return depth_value.astype(np.float32) / 1000.0  # Assuming depth is in millimeters
         elif encoding=="32fc1":
             return depth_value.astype(np.float32)  # Already in meters
@@ -47,7 +48,7 @@ class YOLOAdapter():
             raise ValueError("Unsupported depth image format")
 
     def _get_distance(self, depth, box,depth_encoding):
-        """Get distance to the object based on the bounding box and depth image."""
+        """Get depth to the object based on the bounding box and depth image."""
         height, width = depth.shape[:2]
         x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
 
@@ -70,45 +71,146 @@ class YOLOAdapter():
         cropped_depth = depth[cropped_y1:cropped_y2, cropped_x1:cropped_x2]
         cropped_depth = self._tometer(cropped_depth,depth_encoding)
 
-        samples = cropped_depth.flatten()
+        valid_mask = np.isfinite(cropped_depth) & (cropped_depth > 0.1) & (cropped_depth < 10.0)
+        valid_y, valid_x = np.nonzero(valid_mask)
+        valid_depth = cropped_depth[valid_mask]
+        if valid_depth.size == 0:
+            return None
 
-        valid = samples[np.isfinite(samples) & (samples > 0.1) & (samples < 10.0)] # extract valid depth values between 0.1 and 10 meters(10 meters is D435 depth camera's maximum range)
-        return float(np.median(valid)) if valid.size > 0 else None # return the median of valid depth values, or None if no valid values are found
+        median_depth = np.median(valid_depth)
+        sample_index = np.lexsort(((valid_x-cropped_depth.shape[1]/2)**2+(valid_y-cropped_depth.shape[0]/2)**2, np.abs(valid_depth-median_depth)))[0]
+        return (
+            float(valid_depth[sample_index]),
+            int(cropped_x1 + valid_x[sample_index]),
+            int(cropped_y1 + valid_y[sample_index]),
+        )
 
-    def _image_callback(self, color_msg, depth_msg, pose_msg):
+    def _image_callback(self, color_msg, depth_msg, pose_msg, camera_info_msg):
         try:
             frame=self.bridge.imgmsg_to_cv2(color_msg,desired_encoding="bgr8")
             depth=self.bridge.imgmsg_to_cv2(depth_msg,desired_encoding="passthrough")
+            color_height,color_width=frame.shape[:2]
+            depth_height,depth_width=depth.shape[:2]
+
+            # Validations
+            if color_msg.header.frame_id != depth_msg.header.frame_id:
+                raise ValueError("Color and aligned-depth frames do not match")
+            if pose_msg.child_frame_id != "base_link":
+                rospy.logwarn(f"Unexpected body frame: {pose_msg.child_frame_id}")
+                return
+            if (color_width,color_height)!=(depth_width,depth_height):
+                raise ValueError("Color and aligned-depth dimensions do not match")
+            if (camera_info_msg.width,camera_info_msg.height)!=(depth_width,depth_height):
+                raise ValueError("CameraInfo and aligned-depth dimensions do not match")
+            if camera_info_msg.header.frame_id!=depth_msg.header.frame_id:
+                raise ValueError("CameraInfo and aligned-depth frame IDs do not match")
+            if not pose_msg.header.frame_id:
+                raise ValueError("Vehicle pose frame ID is empty")
+
             results = self.model(frame,verbose=False)[0]
             output={
+                "header": {
+                    "frame_id": pose_msg.header.frame_id,
+                    "stamp": {
+                        "secs": int(depth_msg.header.stamp.secs),
+                        "nsecs": int(depth_msg.header.stamp.nsecs)
+                    }
+                },
                 "class_names": [],
                 "confidences": [],
-                "position":[]
+                "position":[],
+                "detection_distance": []
             }
 
             for box in results.boxes:
-                distance=self._get_distance(depth,box,depth_msg.encoding)
+                try:
+                    class_id = int(box.cls[0].item())
+                    class_name=results.names[class_id]
+                    confidence=box.conf[0].item()
+                except Exception as error:
+                    rospy.logwarn("Skipping invalid YOLO detection: %s",error)
+                    continue
 
-                current_x=pose_msg.pose.pose.position.x
-                current_y=pose_msg.pose.pose.position.y
-                current_z=pose_msg.pose.pose.position.z
-                q=pose_msg.pose.pose.orientation
-                roll,pitch,yaw=euler_from_quaternion([q.x,q.y,q.z,q.w])
+                target_pos=[None,None,None]
+                distance=None
 
-                if distance!=None:
-                    # Find the coordinates of the target.
-                    target_x=current_x+(np.cos(yaw)*distance)
-                    target_y=current_y+(np.sin(yaw)*distance)
-                    target_pos=(target_x,target_y)
-                else:
-                    target_pos=(None,None)
+                try:
+                    height, width = depth.shape[:2]
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
 
-                class_id = int(box.cls[0].item())
-                class_name=results.names[class_id]
-                confidence=box.conf[0].item()
+                    x1 = max(0, min(width - 1, int(x1)))
+                    y1 = max(0, min(height - 1, int(y1)))
+
+                    x2 = max(0, min(width, int(x2)))
+                    y2 = max(0, min(height, int(y2)))
+
+                    depth_sample=self._get_distance(depth,box,depth_msg.encoding)
+
+                    current_x=pose_msg.pose.pose.position.x
+                    current_y=pose_msg.pose.pose.position.y
+                    current_z=pose_msg.pose.pose.position.z
+                    q=pose_msg.pose.pose.orientation
+                    roll,pitch,yaw=euler_from_quaternion([q.x,q.y,q.z,q.w])
+
+                    if depth_sample is not None:
+                        # Find the coordinates of the target.
+                        Zc,u,v=depth_sample
+                        cx=camera_info_msg.K[2]
+                        cy=camera_info_msg.K[5]
+                        fx=camera_info_msg.K[0]
+                        fy=camera_info_msg.K[4]
+
+                        if fx==0 or fy==0:
+                            raise ValueError("Invalid fx or fy values")
+
+                        camera_matrix=np.asarray(camera_info_msg.K,dtype=np.float64).reshape(3,3)
+                        distortion=np.asarray(camera_info_msg.D,dtype=np.float64)
+                        pixel=np.asarray([[[u,v]]],dtype=np.float64)
+
+                        if distortion.size > 0 and np.any(np.abs(distortion) > 1e-12):
+                            if camera_info_msg.distortion_model in ["plumb_bob","rational_polynomial"]:
+                                undistorted_pixel=cv2.undistortPoints(pixel,camera_matrix,distortion)
+                            elif camera_info_msg.distortion_model=="equidistant":
+                                undistorted_pixel=cv2.fisheye.undistortPoints(pixel,camera_matrix,distortion[:4].reshape(4,1))
+                            else:
+                                raise ValueError(f"Unsupported distortion model: {camera_info_msg.distortion_model}")
+                            Xc=undistorted_pixel[0,0,0]*Zc
+                            Yc=undistorted_pixel[0,0,1]*Zc
+                        else:
+                            Xc=(u-cx)*Zc/fx
+                            Yc=(v-cy)*Zc/fy
+
+                        body_transform=np.array([[0,0,1],[-1,0,0],[0,-1,0]],dtype=float)
+                        camera_roll,camera_pitch,camera_yaw=self.cammountrot
+                        camera_rx=np.array([[1,0,0],[0,np.cos(camera_roll),-np.sin(camera_roll)],[0,np.sin(camera_roll),np.cos(camera_roll)]])
+                        camera_ry=np.array([[np.cos(camera_pitch),0,np.sin(camera_pitch)],[0,1,0],[-np.sin(camera_pitch),0,np.cos(camera_pitch)]])
+                        camera_rz=np.array([[np.cos(camera_yaw),-np.sin(camera_yaw),0],[np.sin(camera_yaw),np.cos(camera_yaw),0],[0,0,1]])
+                        body_transform=camera_rz@camera_ry@camera_rx@body_transform
+                        pc=np.array([Xc,Yc,Zc])
+                        pb=body_transform@pc+self.cammountpos
+
+                        distance = float(np.linalg.norm(pb))
+
+                        rx=np.array([[1,0,0],[0,np.cos(roll),-np.sin(roll)],[0,np.sin(roll),np.cos(roll)]])
+                        ry=np.array([[np.cos(pitch),0,np.sin(pitch)],[0,1,0],[-np.sin(pitch),0,np.cos(pitch)]])
+                        rz=np.array([[np.cos(yaw),-np.sin(yaw),0],[np.sin(yaw),np.cos(yaw),0],[0,0,1]])
+
+                        r=rz@ry@rx
+
+                        pw=r@pb
+
+                        pv=np.array([current_x,current_y,current_z],dtype=float)
+
+                        pt=pv+pw
+
+                        target_pos=pt.tolist()
+                except Exception as error:
+                    rospy.logwarn("Could not localize %s detection: %s",class_name,error)
+
                 output["class_names"].append(class_name)
                 output["confidences"].append(confidence)
                 output["position"].append(target_pos)
+                output["detection_distance"].append(distance)
 
             message=String()
             message.data=json.dumps(output)
