@@ -5,8 +5,12 @@ from typing import Any
 from copy import deepcopy
 from threading import RLock
 import rospy
-from .yolo import YOLOAdapter
+import message_filters
+import math
 from std_msgs.msg import String
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CameraInfo
+from alpaca_msgs.msg import ObservationFrame, ObjectDetection
 from math import e
 import json
 
@@ -58,17 +62,21 @@ class WorldModel:
         self.record=[]
         self._lock = RLock()
 
-    def initwm(self,detection_topic:str="yolo_detections"):
+    def initwm(self):
         # Automatic world model updater
         rospy.init_node("world_model_node", anonymous=True)
-        rospy.Subscriber(detection_topic,String,callback=self._update_callback,queue_size=1)
+        self.detection_subscriber=message_filters.Subscriber("detections", String, queue_size=1)
+        self.pose_subscriber=message_filters.Subscriber("vehicle_pose", Odometry, queue_size=1)
+        self.caminfo_subscriber=message_filters.Subscriber("camera_info", CameraInfo, queue_size=1)
+        synchronizer = message_filters.ApproximateTimeSynchronizer([self.detection_subscriber,self.pose_subscriber,self.caminfo_subscriber], queue_size=10, slop=0.05)
+        synchronizer.registerCallback(self._update_callback)
         rospy.spin()
 
     @staticmethod
     def sigmoid(x):
         return 1/(1+e**-x)
 
-    def _update_callback(self, detections):
+    def _update_callback(self, detections, pose, caminfo):
         try:
             detect_dict=json.loads(detections.data)
             detection_list=[]
@@ -81,14 +89,14 @@ class WorldModel:
         with self._lock:
             try:
                 working_objects = deepcopy(self.observations.objects)
-                self._apply_detections(working_objects, detection_list)
+                self._apply_detections(working_objects, detection_list, pose, caminfo)
             except Exception as error:
                 rospy.logerr("World-model update failed: %s", error)
                 return
 
             self.observations.objects[:] = working_objects
 
-    def _apply_detections(self, objects: list[Object], detection_list: list[Detection]) -> None:
+    def _apply_detections(self, objects: list[Object], detection_list: list[Detection], pose: Odometry, caminfo: CameraInfo) -> None:
         for detection in detection_list:
             if(detection.position!=[None,None,None]):
                 if len(objects)>0:
@@ -128,6 +136,16 @@ class WorldModel:
                     objects.append(Object(id=f"{detection.class_name}_{self._get_latest(detection.class_name, objects)+1}", class_name=detection.class_name, position=Position(detection.position[0],detection.position[1],detection.position[2]),confidence_scores={"existence_rawscore":-2.0,"existence_score":self.sigmoid(-2.0)}))
                     objects[-1].confidence_scores["positioning_rawscore"]=-2.0
                     objects[-1].confidence_scores["positioning_score"]=self.sigmoid(objects[-1].confidence_scores["positioning_rawscore"])
+        fx = caminfo.K[0]
+        fy = caminfo.K[4]
+        cx = caminfo.K[2]
+        cy = caminfo.K[5]
+
+        fovx=math.atan2(cx, fx) + math.atan2(caminfo.width - cx, fx)
+        fovy=math.atan2(cy, fy) + math.atan2(caminfo.height - cy, fy)
+        
+        
+        
 
 
     # Insert record and stop record functions

@@ -1,6 +1,8 @@
-from std_msgs.msg import String
+from std_msgs.msg import String, Header
 from sensor_msgs.msg import Image,CameraInfo
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CameraInfo
+from alpaca_msgs.msg import ObservationFrame, ObjectDetection
 
 import message_filters
 import numpy as np
@@ -22,7 +24,7 @@ class YOLOAdapter():
     def init_yolo(self):
         rospy.init_node("yolo_node", anonymous=True)
         self.rate = rospy.Rate(15)
-        self.publisher = rospy.Publisher("yolo_detections",String,queue_size=1)
+        self.publisher = rospy.Publisher("detections",ObservationFrame,queue_size=1)
         self.bridge = CvBridge()
 
         self.color_subscriber = message_filters.Subscriber("camera_color", Image, queue_size=1)
@@ -111,19 +113,9 @@ class YOLOAdapter():
                 raise ValueError("Vehicle pose frame ID is empty")
 
             results = self.model(frame,verbose=False)[0]
-            output={
-                "header": {
-                    "frame_id": pose_msg.header.frame_id,
-                    "stamp": {
-                        "secs": int(depth_msg.header.stamp.secs),
-                        "nsecs": int(depth_msg.header.stamp.nsecs)
-                    }
-                },
-                "class_names": [],
-                "confidences": [],
-                "position":[],
-                "detection_distance": []
-            }
+            output=ObservationFrame()
+            output.header.stamp = depth_msg.header.stamp
+            output.header.frame_id = camera_info_msg.header.frame_id
 
             for box in results.boxes:
                 try:
@@ -210,10 +202,33 @@ class YOLOAdapter():
                 except Exception as error:
                     rospy.logwarn("Could not localize %s detection: %s",class_name,error)
 
-                output["class_names"].append(class_name)
-                output["confidences"].append(confidence)
-                output["position"].append(target_pos)
-                output["detection_distance"].append(distance)
+                detection_output=ObjectDetection()
+                detection_output.class_name=class_name
+                detection_output.confidence=float(confidence)
+
+                detection_output.x_min=float(x1)
+                detection_output.y_min=float(y1)
+                detection_output.x_max=float(x2)
+                detection_output.y_max=float(y2)
+
+                if distance is not None:
+                    detection_output.has_depth=True
+                    detection_output.optical_depth=float(Zc)
+                    detection_output.depth_sample_u=float(u)
+                    detection_output.depth_sample_v=float(v)
+                    detection_output.camera_range=float(np.linalg.norm(pc))
+                else:
+                    detection_output.has_depth=False
+
+                if target_pos != [None,None,None]:
+                    detection_output.has_world_position=True
+                    detection_output.world_position.x=float(target_pos[0])
+                    detection_output.world_position.y=float(target_pos[1])
+                    detection_output.world_position.z=float(target_pos[2])
+                else:
+                    detection_output.has_world_position=False
+
+                output.detections.append(detection_output)
 
             message=String()
             message.data=json.dumps(output)
