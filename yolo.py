@@ -1,4 +1,4 @@
-from std_msgs.msg import String, Header
+from std_msgs.msg import String
 from sensor_msgs.msg import Image,CameraInfo
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo
@@ -11,7 +11,7 @@ from math import sqrt
 from ultralytics import YOLO
 import cv2
 from cv_bridge import CvBridge
-from tf.transformations import euler_from_quaternion
+from tf.transformations import euler_from_quaternion, quaternion_from_matrix
 import rospy
 import json
 
@@ -21,22 +21,23 @@ class YOLOAdapter():
         self.model = self._load_model(model_path)
         self.cammountpos=np.asarray(cammountpos,dtype=float).reshape(3)
         self.cammountrot=np.asarray(cammountrot,dtype=float).reshape(3)
+        self.classes=self.model.names.values()
     def init_yolo(self):
         rospy.init_node("yolo_node", anonymous=True)
         self.rate = rospy.Rate(15)
         self.publisher = rospy.Publisher("detections",ObservationFrame,queue_size=1)
         self.bridge = CvBridge()
 
-        self.color_subscriber = message_filters.Subscriber("camera_color", Image, queue_size=1)
-        self.camera_info_subscriber = message_filters.Subscriber("camera_info", CameraInfo, queue_size=1)
-        self.depth_subscriber = message_filters.Subscriber("camera_depth", Image, queue_size=1)
-        self.pose_subscriber=message_filters.Subscriber("vehicle_pose",Odometry,queue_size=1)
+        self.color_subscriber = message_filters.Subscriber("camera_color", Image)
+        self.camera_info_subscriber = message_filters.Subscriber("camera_info", CameraInfo)
+        self.depth_subscriber = message_filters.Subscriber("camera_depth", Image)
+        self.pose_subscriber=message_filters.Subscriber("vehicle_pose",Odometry)
         self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber, self.depth_subscriber,self.pose_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         self.synchronizer.registerCallback(self._image_callback)
         rospy.spin()
 
     def get_classes(self):
-        return list(self.model.names.values())
+        return self.classes
     
     def _load_model(self, model_path: str) -> YOLO:
         model=YOLO(model_path)
@@ -116,6 +117,28 @@ class YOLOAdapter():
             output=ObservationFrame()
             output.header.stamp = depth_msg.header.stamp
             output.header.frame_id = camera_info_msg.header.frame_id
+            output.vehicle_pose=pose_msg
+            output.camera_info=camera_info_msg
+
+            camera_roll,camera_pitch,camera_yaw=self.cammountrot
+            camera_rx=np.array([[1,0,0],[0,np.cos(camera_roll),-np.sin(camera_roll)],[0,np.sin(camera_roll),np.cos(camera_roll)]])
+            camera_ry=np.array([[np.cos(camera_pitch),0,np.sin(camera_pitch)],[0,1,0],[-np.sin(camera_pitch),0,np.cos(camera_pitch)]])
+            camera_rz=np.array([[np.cos(camera_yaw),-np.sin(camera_yaw),0],[np.sin(camera_yaw),np.cos(camera_yaw),0],[0,0,1]])
+            body_transform=camera_rz@camera_ry@camera_rx@np.array([[0,0,1],[-1,0,0],[0,-1,0]],dtype=float)
+            camera_transform_matrix=np.eye(4,dtype=float)
+            camera_transform_matrix[:3,:3]=body_transform
+            camera_transform_matrix[:3,3]=self.cammountpos
+            camera_quaternion=quaternion_from_matrix(camera_transform_matrix)
+            output.camera_pose_in_body.header.stamp=depth_msg.header.stamp
+            output.camera_pose_in_body.header.frame_id=pose_msg.child_frame_id
+            output.camera_pose_in_body.child_frame_id=camera_info_msg.header.frame_id
+            output.camera_pose_in_body.transform.translation.x=float(self.cammountpos[0])
+            output.camera_pose_in_body.transform.translation.y=float(self.cammountpos[1])
+            output.camera_pose_in_body.transform.translation.z=float(self.cammountpos[2])
+            output.camera_pose_in_body.transform.rotation.x=float(camera_quaternion[0])
+            output.camera_pose_in_body.transform.rotation.y=float(camera_quaternion[1])
+            output.camera_pose_in_body.transform.rotation.z=float(camera_quaternion[2])
+            output.camera_pose_in_body.transform.rotation.w=float(camera_quaternion[3])
 
             for box in results.boxes:
                 try:
@@ -175,12 +198,6 @@ class YOLOAdapter():
                             Xc=(u-cx)*Zc/fx
                             Yc=(v-cy)*Zc/fy
 
-                        body_transform=np.array([[0,0,1],[-1,0,0],[0,-1,0]],dtype=float)
-                        camera_roll,camera_pitch,camera_yaw=self.cammountrot
-                        camera_rx=np.array([[1,0,0],[0,np.cos(camera_roll),-np.sin(camera_roll)],[0,np.sin(camera_roll),np.cos(camera_roll)]])
-                        camera_ry=np.array([[np.cos(camera_pitch),0,np.sin(camera_pitch)],[0,1,0],[-np.sin(camera_pitch),0,np.cos(camera_pitch)]])
-                        camera_rz=np.array([[np.cos(camera_yaw),-np.sin(camera_yaw),0],[np.sin(camera_yaw),np.cos(camera_yaw),0],[0,0,1]])
-                        body_transform=camera_rz@camera_ry@camera_rx@body_transform
                         pc=np.array([Xc,Yc,Zc])
                         pb=body_transform@pc+self.cammountpos
 
@@ -230,9 +247,7 @@ class YOLOAdapter():
 
                 output.detections.append(detection_output)
 
-            message=String()
-            message.data=json.dumps(output)
-            self.publisher.publish(message)
+            self.publisher.publish(output)
         except Exception as error:
             rospy.logerr("YOLO callback failed: %s",error)
     def init_yolo_legacy(self, webcam):

@@ -3,6 +3,7 @@ from __future__ import annotations
 from . import worldmodel as wm
 from . import vehicleadapter as va
 from . import risk as rcm
+from .yolo import YOLOAdapter
 from dataclasses import dataclass,fields
 from typing import Any
 import rospy
@@ -23,10 +24,11 @@ class Return:
     results: dict[str, Any]
 
 class ToolExecutor:
-    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal) -> None:
+    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, detector:YOLOAdapter | None=None) -> None:
         self.model = model
         self.adapter = adapter
         self.risk=riskcalibration
+        self.detector=detector
 
     def execute(self, commands: list[Command]) -> list[Return]:
         results=[]
@@ -87,71 +89,35 @@ class ToolExecutor:
     def _tool_write(self, command: Command) -> Return:
         object_data = command.arguments.get("object")
 
-        if isinstance(object_data, wm.Object):
-            world_object = object_data
-        elif isinstance(object_data, dict):
-            try:
-                position_data = object_data.get("position")
-                if isinstance(position_data, dict):
-                    position = wm.Position(**position_data)
-                elif isinstance(position_data, wm.Position):
-                    position = position_data
-                else:
-                    raise TypeError(
-                        "position must be a Position instance or a position dictionary"
-                    )
-
-                world_object = wm.Object(
-                    **{
-                        **object_data,
-                        "position": position,
-                    }
-                )
-            except TypeError as error:
-                return Return(
-                    id=command.id,
-                    command_type=command.command_type,
-                    status="Failed",
-                    results={"Error": f"Invalid object format: {error}"},
-                )
-        else:
+        if not isinstance(object_data,dict):
             return Return(
                 id=command.id,
                 command_type=command.command_type,
                 status="Failed",
-                results={
-                    "Error": "Object must be an Object instance or a dictionary."
-                },
+                results={"Error":"Object must be a dictionary containing id, class_name, and bounding_box."},
             )
 
-        confidence_scores_are_valid = (
-            isinstance(world_object.confidence_scores, dict)
-            and all(
-                isinstance(name, str)
-                and isinstance(score, (int, float))
-                and not isinstance(score, bool)
-                for name, score in world_object.confidence_scores.items()
-            )
-        )
+        missing_arguments=[name for name in ("id","class_name","bounding_box") if name not in object_data]
+        if missing_arguments:
+            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":f"Missing required object arguments: {', '.join(missing_arguments)}"})
 
-        if (
-            not isinstance(world_object.id, str)
-            or not isinstance(world_object.class_name, str)
-            or not isinstance(world_object.position, wm.Position)
-            or not isinstance(world_object.attributes, dict)
-            or not all(
-                isinstance(name, str) for name in world_object.attributes
-            )
-            or not confidence_scores_are_valid
-        ):
-            return Return(
-                id=command.id,
-                command_type=command.command_type,
-                status="Failed",
-                results={
-                    "Error": "Object does not match the world-model Object format."
-                },
-            )
+        attributes=object_data.get("attributes",{})
+        if not isinstance(object_data["id"],str) or not object_data["id"] or not isinstance(object_data["class_name"],str) or not object_data["class_name"]:
+            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":"id and class_name must be non-empty strings."})
+        detection_classes=self.detector.get_classes() if self.detector is not None else self.model.detection_classes
+        if object_data["class_name"] in detection_classes:
+            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":f"Class name {object_data['class_name']!r} is reserved for YOLO detections."})
+        if not isinstance(attributes,dict) or not all(isinstance(name,str) for name in attributes):
+            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":"attributes must be a dictionary with string keys."})
+        forbidden_attributes={"Notes","VLMFlag"}.intersection(attributes)
+        if forbidden_attributes:
+            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":f"Forbidden attribute keys: {', '.join(sorted(forbidden_attributes))}"})
+
+        try:
+            position=self.model.bounding_box_to_world(object_data["bounding_box"])
+            world_object=wm.Object(id=object_data["id"],class_name=object_data["class_name"],size=wm.Size(),position=position,attributes=dict(attributes))
+        except (TypeError,ValueError) as error:
+            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":f"Could not calculate object position: {error}"})
 
         try:
             self.model.write(world_object)
@@ -195,4 +161,3 @@ class ToolExecutor:
             results={"Scan": "Completed"},
         )
     
-
