@@ -11,14 +11,10 @@ from scipy.spatial.transform import Rotation
 import message_filters
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Quaternion
 import math
-from std_msgs.msg import String
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CameraInfo
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection
 from sklearn.neighbors import KNeighborsClassifier
-from math import e
+from math import e, sqrt
 import json
 
 
@@ -71,6 +67,7 @@ class WorldModel:
         self._latest_frame=None
         self._latest_depth=None
         self._lock = RLock()
+        self._startstate=None
 
     def initwm(self):
         # Automatic world model updater
@@ -398,7 +395,29 @@ class WorldModel:
             world_position=self.c2w(self._latest_frame,camera_position)
             return Position(float(world_position[0]),float(world_position[1]),float(world_position[2]))
 
-    # Insert record and stop record functions
+    def record(self)->None:
+        """Used by tools to record world model updates."""
+        self._startstate=deepcopy(self.observations)
+        self.start_list=[]
+        for object in self._startstate.objects:
+            self.start_list.append(object.id)
+    def stop_record(self)->dict:
+        """Used by tools to stop recording world model updates."""
+        endstate=deepcopy(self.observations)
+        end_list=[]
+        for object in endstate.objects:
+            end_list.append(object.id)
+        added_objects=[object for object in endstate.objects if object.id not in self.start_list]
+        removed_objects=[object for object in self._startstate.objects if object.id not in end_list]
+        changed_objects=[]
+        common=self.start_list & end_list
+        for object in endstate:
+            if object.id in common:
+                if(abs(object.confidence_scores["existence_score"]-self._startstate.objects[self.start_list.index(object.id)].confidence_scores["existence_score"])>0.3 or abs(object.confidence_scores["positioning_score"]-self._startstate.objects[self.start_list.index(object.id)].confidence_scores["positioning_score"])>0.3 or np.sqrt(abs(endstate.objects[self.start_list.index(object.id)].position.x-object.position.x)**2 +abs(endstate.objects[self.start_list.index(object.id)].position.y-object.position.y)**2 +abs(endstate.objects[self.start_list.index(object.id)].position.z-object.position.z)**2)>0.3):
+                    changed_objects.append({"New": object, "Old": self._startstate.objects[self.start_list.index(object.id)]})
+
+        return {"Added Objects":added_objects,"Removed Objects":removed_objects,"Changed Objects":changed_objects}
+
 
     def _get_latest(self,class_name:str, objects: list[Object] | None = None)->int:
         with self._lock:

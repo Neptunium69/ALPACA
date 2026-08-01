@@ -3,6 +3,9 @@ from __future__ import annotations
 from . import worldmodel as wm
 from . import vehicleadapter as va
 from . import risk as rcm
+import cv2
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
 from .yolo import YOLOAdapter
 from dataclasses import dataclass,fields
 from typing import Any
@@ -29,6 +32,7 @@ class ToolExecutor:
         self.adapter = adapter
         self.risk=riskcalibration
         self.detector=detector
+        self.bridge=CvBridge()
 
     def execute(self, commands: list[Command]) -> list[Return]:
         results=[]
@@ -79,6 +83,7 @@ class ToolExecutor:
             status="Success",
             results={"Objects Found": objects},
         )
+    
     def _tool_robot_state(self, command: Command) -> Return:
         state=self.adapter.get_state()
         rv=Return(id=command.id, command_type=command.command_type, status="Success", results={})
@@ -106,7 +111,7 @@ class ToolExecutor:
             return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":"id and class_name must be non-empty strings."})
         detection_classes=self.detector.get_classes() if self.detector is not None else self.model.detection_classes
         if object_data["class_name"] in detection_classes:
-            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":f"Class name {object_data['class_name']!r} is reserved for YOLO detections."})
+            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":f"Class name {object_data['class_name']!r} is reserved and cannot be used."})
         if not isinstance(attributes,dict) or not all(isinstance(name,str) for name in attributes):
             return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error":"attributes must be a dictionary with string keys."})
         forbidden_attributes={"Notes","VLMFlag"}.intersection(attributes)
@@ -135,10 +140,32 @@ class ToolExecutor:
             status="Success",
             results={"Object Written": world_object},
         )
+
+    def _tool_observe(self, command:Command) -> Return:
+        try:
+            message=rospy.wait_for_message("camera_color", Image, timeout=5.0)
+            image=self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
+            height,width=image.shape[:2]
+            timestamp=message.header.stamp.to_nsec()
+            image_path=f"/tmp/camera_image_{timestamp}.png"
+            if not cv2.imwrite(image_path,image):
+                raise IOError(f"Could not write {image_path}")
+            return Return(id=command.id,command_type=command.command_type,status="Success",results={
+                "image_path":image_path,
+                "width":width,
+                "height":height,
+                "timestamp_ns":timestamp,
+                "frame_id":message.header.frame_id,
+            })
+        except Exception as error:
+            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error)})
+        
     def _tool_scan(self, command: Command) -> Return:
         try:
+            self.model.record()
             self.risk.inspect(command)
             self.adapter.scan()
+            changes=self.model.stop_record()
         except rospy.ROSInterruptException as error:
             return Return(
                 id=command.id,
@@ -158,6 +185,7 @@ class ToolExecutor:
             id=command.id,
             command_type=command.command_type,
             status="Success",
-            results={"Scan": "Completed"},
-        )
+            results={"Scan": "Completed",
+                     "Major Changes": changes,
+        })
     

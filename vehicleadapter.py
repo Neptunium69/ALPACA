@@ -58,10 +58,16 @@ class UGVAdapter(VehicleAdapter):
         self.depth_subscriber = message_filters.Subscriber("/camera/aligned_depth_to_color/image_raw", Image, queue_size=1)
         self.camera_info_subscriber = message_filters.Subscriber("/camera/aligned_depth_to_color/camera_info",CameraInfo,queue_size=1)
         self.battery_subscriber = rospy.Subscriber("/mavros/battery", BatteryState, queue_size=1,callback=self._battery_callback)
+        self.lidar_subscriber = rospy.Subscriber("livox/lidar", Image, queue_size=1, callback=self._lidar_callback)
 
         synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         synchronizer.registerCallback(self._adapter_callback)
         rospy.spin()
+
+    def _lidar_callback(self, lidar_msg):
+        # Placeholder for processing LiDAR data
+        pass
+
     def _battery_callback(self,battery_msg):
         with self.state_lock:
             self.state.battery_level=battery_msg.percentage
@@ -146,3 +152,7 @@ class UGVAdapter(VehicleAdapter):
                     yaw_publisher.publish(stop_message)  # Stop rotation
             finally:     
                 subscriber.unregister()
+    def inspect(self, object_id: str) -> None:
+        # Implement UGV-specific inspection logic here
+        pass
+
