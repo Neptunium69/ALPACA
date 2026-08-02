@@ -5,7 +5,7 @@ from . import vehicleadapter as va
 from . import risk as rcm
 import cv2
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge, CvBridgeError
+from cv_bridge import CvBridge
 from .yolo import YOLOAdapter
 from dataclasses import dataclass,fields
 from typing import Any
@@ -43,7 +43,9 @@ class ToolExecutor:
                 results.append(self._command_reader(command))
         return results
     def _command_reader(self, command: Command) -> Return:
-        tool_function = getattr(self, f"_tool_{command.command_type}")
+        tool_function = getattr(self,f"_tool_{command.command_type}",None)
+        if tool_function is None:
+            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":f"The {command.command_type} command is not implemented."})
         return tool_function(command)
 
     def _tool_query(self, command: Command) -> Return:
@@ -144,6 +146,8 @@ class ToolExecutor:
     def _tool_observe(self, command:Command) -> Return:
         try:
             message=rospy.wait_for_message("camera_color", Image, timeout=5.0)
+            if message is None:
+                raise RuntimeError("Camera returned no image message")
             image=self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
             height,width=image.shape[:2]
             timestamp=message.header.stamp.to_nsec()
@@ -162,8 +166,10 @@ class ToolExecutor:
         
     def _tool_scan(self, command: Command) -> Return:
         try:
+            risk_result=self.risk.checkcmd(command,self.adapter)
+            if risk_result.get("Safe") is False:
+                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
             self.model.record()
-            self.risk.inspect(command)
             self.adapter.scan()
             changes=self.model.stop_record()
         except rospy.ROSInterruptException as error:
@@ -188,4 +194,20 @@ class ToolExecutor:
             results={"Scan": "Completed",
                      "Major Changes": changes,
         })
+
+    def _tool_navigate(self, command: Command) -> Return:
+        try:
+            risk_result=self.risk.checkcmd(command,self.adapter)
+            if risk_result.get("Safe") is False:
+                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
+            destination_data=command.arguments.get("destination")
+            orientation_data=command.arguments.get("orientation")
+            if not isinstance(destination_data,dict) or not isinstance(orientation_data,dict):
+                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Destination and orientation must be dictionaries."})
+            destination=va.Position(**destination_data)
+            orientation=va.Orientation(**orientation_data)
+            self.adapter.navigate(destination,orientation)
+        except Exception as error:
+            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error)})
+        return Return(id=command.id,command_type=command.command_type,status="Success",results={"Navigation":"Completed"})
     

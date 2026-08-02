@@ -1,14 +1,14 @@
 from std_msgs.msg import String
 from sensor_msgs.msg import Image,CameraInfo
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CameraInfo
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection
+from typing import Any
 
 import message_filters
 import numpy as np
-from math import sqrt
 
 from ultralytics import YOLO
+from ultralytics.engine.results import Results
 import cv2
 from cv_bridge import CvBridge
 from tf.transformations import euler_from_quaternion, quaternion_from_matrix
@@ -43,7 +43,7 @@ class YOLOAdapter():
         model=YOLO(model_path)
         return model
 
-    def _tometer(self, depth_value: float, encoding:str) -> float:
+    def _tometer(self, depth_value: np.ndarray, encoding:str) -> np.ndarray:
         """Convert depth value to meters."""
         encoding = encoding.lower()
         if encoding == "16uc1":
@@ -53,7 +53,7 @@ class YOLOAdapter():
         else:
             raise ValueError("Unsupported depth image format")
 
-    def _get_distance(self, depth, box,depth_encoding):
+    def _get_distance(self, depth: np.ndarray, box: Any,depth_encoding: str) -> tuple[float,int,int] | None:
         """Get depth to the object based on the bounding box and depth image."""
         height, width = depth.shape[:2]
         x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
@@ -91,6 +91,12 @@ class YOLOAdapter():
             int(cropped_y1 + valid_y[sample_index]),
         )
 
+    def _run_model(self, image: np.ndarray) -> Results:
+        result=next(iter(self.model(image,verbose=False)))
+        if not isinstance(result,Results):
+            raise TypeError(f"YOLO returned an unexpected result type: {type(result).__name__}")
+        return result
+
     def _image_callback(self, color_msg, depth_msg, pose_msg, camera_info_msg):
         try:
             frame=self.bridge.imgmsg_to_cv2(color_msg,desired_encoding="bgr8")
@@ -113,8 +119,12 @@ class YOLOAdapter():
             if not pose_msg.header.frame_id:
                 raise ValueError("Vehicle pose frame ID is empty")
 
-            results = self.model(frame,verbose=False)[0]
+            results=self._run_model(frame)
             output=ObservationFrame()
+            output_detections=output.detections
+            if output_detections is None:
+                output_detections=[]
+                output.detections=output_detections
             output.header.stamp = depth_msg.header.stamp
             output.header.frame_id = camera_info_msg.header.frame_id
             output.vehicle_pose=pose_msg
@@ -140,28 +150,27 @@ class YOLOAdapter():
             output.camera_pose_in_body.transform.rotation.z=float(camera_quaternion[2])
             output.camera_pose_in_body.transform.rotation.w=float(camera_quaternion[3])
 
-            for box in results.boxes:
+            boxes=results.boxes
+            if boxes is None:
+                boxes=[]
+            for box in boxes:
                 try:
                     class_id = int(box.cls[0].item())
                     class_name=results.names[class_id]
                     confidence=box.conf[0].item()
+                    x1,y1,x2,y2=box.xyxy[0].cpu().tolist()
+                    x1=max(0,min(depth_width-1,int(x1)))
+                    y1=max(0,min(depth_height-1,int(y1)))
+                    x2=max(0,min(depth_width,int(x2)))
+                    y2=max(0,min(depth_height,int(y2)))
                 except Exception as error:
                     rospy.logwarn("Skipping invalid YOLO detection: %s",error)
                     continue
 
-                target_pos=[None,None,None]
-                distance=None
+                target_pos: tuple[float,float,float] | None=None
+                depth_result: tuple[float,int,int,np.ndarray] | None=None
 
                 try:
-                    height, width = depth.shape[:2]
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
-
-                    x1 = max(0, min(width - 1, int(x1)))
-                    y1 = max(0, min(height - 1, int(y1)))
-
-                    x2 = max(0, min(width, int(x2)))
-                    y2 = max(0, min(height, int(y2)))
-
                     depth_sample=self._get_distance(depth,box,depth_msg.encoding)
 
                     current_x=pose_msg.pose.pose.position.x
@@ -201,8 +210,6 @@ class YOLOAdapter():
                         pc=np.array([Xc,Yc,Zc])
                         pb=body_transform@pc+self.cammountpos
 
-                        distance = float(np.linalg.norm(pb))
-
                         rx=np.array([[1,0,0],[0,np.cos(roll),-np.sin(roll)],[0,np.sin(roll),np.cos(roll)]])
                         ry=np.array([[np.cos(pitch),0,np.sin(pitch)],[0,1,0],[-np.sin(pitch),0,np.cos(pitch)]])
                         rz=np.array([[np.cos(yaw),-np.sin(yaw),0],[np.sin(yaw),np.cos(yaw),0],[0,0,1]])
@@ -214,8 +221,8 @@ class YOLOAdapter():
                         pv=np.array([current_x,current_y,current_z],dtype=float)
 
                         pt=pv+pw
-
-                        target_pos=pt.tolist()
+                        target_pos=(float(pt[0]),float(pt[1]),float(pt[2]))
+                        depth_result=(Zc,u,v,pc)
                 except Exception as error:
                     rospy.logwarn("Could not localize %s detection: %s",class_name,error)
 
@@ -228,7 +235,8 @@ class YOLOAdapter():
                 detection_output.x_max=float(x2)
                 detection_output.y_max=float(y2)
 
-                if distance is not None:
+                if depth_result is not None:
+                    Zc,u,v,pc=depth_result
                     detection_output.has_depth=True
                     detection_output.optical_depth=float(Zc)
                     detection_output.depth_sample_u=float(u)
@@ -237,7 +245,7 @@ class YOLOAdapter():
                 else:
                     detection_output.has_depth=False
 
-                if target_pos != [None,None,None]:
+                if target_pos is not None:
                     detection_output.has_world_position=True
                     detection_output.world_position.x=float(target_pos[0])
                     detection_output.world_position.y=float(target_pos[1])
@@ -245,7 +253,7 @@ class YOLOAdapter():
                 else:
                     detection_output.has_world_position=False
 
-                output.detections.append(detection_output)
+                output_detections.append(detection_output)
 
             self.publisher.publish(output)
         except Exception as error:
@@ -275,8 +283,12 @@ class YOLOAdapter():
                         "y2s": []
                     }
                 }
-                result = self.model(frame,verbose=False)[0]
-                for box in result.boxes:
+                result=self._run_model(frame)
+                boxes=result.boxes
+                if boxes is None:
+                    rate.sleep()
+                    continue
+                for box in boxes:
                     x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
                     class_id = int(box.cls[0].item())
                     class_name = result.names[class_id]

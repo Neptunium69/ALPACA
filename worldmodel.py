@@ -6,7 +6,6 @@ from copy import deepcopy
 from threading import RLock
 import rospy
 import numpy as np
-from tf.transformations import quaternion_matrix
 from scipy.spatial.transform import Rotation
 import message_filters
 from sensor_msgs.msg import Image
@@ -14,7 +13,7 @@ from cv_bridge import CvBridge
 import math
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection
 from sklearn.neighbors import KNeighborsClassifier
-from math import e, sqrt
+from math import e
 import json
 
 
@@ -62,7 +61,6 @@ class WorldModel:
     def __init__(self, observations: Model, detection_classes):
         self.observations = observations
         self.detection_classes = tuple(detection_classes)
-        self.record=[]
         self._bridge = CvBridge()
         self._latest_frame=None
         self._latest_depth=None
@@ -71,12 +69,12 @@ class WorldModel:
 
     def initwm(self):
         # Automatic world model updater
-        rospy.init_node("world_model_node", anonymous=True)
+        if not rospy.core.is_initialized():
+            rospy.init_node("world_model_node", anonymous=True)
         self.detection_subscriber=message_filters.Subscriber("detections", ObservationFrame)
         self.depth_subscriber=message_filters.Subscriber("camera_depth", Image)
-        syncronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.detection_subscriber], queue_size=10, slop=0.05)
-        syncronizer.registerCallback(self._update_callback)
-        rospy.spin()
+        self.synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.detection_subscriber], queue_size=10, slop=0.05)
+        self.synchronizer.registerCallback(self._update_callback)
 
     @staticmethod
     def sigmoid(x):
@@ -104,6 +102,7 @@ class WorldModel:
     def _apply_detections(self, objects: list[Object], detection_list: list[ObjectDetection], frame: ObservationFrame, depthmap: Image) -> None:
         observed_list=[]
         for detection in detection_list:
+            updated_object=None
             detected_size=None
             fx=frame.camera_info.K[0]
             fy=frame.camera_info.K[4]
@@ -114,62 +113,47 @@ class WorldModel:
                     detected_size=Size(detected_width,detected_height)
 
             if(detection.has_world_position):
-                if len(objects)>0:
-                    flag=0
-                    for object in objects:
-                        if((object.class_name==detection.class_name) and (object.position.x-0.1)<detection.world_position.x<(object.position.x+0.1) and ((object.position.y-0.1)<detection.world_position.y<(object.position.y+0.1)) and ((object.position.z-0.1)<detection.world_position.z<(object.position.z+0.1))):
-                            rawscore = object.confidence_scores.get("existence_rawscore")
-                            if rawscore is None:
-                                rawscore = -2.0
-                            rawscore += 0.1*detection.confidence
-                            object.confidence_scores["existence_rawscore"] = rawscore
-                            flag=1
-                            observed_list.append(object.id)
-                            break
-                    if(flag==1):
-                        object.confidence_scores["existence_score"]=self.sigmoid(object.confidence_scores["existence_rawscore"])
-                    if(detection.has_depth and flag==1):
+                matched_object=None
+                for candidate in objects:
+                    if candidate.class_name==detection.class_name and (candidate.position.x-0.1)<detection.world_position.x<(candidate.position.x+0.1) and (candidate.position.y-0.1)<detection.world_position.y<(candidate.position.y+0.1) and (candidate.position.z-0.1)<detection.world_position.z<(candidate.position.z+0.1):
+                        matched_object=candidate
+                        break
+
+                if matched_object is not None:
+                    rawscore=matched_object.confidence_scores.get("existence_rawscore",-2.0)+0.1*detection.confidence
+                    matched_object.confidence_scores["existence_rawscore"]=rawscore
+                    matched_object.confidence_scores["existence_score"]=self.sigmoid(rawscore)
+                    updated_object=matched_object
+                    observed_list.append(matched_object.id)
+                    if detection.has_depth:
                         distance_scaled=detection.camera_range/10
-                        positioning_rawscore = object.confidence_scores.get("positioning_rawscore")
-                        if positioning_rawscore is None:
-                            positioning_rawscore = -2.0
-                        positioning_increment = 0.1*((1-distance_scaled)**2+0.05)
-                        positioning_rawscore += positioning_increment
-                        object.confidence_scores["positioning_rawscore"] = positioning_rawscore
-                        object.confidence_scores["positioning_score"]=self.sigmoid(positioning_rawscore)
-                        object.position.x=(object.position.x*object.confidence_scores["positioning_score"])+((1-object.confidence_scores["positioning_score"])*detection.world_position.x)
-                        object.position.y=(object.position.y*object.confidence_scores["positioning_score"])+((1-object.confidence_scores["positioning_score"])*detection.world_position.y)
-                        object.position.z=(object.position.z*object.confidence_scores["positioning_score"])+((1-object.confidence_scores["positioning_score"])*detection.world_position.z)
+                        positioning_rawscore=matched_object.confidence_scores.get("positioning_rawscore",-2.0)+0.1*((1-distance_scaled)**2+0.05)
+                        positioning_score=self.sigmoid(positioning_rawscore)
+                        matched_object.confidence_scores["positioning_rawscore"]=positioning_rawscore
+                        matched_object.confidence_scores["positioning_score"]=positioning_score
+                        matched_object.position.x=(matched_object.position.x*positioning_score)+((1-positioning_score)*detection.world_position.x)
+                        matched_object.position.y=(matched_object.position.y*positioning_score)+((1-positioning_score)*detection.world_position.y)
+                        matched_object.position.z=(matched_object.position.z*positioning_score)+((1-positioning_score)*detection.world_position.z)
                         if detected_size is not None:
-                            if object.size.conservative_width is None or object.size.conservative_height is None:
-                                object.size=detected_size
+                            old_width=matched_object.size.conservative_width
+                            old_height=matched_object.size.conservative_height
+                            new_width=detected_size.conservative_width
+                            new_height=detected_size.conservative_height
+                            if old_width is None or old_height is None or new_width is None or new_height is None:
+                                matched_object.size=detected_size
                             else:
-                                object.size.conservative_width=(object.size.conservative_width*object.confidence_scores["positioning_score"])+((1-object.confidence_scores["positioning_score"])*detected_size.conservative_width)
-                                object.size.conservative_height=(object.size.conservative_height*object.confidence_scores["positioning_score"])+((1-object.confidence_scores["positioning_score"])*detected_size.conservative_height)
-
-                    else:
-                        pass
-
-                    if(flag==0):
-                        id=f"{detection.class_name}_{self._get_latest(detection.class_name, objects)+1}"
-                        objects.append(Object(id=id, class_name=detection.class_name, size=detected_size if detected_size is not None else Size(), position=Position(detection.world_position.x,detection.world_position.y,detection.world_position.z),confidence_scores={"existence_rawscore":-2.0,"existence_score":self.sigmoid(-2.0)}))
-                        observed_list.append(id)
-                        for i in range(len(objects)):
-                            if objects[i].id==id:
-                                objects[i].confidence_scores["positioning_rawscore"]=-2.0
-                                objects[i].confidence_scores["positioning_score"]=self.sigmoid(objects[-1].confidence_scores["positioning_rawscore"])
+                                matched_object.size.conservative_width=(old_width*positioning_score)+((1-positioning_score)*new_width)
+                                matched_object.size.conservative_height=(old_height*positioning_score)+((1-positioning_score)*new_height)
                 else:
                     id=f"{detection.class_name}_{self._get_latest(detection.class_name, objects)+1}"
+                    updated_object=Object(id=id,class_name=detection.class_name,size=detected_size if detected_size is not None else Size(),position=Position(detection.world_position.x,detection.world_position.y,detection.world_position.z),confidence_scores={"existence_rawscore":-2.0,"existence_score":self.sigmoid(-2.0)})
+                    objects.append(updated_object)
                     observed_list.append(id)
-                    objects.append(Object(id=id, class_name=detection.class_name, size=detected_size if detected_size is not None else Size(), position=Position(detection.world_position.x,detection.world_position.y,detection.world_position.z),confidence_scores={"existence_rawscore":-2.0,"existence_score":self.sigmoid(-2.0)}))
-                    for i in range(len(objects)):
-                        if objects[i].id==id:
-                            objects[i].confidence_scores["positioning_rawscore"]=-2.0
-                            objects[i].confidence_scores["positioning_score"]=self.sigmoid(objects[-1].confidence_scores["positioning_rawscore"])
 
                 # Prevents the rawscore form being too large, which may cause world model updates to be slow if the object's position is changed.
-                if(objects[-1].confidence_scores["existence_rawscore"]>5.0):
-                    objects[-1].confidence_scores["existence_rawscore"]=5.0
+                if updated_object is not None and updated_object.confidence_scores["existence_rawscore"]>5.0:
+                    updated_object.confidence_scores["existence_rawscore"]=5.0
+                    updated_object.confidence_scores["existence_score"]=self.sigmoid(5.0)
 
         for object in objects:
             if object.attributes.get("VLMFlag")==1:
@@ -229,27 +213,18 @@ class WorldModel:
             if(visible_fraction<0.8):
                 continue
 
-            depthmap_new=np.array([])
-            depthmap_data=self._bridge.imgmsg_to_cv2(depthmap.data)
-
+            depthmap_data=np.asarray(self._bridge.imgmsg_to_cv2(depthmap,desired_encoding="passthrough"),dtype=np.float32)
             if depthmap.encoding=="16UC1":
-                for row in depthmap_data:
-                    for pixel in row:
-                        pixel=pixel/1000
-                    
+                depthmap_data=depthmap_data/1000.0
+            elif depthmap.encoding!="32FC1":
+                raise ValueError(f"Unsupported depth image encoding: {depthmap.encoding}")
 
-            for x in range(x1_i,x2_i):
-                np.append(depthmap_new,[])
-                for y in range(y1_i,y2_i):
-                    if(type(depthmap_data)==int):
-                        if(depthmap_data[x,y]<(z-0.2)):
-                            np.append(depthmap_new[x],0)
-                        elif((z+0.2)>depthmap_data[x,y]>(z-0.2)):
-                            np.append(depthmap_new[x],1)
-                        elif(depthmap_new[x]>(z+0.2)):
-                            np.append(depthmap_new[x],2)
-                    else:
-                        np.append(depthmap_new[x],3)
+            depth_crop=depthmap_data[y1_i:y2_i,x1_i:x2_i]
+            depthmap_new=np.full(depth_crop.shape,3,dtype=np.uint8)
+            valid_mask=np.isfinite(depth_crop) & (depth_crop>0)
+            depthmap_new[valid_mask & (depth_crop<(z-0.2))]=0
+            depthmap_new[valid_mask & (depth_crop>=(z-0.2)) & (depth_crop<=(z+0.2))]=1
+            depthmap_new[valid_mask & (depth_crop>(z+0.2))]=2
                 
             rows,cols=np.indices(depthmap_new.shape)
             known_mask=depthmap_new!=3
@@ -265,6 +240,9 @@ class WorldModel:
                 imputer.fit(known_coordinates,known_categories)
                 depthmap_new[unknown_mask]=imputer.predict(unknown_coordinates)
 
+            if not known_mask.any():
+                continue
+
             closer=0
             samedistance=0
             further=0
@@ -278,25 +256,22 @@ class WorldModel:
                     elif j==2:
                         further+=1
 
-            fnear=(closer+samedistance)/(closer+samedistance+further)
+            classified_pixels=closer+samedistance+further
+            if classified_pixels==0:
+                continue
+            fnear=(closer+samedistance)/classified_pixels
             if(fnear>=0.3):
                 continue
             
             unobserved_objects_new.append(world_object)
 
         for object in unobserved_objects_new:
-            for i in range(len(self.observations.objects)):
-                if(object.id==self.observations.objects[i].id):
-                    objects[i].confidence_scores["positioning_rawscore"]-=0.1
-                    objects[i].confidence_scores["existence_rawscore"]-=0.1
+            object.confidence_scores["positioning_rawscore"]-=0.1
+            object.confidence_scores["existence_rawscore"]-=0.1
+            object.confidence_scores["positioning_score"]=self.sigmoid(object.confidence_scores["positioning_rawscore"])
+            object.confidence_scores["existence_score"]=self.sigmoid(object.confidence_scores["existence_rawscore"])
 
-                    objects[i].confidence_scores["positioning_score"]=self.sigmoid(self.observations.objects[i].confidence_scores["positioning_rawscore"])
-                    objects[i].confidence_scores["existence_score"]=self.sigmoid(self.observations.objects[i].confidence_scores["existence_rawscore"])
-
-        pop_indexes=[]
-        for i in range(len(self.observations.objects)):
-            if self.observations.objects[i].confidence_scores["existence_score"]<0.08:
-                self._remove_object(object_id=self.observations.objects[i].id)
+        objects[:]=[object for object in objects if object.confidence_scores["existence_score"]>=0.08]
         
     def _camera_transform(self,observation: ObservationFrame,flag: int=0)->np.ndarray:
         pose=observation.vehicle_pose.pose.pose
@@ -322,13 +297,13 @@ class WorldModel:
 
         raise ValueError("flag must be 0 for camera-to-world or 1 for world-to-camera")
 
-    def w2c(self,frame, position:np.ndarray)->np.ndarray:
+    def w2c(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
         position=np.append(np.asarray(position,dtype=float),1.0)
         transform=self._camera_transform(frame,1)
         newpos=transform@position
         return newpos[:3]
     
-    def c2w(self,frame, position:np.ndarray)->np.ndarray:
+    def c2w(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
         position=np.append(np.asarray(position,dtype=float),1.0)
         transform=self._camera_transform(frame,0)
         newpos=transform@position
@@ -397,24 +372,27 @@ class WorldModel:
 
     def record(self)->None:
         """Used by tools to record world model updates."""
-        self._startstate=deepcopy(self.observations)
-        self.start_list=[]
-        for object in self._startstate.objects:
-            self.start_list.append(object.id)
+        with self._lock:
+            self._startstate=deepcopy(self.observations)
     def stop_record(self)->dict:
         """Used by tools to stop recording world model updates."""
-        endstate=deepcopy(self.observations)
-        end_list=[]
-        for object in endstate.objects:
-            end_list.append(object.id)
-        added_objects=[object for object in endstate.objects if object.id not in self.start_list]
-        removed_objects=[object for object in self._startstate.objects if object.id not in end_list]
+        with self._lock:
+            if self._startstate is None:
+                raise RuntimeError("record() must be called before stop_record()")
+            startstate=self._startstate
+            endstate=deepcopy(self.observations)
+            self._startstate=None
+        start_objects={object.id:object for object in startstate.objects}
+        end_objects={object.id:object for object in endstate.objects}
+        added_objects=[object for object in endstate.objects if object.id not in start_objects]
+        removed_objects=[object for object in startstate.objects if object.id not in end_objects]
         changed_objects=[]
-        common=self.start_list & end_list
-        for object in endstate:
-            if object.id in common:
-                if(abs(object.confidence_scores["existence_score"]-self._startstate.objects[self.start_list.index(object.id)].confidence_scores["existence_score"])>0.3 or abs(object.confidence_scores["positioning_score"]-self._startstate.objects[self.start_list.index(object.id)].confidence_scores["positioning_score"])>0.3 or np.sqrt(abs(endstate.objects[self.start_list.index(object.id)].position.x-object.position.x)**2 +abs(endstate.objects[self.start_list.index(object.id)].position.y-object.position.y)**2 +abs(endstate.objects[self.start_list.index(object.id)].position.z-object.position.z)**2)>0.3):
-                    changed_objects.append({"New": object, "Old": self._startstate.objects[self.start_list.index(object.id)]})
+        for object in endstate.objects:
+            if object.id in start_objects:
+                old_object=start_objects[object.id]
+                position_change=np.sqrt((object.position.x-old_object.position.x)**2+(object.position.y-old_object.position.y)**2+(object.position.z-old_object.position.z)**2)
+                if abs(object.confidence_scores["existence_score"]-old_object.confidence_scores["existence_score"])>0.3 or abs(object.confidence_scores["positioning_score"]-old_object.confidence_scores["positioning_score"])>0.3 or position_change>0.3:
+                    changed_objects.append({"New":object,"Old":old_object})
 
         return {"Added Objects":added_objects,"Removed Objects":removed_objects,"Changed Objects":changed_objects}
 
@@ -471,13 +449,12 @@ class WorldModel:
     def write(self,world_object: Object) -> None:
         candidate = deepcopy(world_object)
         for detection_class in self.detection_classes:
-            if f"{detection_class}_" not in candidate.class_name:
-                candidate.attributes["Notes"]="Artificially written by VLM, not added by automatic updater"
-                candidate.attributes["VLMFlag"]=1
-                candidate.confidence_scores["existence_rawscore"]=0.0
-                candidate.confidence_scores["existence_score"]=float(self.sigmoid(candidate.confidence_scores["existence_rawscore"]))
-            else:
+            if f"{detection_class}_" in candidate.class_name:
                 raise ValueError(f"Class name {candidate.class_name} is invalid because it contains the reserved phrase '{detection_class}_'")
+        candidate.attributes["Notes"]="Artificially written by VLM, not added by automatic updater"
+        candidate.attributes["VLMFlag"]=1
+        candidate.confidence_scores["existence_rawscore"]=0.0
+        candidate.confidence_scores["existence_score"]=float(self.sigmoid(candidate.confidence_scores["existence_rawscore"]))
 
         with self._lock:
             self._add_object(candidate)
