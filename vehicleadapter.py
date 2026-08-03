@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 import numpy as np
 from typing import Protocol
@@ -14,8 +16,10 @@ from threading import Lock
 from copy import deepcopy
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TwistStamped
+from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelObservationMsg
 from sensor_msgs.msg import Image, BatteryState,CameraInfo, PointCloud2
-from tf.transformations import euler_from_quaternion,quaternion_from_euler
+from tf.transformations import euler_from_quaternion,quaternion_from_euler,quaternion_matrix
+from . import worldmodel as wm
 from .worldmodel import Position,Orientation
 
 @dataclass
@@ -23,6 +27,12 @@ class State():
     battery_level: float
     position: Position
     orientation: Orientation
+
+@dataclass
+class VoxelObservation():
+    location: tuple[int,int,int]
+    occupied: int
+    free: int
 
 
 class VehicleAdapter(Protocol):
@@ -47,11 +57,15 @@ class VehicleAdapter(Protocol):
         raise NotImplementedError("This method should be implemented by subclasses.")
 
 class UGVAdapter(VehicleAdapter):
-    def __init__(self, state: State, *args, **kwargs) -> None:
+    def __init__(self, state: State, worldmodel: wm.WorldModel, *args, **kwargs) -> None:
         self.state=state
+        self.worldmodel=worldmodel
         self.state_lock=Lock()
         self.client=None
         self.voxel_size = 0.05
+        self.vehicle_pose=None
+        self.lidar_points_world=None
+        self.lidar_origin_world=None
         self.vehicle_min = np.array([-0.15, -0.17, -0.25])
         self.vehicle_max = np.array([0.15, 0.17, 0.0])
         self.search_offset = np.array([0.30, 0.30, 0.05])
@@ -74,6 +88,8 @@ class UGVAdapter(VehicleAdapter):
         if self.lidar_to_body_translation.shape!=(3,) or not np.all(np.isfinite(self.lidar_to_body_translation)) or not np.all(np.isfinite(self.lidar_to_body_rotation)):
             raise ValueError("FAST-LIO extrinsic translation and rotation must contain finite values.")
         self.client=actionlib.SimpleActionClient("/move_base",MoveBaseAction)
+
+        self.voxel_publisher = rospy.Publisher("voxel_observations",SpatialObservationFrame,queue_size=1)
         self.pose_publisher = rospy.Publisher("vehicle_pose",Odometry,queue_size=1)
         self.camera_info_publisher = rospy.Publisher("camera_info", CameraInfo, queue_size=1)
         self.battery_publisher = rospy.Publisher("battery_level",BatteryState,queue_size=1)
@@ -83,49 +99,58 @@ class UGVAdapter(VehicleAdapter):
         if not self.client.wait_for_server(rospy.Duration(secs=5)):
             raise RuntimeError("The move_base action server is unavailable.")
 
-        self.gnss_position_subscriber = rospy.Subscriber("mavros/global_position/local",Odometry,queue_size=1,callback=self._pose_callback)
+        self.gnss_position_subscriber = message_filters.Subscriber("mavros/global_position/local",Odometry,queue_size=10)
+        self.gnss_position_subscriber.registerCallback(self._pose_callback)
         self.color_subscriber = message_filters.Subscriber("/camera/color/image_raw", Image, queue_size=1)
         self.depth_subscriber = message_filters.Subscriber("/camera/aligned_depth_to_color/image_raw", Image, queue_size=1)
         self.camera_info_subscriber = message_filters.Subscriber("/camera/aligned_depth_to_color/camera_info",CameraInfo,queue_size=1)
         self.battery_subscriber = rospy.Subscriber("/mavros/battery", BatteryState, queue_size=1,callback=self._battery_callback)
-        self.lidar_subscriber = rospy.Subscriber("/cloud_registered_body", PointCloud2, queue_size=1, callback=self._lidar_callback)
+        self.lidar_subscriber = message_filters.Subscriber("/cloud_registered_body",PointCloud2,queue_size=5)
 
         self.camera_synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         self.camera_synchronizer.registerCallback(self._adapter_callback)
+        self.lidar_synchronizer = message_filters.ApproximateTimeSynchronizer([self.lidar_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.03)
+        self.lidar_synchronizer.registerCallback(self._lidar_callback)
 
-    def _lidar_callback(self, cloud: PointCloud2)-> None:
-        points = np.asarray(list(pc2.read_points(cloud, field_names=("x", "y", "z"), skip_nans=True)), dtype=np.float32)
+    def _lidar_callback(self,cloud: PointCloud2,vehicle_pose: Odometry)->None:
+        points_body=np.asarray(list(pc2.read_points(cloud,field_names=("x","y","z"),skip_nans=True)),dtype=np.float64).reshape(-1,3)
+        points_body=points_body[np.isfinite(points_body).all(axis=1)]
+        self.lidar_points_world,self.lidar_origin_world=self._lidar_to_world(points_body,vehicle_pose)
 
-        if len(points) == 0:
-            return
-
-        points = points[np.isfinite(points).all(axis=1)]
-        points = (self.lidar_to_body_rotation.T @ (points - self.lidar_to_body_translation).T).T
-
-        inside_roi = np.all((points >= self.roi_min) & (points < self.roi_max), axis=1)
-        points = points[inside_roi]
-
-        inside_vehicle = np.all((points >= self.vehicle_min) & (points <= self.vehicle_max), axis=1)
-        points = points[~inside_vehicle]
-
-        is_ground = np.abs(points[:, 2] - self.ground_z) < self.ground_margin
-        points = points[~is_ground]
-
-        if len(points) == 0:
-            occupied_count = 0
+        clutter_points=points_body[np.all((points_body>=self.roi_min) & (points_body<self.roi_max),axis=1)]
+        clutter_points=clutter_points[~np.all((clutter_points>=self.vehicle_min) & (clutter_points<=self.vehicle_max),axis=1)]
+        clutter_points=clutter_points[np.abs(clutter_points[:,2]-self.ground_z)>=self.ground_margin]
+        if len(clutter_points)==0:
+            occupied_count=0
         else:
-            voxel_indices = np.floor((points - self.roi_min) / self.voxel_size).astype(np.int32)
-            occupied_voxels = np.unique(voxel_indices, axis=0)
-            occupied_count = len(occupied_voxels)
-
-
+            clutter_voxel_indices=np.floor((clutter_points-self.roi_min)/self.voxel_size).astype(np.int32)
+            occupied_count=len(np.unique(clutter_voxel_indices,axis=0))
         if self.N_dense<=self.N_open:
             rospy.logerr("N_dense must be greater than N_open.")
             return
-        clutter_level = float(np.clip((occupied_count - self.N_open) / (self.N_dense - self.N_open), 0.0, 1.0))
+        clutter_level=float(np.clip((occupied_count-self.N_open)/(self.N_dense-self.N_open),0.0,1.0))
+
+        voxel_counts: dict[tuple[int,int,int],list[int]]={}
+        for point in self.lidar_points_world:
+            free_voxels,occupied_voxel=self._raycast_voxels(self.lidar_origin_world,point,self.roi_min,self.voxel_size)
+            for free_voxel in free_voxels:
+                counts=voxel_counts.setdefault(free_voxel,[0,0])
+                counts[0]+=1
+            counts=voxel_counts.setdefault(occupied_voxel,[0,0])
+            counts[1]+=1
+        voxel_messages=[VoxelObservationMsg(x=voxel[0],y=voxel[1],z=voxel[2],free_observations=counts[0],occupied_observations=counts[1]) for voxel,counts in voxel_counts.items()]
+        voxel_frame=SpatialObservationFrame()
+        voxel_frame.header.stamp=cloud.header.stamp
+        voxel_frame.header.frame_id=vehicle_pose.header.frame_id
+        voxel_frame.voxels=voxel_messages
+        voxel_frame.voxel_size=self.voxel_size
+        voxel_frame.grid_origin.x=self.roi_min[0]
+        voxel_frame.grid_origin.y=self.roi_min[1]
+        voxel_frame.grid_origin.z=self.roi_min[2]
+        voxel_frame.source_id="UGV LiDAR"
+
+        self.voxel_publisher.publish(voxel_frame)
         self.clutter_publisher.publish(Float64(data=clutter_level))
-
-
 
     def _battery_callback(self,battery_msg):
         with self.state_lock:
@@ -143,8 +168,85 @@ class UGVAdapter(VehicleAdapter):
         with self.state_lock:
             self.state.position=Position(x=gnss_position.pose.pose.position.x,y=gnss_position.pose.pose.position.y,z=gnss_position.pose.pose.position.z)
             self.state.orientation=Orientation(pitch=pitch,yaw=yaw,roll=roll)
+            self.vehicle_pose=deepcopy(gnss_position)
         self.pose_publisher.publish(gnss_position)
-        
+
+    def _lidar_to_world(self,points_body: np.ndarray,vehicle_pose: Odometry)->tuple[np.ndarray,np.ndarray]:
+        """Transform body-frame LiDAR points and the LiDAR origin into the pose's world frame."""
+        points=np.asarray(points_body,dtype=np.float64)
+        if points.ndim!=2 or points.shape[1]!=3:
+            raise ValueError("points_body must be an Nx3 array of body-frame xyz coordinates.")
+        if not np.all(np.isfinite(points)):
+            raise ValueError("points_body must contain only finite values.")
+
+        pose=vehicle_pose.pose.pose
+        translation=np.array([pose.position.x,pose.position.y,pose.position.z],dtype=np.float64)
+        quaternion=np.array([pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w],dtype=np.float64)
+        if not np.all(np.isfinite(translation)) or not np.all(np.isfinite(quaternion)) or np.linalg.norm(quaternion)==0:
+            raise ValueError("vehicle_pose must contain a finite position and a non-zero finite quaternion.")
+
+        rotation=quaternion_matrix(quaternion)[:3,:3]
+        points_world=points@rotation.T+translation
+        lidar_origin_world=rotation@self.lidar_to_body_translation+translation
+        return points_world,lidar_origin_world
+
+    def _raycast_voxels(self,origin_world: np.ndarray,endpoint_world: np.ndarray,grid_origin: np.ndarray,voxel_size: float)->tuple[list[tuple[int,int,int]],tuple[int,int,int]]:
+        """Return free voxels traversed by a ray and its occupied endpoint voxel."""
+        origin=np.asarray(origin_world,dtype=np.float64)
+        endpoint=np.asarray(endpoint_world,dtype=np.float64)
+        grid_origin=np.asarray(grid_origin,dtype=np.float64)
+
+        if origin.shape!=(3,) or endpoint.shape!=(3,) or grid_origin.shape!=(3,):
+            raise ValueError("origin_world, endpoint_world, and grid_origin must have shape (3,)")
+        if not np.all(np.isfinite(origin)) or not np.all(np.isfinite(endpoint)) or not np.all(np.isfinite(grid_origin)):
+            raise ValueError("Ray coordinates must be finite")
+        if not np.isfinite(voxel_size) or voxel_size<=0:
+            raise ValueError("voxel_size must be finite and positive")
+
+        current=np.floor((origin-grid_origin)/voxel_size).astype(np.int64)
+        target=np.floor((endpoint-grid_origin)/voxel_size).astype(np.int64)
+
+        if np.array_equal(current,target):
+            target_index=(int(target[0]),int(target[1]),int(target[2]))
+            return [],target_index
+
+        direction=endpoint-origin
+        step=np.sign(direction).astype(np.int64)
+        t_delta=np.full(3,np.inf,dtype=np.float64)
+        t_max=np.full(3,np.inf,dtype=np.float64)
+
+        for axis in range(3):
+            if direction[axis]==0:
+                continue
+
+            t_delta[axis]=voxel_size/abs(direction[axis])
+
+            if step[axis]>0:
+                boundary=grid_origin[axis]+(current[axis]+1)*voxel_size
+            else:
+                boundary=grid_origin[axis]+current[axis]*voxel_size
+
+            t_max[axis]=(boundary-origin[axis])/direction[axis]
+
+        free_voxels=[]
+        maximum_steps=int(np.abs(target-current).sum())+3
+
+        while not np.array_equal(current,target):
+            free_voxels.append((int(current[0]),int(current[1]),int(current[2])))
+
+            next_crossing=float(np.min(t_max))
+            crossed_axes=np.flatnonzero(np.isclose(t_max,next_crossing,rtol=0.0,atol=1e-12))
+
+            for axis in crossed_axes:
+                current[axis]+=step[axis]
+                t_max[axis]+=t_delta[axis]
+
+            if len(free_voxels)>maximum_steps:
+                raise RuntimeError("Voxel ray-casting exceeded its expected step count")
+
+        target_index=(int(target[0]),int(target[1]),int(target[2]))
+        return free_voxels,target_index
+
 
     def get_state(self):
         with self.state_lock:

@@ -13,6 +13,8 @@ add_message_files(
   FILES
   ObjectDetection.msg
   ObservationFrame.msg
+  VoxelObservation.msg
+  SpatialObservationFrame.msg
 )
 
 generate_messages(

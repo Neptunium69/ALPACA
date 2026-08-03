@@ -11,11 +11,10 @@ import message_filters
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import math
-from alpaca_msgs.msg import ObservationFrame, ObjectDetection
+from alpaca_msgs.msg import ObservationFrame, ObjectDetection,SpatialObservationFrame
 from sklearn.neighbors import KNeighborsClassifier
 from math import e
 import json
-
 
 @dataclass
 class Position:
@@ -54,13 +53,29 @@ class Object:
             self.confidence_scores.setdefault(key, value)
 
 @dataclass
+class Voxel:
+    position: Position
+    state: int
+    rawscore: float = 0
+    score: float = 0.5
+
+@dataclass
 class Model:
     objects: list[Object] = field(default_factory=list)
+
+@dataclass
+class VoxelModel:
+    voxelsize: float
+    voxels: list[Voxel] = field(default_factory=list)
+    grid_origin: Position | None = None
+    frame_id: str | None = None
 
 class WorldModel:
     def __init__(self, observations: Model, detection_classes):
         self.observations = observations
         self.detection_classes = tuple(detection_classes)
+        self.voxelmap = VoxelModel(voxelsize=float("nan"), voxels=[], grid_origin=None, frame_id=None)
+        self._voxel_lookup: dict[tuple[int,int,int],Voxel]={}
         self._bridge = CvBridge()
         self._latest_frame=None
         self._latest_depth=None
@@ -73,8 +88,10 @@ class WorldModel:
             rospy.init_node("world_model_node", anonymous=True)
         self.detection_subscriber=message_filters.Subscriber("detections", ObservationFrame)
         self.depth_subscriber=message_filters.Subscriber("camera_depth", Image)
+        self.voxel_subscriber=rospy.Subscriber("voxel_observations",SpatialObservationFrame,callback=self._voxel_callback)
         self.synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.detection_subscriber], queue_size=10, slop=0.05)
         self.synchronizer.registerCallback(self._update_callback)
+        rospy.spin()
 
     @staticmethod
     def sigmoid(x):
@@ -98,6 +115,51 @@ class WorldModel:
                 return
 
             self.observations.objects[:] = working_objects
+
+    def _voxel_callback(self, message: SpatialObservationFrame):
+        voxel_size=float(message.voxel_size)
+        origin_array=np.array([message.grid_origin.x,message.grid_origin.y,message.grid_origin.z],dtype=np.float64)
+        frame_id=message.header.frame_id
+        if not math.isfinite(voxel_size) or voxel_size<=0 or not np.all(np.isfinite(origin_array)):
+            rospy.logerr("Received voxel map with an invalid voxel size or grid origin.")
+            return
+        if not frame_id:
+            rospy.logerr("Received voxel map with an empty frame ID.")
+            return
+
+        with self._lock:
+            if self.voxelmap.grid_origin is None:
+                self.voxelmap.voxelsize=voxel_size
+                self.voxelmap.grid_origin=Position(x=float(origin_array[0]),y=float(origin_array[1]),z=float(origin_array[2]))
+                self.voxelmap.frame_id=frame_id
+            else:
+                stored_origin=np.array([self.voxelmap.grid_origin.x,self.voxelmap.grid_origin.y,self.voxelmap.grid_origin.z],dtype=np.float64)
+                if not math.isclose(self.voxelmap.voxelsize,voxel_size,rel_tol=0.0,abs_tol=1e-9) or not np.allclose(stored_origin,origin_array,rtol=0.0,atol=1e-9) or self.voxelmap.frame_id!=frame_id:
+                    rospy.logerr("Received voxel map whose size, origin, or frame differs from the established grid.")
+                    return
+
+            if not message.voxels:
+                rospy.logwarn("Received empty voxel map message.")
+                return
+
+            for observation in message.voxels:
+                index=(int(observation.x),int(observation.y),int(observation.z))
+                occupied=int(observation.occupied_observations)
+                free=int(observation.free_observations)
+                if occupied==0 and free==0:
+                    continue
+                rawscore_delta=0.2 if 2*occupied>=free else -0.2
+                voxel=self._voxel_lookup.get(index)
+                if voxel is None:
+                    position_array=origin_array+np.asarray(index,dtype=np.float64)*voxel_size
+                    score=self.sigmoid(rawscore_delta)
+                    voxel=Voxel(position=Position(x=float(position_array[0]),y=float(position_array[1]),z=float(position_array[2])),state=int(score>=0.5),rawscore=rawscore_delta,score=score)
+                    self._voxel_lookup[index]=voxel
+                    self.voxelmap.voxels.append(voxel)
+                else:
+                    voxel.rawscore+=rawscore_delta
+                    voxel.score=self.sigmoid(voxel.rawscore)
+                    voxel.state=int(voxel.score>=0.5)
 
     def _apply_detections(self, objects: list[Object], detection_list: list[ObjectDetection], frame: ObservationFrame, depthmap: Image) -> None:
         observed_list=[]
@@ -297,6 +359,22 @@ class WorldModel:
 
         raise ValueError("flag must be 0 for camera-to-world or 1 for world-to-camera")
 
+    def _lidar_transform(self,observation: ObservationFrame,flag: int=0)->np.ndarray:
+        """Return the body-to-world transform or its inverse for body-frame LiDAR points."""
+        pose=observation.vehicle_pose.pose.pose
+        q_WB=pose.orientation
+
+        T_WB=np.eye(4,dtype=float)
+        T_WB[:3,:3]=Rotation.from_quat([q_WB.x,q_WB.y,q_WB.z,q_WB.w]).as_matrix()
+        T_WB[:3,3]=[pose.position.x,pose.position.y,pose.position.z]
+
+        if flag==0:
+            return T_WB
+        if flag==1:
+            return np.linalg.inv(T_WB)
+
+        raise ValueError("flag must be 0 for body-to-world or 1 for world-to-body")
+
     def w2c(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
         position=np.append(np.asarray(position,dtype=float),1.0)
         transform=self._camera_transform(frame,1)
@@ -308,6 +386,65 @@ class WorldModel:
         transform=self._camera_transform(frame,0)
         newpos=transform@position
         return newpos[:3]
+
+    def w2l(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
+        """Convert a world-frame point to the LiDAR cloud's body frame."""
+        position=np.append(np.asarray(position,dtype=float),1.0)
+        transform=self._lidar_transform(frame,1)
+        newpos=transform@position
+        return newpos[:3]
+
+    def l2w(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
+        """Convert a body-frame LiDAR cloud point to the world frame."""
+        position=np.append(np.asarray(position,dtype=float),1.0)
+        transform=self._lidar_transform(frame,0)
+        newpos=transform@position
+        return newpos[:3]
+
+    def position_to_voxel(self,position: np.ndarray,grid_origin: np.ndarray,voxel_size:float) -> tuple[int,int,int]:
+        index=np.floor((position-grid_origin)/voxel_size).astype(np.int32)
+        return int(index[0]),int(index[1]),int(index[2])
+
+    def _get_voxel_regions(self,minimum: Position,maximum: Position)->list[int]:
+        """Return [filled, empty, unknown] voxel counts within a world-frame bounding box."""
+        coordinates=np.array([minimum.x,minimum.y,minimum.z,maximum.x,maximum.y,maximum.z],dtype=np.float64)
+        if not np.all(np.isfinite(coordinates)):
+            raise ValueError("Bounding-box coordinates must be finite.")
+        minimum_array=coordinates[:3]
+        maximum_array=coordinates[3:]
+        if np.any(minimum_array>=maximum_array):
+            raise ValueError("Bounding-box minimum must be smaller than its maximum.")
+
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=self.voxelmap.grid_origin
+            if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+                raise ValueError("Voxel-grid size and origin have not been initialized.")
+
+            origin_array=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+            minimum_index=np.floor((minimum_array-origin_array)/voxel_size).astype(np.int64)
+            maximum_index=np.ceil((maximum_array-origin_array)/voxel_size).astype(np.int64)
+            region_shape=maximum_index-minimum_index
+            total_voxels=int(np.prod(region_shape,dtype=np.int64))
+            known_voxels=[voxel for index,voxel in self._voxel_lookup.items() if minimum_index[0]<=index[0]<maximum_index[0] and minimum_index[1]<=index[1]<maximum_index[1] and minimum_index[2]<=index[2]<maximum_index[2]]
+            filled=sum(voxel.state==1 for voxel in known_voxels)
+            empty=sum(voxel.state==0 for voxel in known_voxels)
+            unknown=total_voxels-len(known_voxels)
+            return [filled,empty,unknown]
+
+    def get_unknown_score(self,minimum:Position,maximum:Position)->float:
+        voxel_regions=self._get_voxel_regions(minimum,maximum)
+        score=voxel_regions[2]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
+        return score
+
+    def get_filled_score(self,minimum:Position,maximum:Position)->float:
+        voxel_regions=self._get_voxel_regions(minimum,maximum)
+        score=voxel_regions[0]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
+        return score
+    def get_empty_score(self,minimum:Position,maximum:Position)->float:
+        voxel_regions=self._get_voxel_regions(minimum,maximum)
+        score=voxel_regions[1]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
+        return score
 
     def bounding_box_to_world(self,bounding_box)->Position:
         with self._lock:
