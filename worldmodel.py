@@ -11,6 +11,7 @@ import message_filters
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import math
+from nav_msgs.msg import Odometry
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection,SpatialObservationFrame
 from sklearn.neighbors import KNeighborsClassifier
 from math import e
@@ -404,6 +405,87 @@ class WorldModel:
     def position_to_voxel(self,position: np.ndarray,grid_origin: np.ndarray,voxel_size:float) -> tuple[int,int,int]:
         index=np.floor((position-grid_origin)/voxel_size).astype(np.int32)
         return int(index[0]),int(index[1]),int(index[2])
+
+    def get_vehicle_voxels(self,vehicle_pose:Odometry,vehicle_min: np.ndarray,vehicle_max: np.ndarray)->list[tuple[int,int,int]]:
+        """Obtain the current occupied voxels of the vehicle"""
+        if vehicle_pose is None:
+            raise ValueError("Vehicle pose has not been initialized.")
+        pose=vehicle_pose.pose.pose
+        translation=np.array([pose.position.x,pose.position.y,pose.position.z],dtype=np.float64)
+        quaternion=np.array([pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w],dtype=np.float64)
+        if not np.all(np.isfinite(translation)) or not np.all(np.isfinite(quaternion)) or np.linalg.norm(quaternion)==0:
+            raise ValueError("Vehicle pose must contain a finite position and a non-zero finite quaternion.")
+        rotation=Rotation.from_quat(quaternion).as_matrix()
+        return self._get_vehicle_voxels_from_transform(translation,rotation,vehicle_min,vehicle_max)
+
+    def get_vehicle_voxels_at_pose(self,position:Position,orientation:Orientation,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
+        """Obtain the vehicle's occupied voxels at a given pose."""
+        pose_values=np.array([position.x,position.y,position.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
+        if not np.all(np.isfinite(pose_values)):
+            raise ValueError("Target position and orientation must contain only finite values.")
+        translation=pose_values[:3]
+        rotation=Rotation.from_euler("xyz",[orientation.roll,orientation.pitch,orientation.yaw]).as_matrix()
+        return self._get_vehicle_voxels_from_transform(translation,rotation,vehicle_min,vehicle_max)
+
+    def _get_vehicle_voxels_from_transform(self,translation:np.ndarray,rotation:np.ndarray,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
+        """Obtaine the vehicle's occupied voxels after performing a transformation."""
+        vehicle_min=np.asarray(vehicle_min,dtype=np.float64)
+        vehicle_max=np.asarray(vehicle_max,dtype=np.float64)
+        if vehicle_min.shape!=(3,) or vehicle_max.shape!=(3,) or not np.all(np.isfinite(vehicle_min)) or not np.all(np.isfinite(vehicle_max)) or np.any(vehicle_min>=vehicle_max):
+            raise ValueError("Invalid vehicle dimensions.")
+        translation=np.asarray(translation,dtype=np.float64)
+        rotation=np.asarray(rotation,dtype=np.float64)
+        if translation.shape!=(3,) or rotation.shape!=(3,3) or not np.all(np.isfinite(translation)) or not np.all(np.isfinite(rotation)):
+            raise ValueError("Invalid vehicle pose transform.")
+
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=self.voxelmap.grid_origin
+
+        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+            raise ValueError("Voxel grid has not been initialized.")
+
+        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+
+        body_corners=np.array([[x,y,z] for x in (vehicle_min[0],vehicle_max[0]) for y in (vehicle_min[1],vehicle_max[1]) for z in (vehicle_min[2],vehicle_max[2])],dtype=np.float64)
+        world_corners=body_corners@rotation.T+translation
+        minimum_index=np.floor((world_corners.min(axis=0)-origin)/voxel_size).astype(np.int64)
+        maximum_index=np.ceil((world_corners.max(axis=0)-origin)/voxel_size).astype(np.int64)
+
+        voxel_half_extent=np.full(3,voxel_size/2.0,dtype=np.float64)
+        body_frame_padding=np.abs(rotation.T)@voxel_half_extent
+        indices=[]
+
+        for x in range(int(minimum_index[0]),int(maximum_index[0])):
+            for y in range(int(minimum_index[1]),int(maximum_index[1])):
+                for z in range(int(minimum_index[2]),int(maximum_index[2])):
+                    index=(x,y,z)
+                    voxel_center_world=origin+(np.asarray(index,dtype=np.float64)+0.5)*voxel_size
+                    voxel_center_body=rotation.T@(voxel_center_world-translation)
+                    overlaps=np.all(voxel_center_body+body_frame_padding>vehicle_min) and np.all(voxel_center_body-body_frame_padding<vehicle_max)
+                    if overlaps:
+                        indices.append(index)
+
+        return indices
+
+    def get_voxel_map_frame(self)->str | None:
+        with self._lock:
+            return self.voxelmap.frame_id
+
+    def get_voxel_size(self)->float:
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+        if not math.isfinite(voxel_size) or voxel_size<=0:
+            raise ValueError("Voxel grid has not been initialized.")
+        return voxel_size
+
+    def get_voxel_states(self,indices:list[tuple[int,int,int]])->list[int | None]:
+        with self._lock:
+            states=[]
+            for index in indices:
+                voxel=self._voxel_lookup.get(index)
+                states.append(None if voxel is None else voxel.state)
+            return states
 
     def _get_voxel_regions(self,minimum: Position,maximum: Position)->list[int]:
         """Return [filled, empty, unknown] voxel counts within a world-frame bounding box."""

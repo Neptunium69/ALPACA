@@ -14,8 +14,9 @@ import rospy
 import message_filters
 from threading import Lock
 from copy import deepcopy
-from nav_msgs.msg import Odometry
-from geometry_msgs.msg import TwistStamped
+from nav_msgs.msg import Odometry,Path
+from nav_msgs.srv import GetPlan,GetPlanRequest
+from geometry_msgs.msg import PoseStamped,TwistStamped
 from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelObservationMsg
 from sensor_msgs.msg import Image, BatteryState,CameraInfo, PointCloud2
 from tf.transformations import euler_from_quaternion,quaternion_from_euler,quaternion_matrix
@@ -37,6 +38,10 @@ class VoxelObservation():
 
 class VehicleAdapter(Protocol):
     state: State
+    @property
+    def navigation_frame(self) -> str:
+        """Return the coordinate frame used for navigation goals."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
     def get_state(self) -> State:
         """Returns the current state of the vehicle as a State Object."""
         raise NotImplementedError("This method should be implemented by subclasses.")
@@ -46,7 +51,13 @@ class VehicleAdapter(Protocol):
     def inspect(self, object_id: str) -> None:
         """Inspect an object in the world model."""
         raise NotImplementedError("This method should be implemented by subclasses.")
-    def navigate(self, destination: Position, orientation: Orientation) -> None:
+    def get_collision_geometry(self) -> tuple[Odometry | None,np.ndarray,np.ndarray]:
+        """Return the latest pose and body-frame collision bounds."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
+    def plan_path(self, destination: Position, orientation: Orientation, frame_id: str | None=None, tolerance: float=0.0) -> Path:
+        """Return a planned path without commanding the vehicle to move."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
+    def navigate(self, destination: Position, orientation: Orientation, frame_id: str | None=None) -> None:
         """Navigate to a specified destination."""
         raise NotImplementedError("This method should be implemented by subclasses.")
     def scan(self) -> None:
@@ -62,6 +73,11 @@ class UGVAdapter(VehicleAdapter):
         self.worldmodel=worldmodel
         self.state_lock=Lock()
         self.client=None
+        self.make_plan_service=None
+        navigation_frame=kwargs.get("navigation_frame","map")
+        if not isinstance(navigation_frame,str) or not navigation_frame.strip():
+            raise ValueError("Navigation frame must be a non-empty string.")
+        self._navigation_frame:str=navigation_frame
         self.voxel_size = 0.05
         self.vehicle_pose=None
         self.lidar_points_world=None
@@ -77,6 +93,10 @@ class UGVAdapter(VehicleAdapter):
         self.N_dense = 20
         self.lidar_to_body_translation = np.array([-0.011, -0.02329, 0.04412],dtype=np.float64)
         self.lidar_to_body_rotation = np.eye(3,dtype=np.float64)
+
+    @property
+    def navigation_frame(self)->str:
+        return self._navigation_frame
 
     def init_sensordata(self) -> None:
         if not rospy.core.is_initialized():
@@ -98,6 +118,11 @@ class UGVAdapter(VehicleAdapter):
         self.clutter_publisher = rospy.Publisher("clutter_level",Float64,queue_size=1)
         if not self.client.wait_for_server(rospy.Duration(secs=5)):
             raise RuntimeError("The move_base action server is unavailable.")
+        try:
+            rospy.wait_for_service("/move_base/make_plan",timeout=5.0)
+        except rospy.ROSException as error:
+            raise RuntimeError("The move_base planning service is unavailable.") from error
+        self.make_plan_service=rospy.ServiceProxy("/move_base/make_plan",GetPlan)
 
         self.gnss_position_subscriber = message_filters.Subscriber("mavros/global_position/local",Odometry,queue_size=10)
         self.gnss_position_subscriber.registerCallback(self._pose_callback)
@@ -252,6 +277,58 @@ class UGVAdapter(VehicleAdapter):
         with self.state_lock:
             return deepcopy(self.state)
 
+    def get_collision_geometry(self)->tuple[Odometry | None,np.ndarray,np.ndarray]:
+        with self.state_lock:
+            return deepcopy(self.vehicle_pose),self.vehicle_min.copy(),self.vehicle_max.copy()
+
+    def plan_path(self,destination:Position,orientation:Orientation,frame_id:str | None=None,tolerance:float=0.0)->Path:
+        """Plan a path for RCM to evaluate."""
+        if self.make_plan_service is None:
+            raise RuntimeError("move_base is not initialized yet.")
+        goal_values=np.array([destination.x,destination.y,destination.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
+        if not np.all(np.isfinite(goal_values)):
+            raise ValueError("Planning position and orientation must contain only finite values.")
+        frame_id=self.navigation_frame if frame_id is None else frame_id
+        if not isinstance(frame_id,str) or not frame_id.strip():
+            raise ValueError("Planning frame must be a non-empty string.")
+        if not isinstance(tolerance,(int,float)) or isinstance(tolerance,bool) or not isfinite(tolerance) or tolerance<0:
+            raise ValueError("Planning tolerance must be a finite, non-negative number.")
+        with self.state_lock:
+            vehicle_pose=deepcopy(self.vehicle_pose)
+        if vehicle_pose is None:
+            raise RuntimeError("Vehicle pose is unavailable.")
+        if vehicle_pose.header.frame_id!=frame_id:
+            raise ValueError(f"Planning frame mismatch: vehicle={vehicle_pose.header.frame_id!r}, goal={frame_id!r}.")
+
+        start=PoseStamped()
+        start.header.stamp=rospy.Time.now()
+        start.header.frame_id=frame_id
+        start.pose=deepcopy(vehicle_pose.pose.pose)
+        goal=PoseStamped()
+        goal.header.stamp=start.header.stamp
+        goal.header.frame_id=frame_id
+        goal.pose.position.x=destination.x
+        goal.pose.position.y=destination.y
+        goal.pose.position.z=destination.z
+        qx,qy,qz,qw=quaternion_from_euler(orientation.roll,orientation.pitch,orientation.yaw)
+        goal.pose.orientation.x=qx
+        goal.pose.orientation.y=qy
+        goal.pose.orientation.z=qz
+        goal.pose.orientation.w=qw
+
+        try:
+            response=self.make_plan_service(GetPlanRequest(start=start,goal=goal,tolerance=float(tolerance)))
+        except rospy.ServiceException as error:
+            raise RuntimeError(f"move_base failed to generate a path: {error}") from error
+        path=response.plan
+        if not path.poses:
+            raise RuntimeError("move_base returned an empty path.")
+        if path.header.frame_id and path.header.frame_id!=frame_id:
+            raise ValueError(f"Planned path uses frame {path.header.frame_id!r}, expected {frame_id!r}.")
+        if any(pose.header.frame_id and pose.header.frame_id!=frame_id for pose in path.poses):
+            raise ValueError("The planned path contains poses in an unexpected coordinate frame.")
+        return path
+
     def scan(self, yaw_margin: float=0.1) -> None:
         """Rotate 360 degrees while collecting sensor data(Data collection is not done in this script)"""
         marginmax=pi/6
@@ -314,12 +391,18 @@ class UGVAdapter(VehicleAdapter):
             finally:     
                 subscriber.unregister()
 
-    def navigate(self, destination: Position, orientation: Orientation) -> None:
+    def navigate(self, destination: Position, orientation: Orientation, frame_id: str | None=None) -> None:
         """Navigate Tool: Navigate to a specified destination using the move_base action server."""
         if self.client is None:
             raise RuntimeError("Sensor data must be initialized before navigation.")
+        goal_values=np.array([destination.x,destination.y,destination.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
+        if not np.all(np.isfinite(goal_values)):
+            raise ValueError("Navigation position and orientation must contain only finite values.")
+        frame_id=self.navigation_frame if frame_id is None else frame_id
+        if not isinstance(frame_id,str) or not frame_id.strip():
+            raise ValueError("Navigation frame must be a non-empty string.")
         goal=MoveBaseGoal()
-        goal.target_pose.header.frame_id="map"
+        goal.target_pose.header.frame_id=frame_id
         goal.target_pose.header.stamp=rospy.Time.now()
         goal.target_pose.pose.position.x=destination.x
         goal.target_pose.pose.position.y=destination.y
