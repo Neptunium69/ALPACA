@@ -479,6 +479,18 @@ class WorldModel:
             raise ValueError("Voxel grid has not been initialized.")
         return voxel_size
 
+    def voxel_to_position(self,index:tuple[int,int,int])->Position:
+        if len(index)!=3 or any(not isinstance(component,int) or isinstance(component,bool) for component in index):
+            raise ValueError("Voxel index must contain exactly three integers.")
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=deepcopy(self.voxelmap.grid_origin)
+        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+            raise ValueError("Voxel map has not been initialized.")
+        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+        center=origin+(np.asarray(index,dtype=np.float64)+0.5)*voxel_size
+        return Position(x=float(center[0]),y=float(center[1]),z=float(center[2]))
+
     def get_voxel_states(self,indices:list[tuple[int,int,int]])->list[int | None]:
         with self._lock:
             states=[]
@@ -527,6 +539,29 @@ class WorldModel:
         voxel_regions=self._get_voxel_regions(minimum,maximum)
         score=voxel_regions[1]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
         return score
+
+    def hiddenpoint(self,object_id:str,vehicle_position:Position,distance_behind:float=0.5)->Position:
+        """Obtain coordinates of a point behind an object relative to the vehicle."""
+        if not isinstance(object_id,str) or not object_id.strip():
+            raise ValueError("Object ID must be a non-empty string.")
+        if not isinstance(distance_behind,(int,float)) or isinstance(distance_behind,bool) or not math.isfinite(distance_behind) or distance_behind<=0:
+            raise ValueError("distance_behind must be >=0 and finite.")
+        vehicle_array=np.array([vehicle_position.x,vehicle_position.y,vehicle_position.z],dtype=np.float64)
+        if not np.all(np.isfinite(vehicle_array)):
+            raise ValueError("Vehicle position must contain only finite values.")
+        with self._lock:
+            world_object=next((candidate for candidate in self.observations.objects if candidate.id==object_id),None)
+            if world_object is None:
+                raise KeyError(f"Object {object_id!r} does not exist in the current world model.")
+            object_array=np.array([world_object.position.x,world_object.position.y,world_object.position.z],dtype=np.float64)
+        if not np.all(np.isfinite(object_array)):
+            raise ValueError(f"Object {object_id!r}'s position is invalid.")
+        direction=object_array-vehicle_array
+        direction_length=float(np.linalg.norm(direction))
+        if direction_length<=np.finfo(np.float64).eps:
+            raise ValueError("Vehicle object positions overlap. Thus, a \"behind\" cannot be defined. ")
+        point=object_array+(float(distance_behind)/direction_length)*direction
+        return Position(x=float(point[0]),y=float(point[1]),z=float(point[2]))
 
     def bounding_box_to_world(self,bounding_box)->Position:
         with self._lock:

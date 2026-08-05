@@ -21,7 +21,9 @@ from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelOb
 from sensor_msgs.msg import Image, BatteryState,CameraInfo, PointCloud2
 from tf.transformations import euler_from_quaternion,quaternion_from_euler,quaternion_matrix
 from . import worldmodel as wm
+from . import risk
 from .worldmodel import Position,Orientation
+from .risk import PathVoxelAssessment, VantagePoint
 
 @dataclass
 class State():
@@ -66,11 +68,15 @@ class VehicleAdapter(Protocol):
     def sensordata(self) -> None:
         """Collect raw sensor data from the vehicle's sensors."""
         raise NotImplementedError("This method should be implemented by subclasses.")
+    def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
+        """Find a mostly known voxel ring around the unknown region."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
 
 class UGVAdapter(VehicleAdapter):
-    def __init__(self, state: State, worldmodel: wm.WorldModel, *args, **kwargs) -> None:
+    def __init__(self, state: State, risk:risk.RiskCal, worldmodel: wm.WorldModel, *args, **kwargs) -> None:
         self.state=state
         self.worldmodel=worldmodel
+        self.riskcal=risk
         self.state_lock=Lock()
         self.client=None
         self.make_plan_service=None
@@ -136,6 +142,27 @@ class UGVAdapter(VehicleAdapter):
         self.camera_synchronizer.registerCallback(self._adapter_callback)
         self.lidar_synchronizer = message_filters.ApproximateTimeSynchronizer([self.lidar_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.03)
         self.lidar_synchronizer.registerCallback(self._lidar_callback)
+
+    def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
+        if not isinstance(max_updates,int) or isinstance(max_updates,bool) or max_updates<1:
+            raise ValueError("max_updates must be a positive integer.")
+        center=self.riskcal.center(pathvoxel)
+        voxellist:set[tuple[int,int,int]]={center}
+        visited:set[tuple[int,int,int]]={center}
+        for _ in range(max_updates):
+            voxelnew:set[tuple[int,int,int]]=set()
+            for voxel in voxellist:
+                voxelnew.update((voxel[0]+dx,voxel[1]+dy,voxel[2]) for dx in (-1,0,1) for dy in (-1,0,1) if not(dx==0 and dy==0))
+            voxelnew.difference_update(visited)
+            if not voxelnew:
+                return set()
+            voxelstates=self.worldmodel.get_voxel_states(list(voxelnew))
+            known_count=sum(state is not None for state in voxelstates)
+            if known_count/len(voxelnew)>0.5:
+                return voxelnew
+            visited.update(voxelnew)
+            voxellist=voxelnew
+        raise RuntimeError(f"Could not find a voxel ring with more than 50% known voxels after {max_updates} updates.")
 
     def _lidar_callback(self,cloud: PointCloud2,vehicle_pose: Odometry)->None:
         points_body=np.asarray(list(pc2.read_points(cloud,field_names=("x","y","z"),skip_nans=True)),dtype=np.float64).reshape(-1,3)

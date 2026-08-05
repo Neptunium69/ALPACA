@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING,Any,Protocol
+from typing import TYPE_CHECKING,Any,Callable,Protocol
 
 import numpy as np
 import rospy
 from std_msgs.msg import Float64
 from dataclasses import dataclass
 from . import worldmodel as wm
+from . import vehicleadapter as va
 from .worldmodel import Voxel
 from . import tools
 
@@ -16,53 +17,77 @@ if TYPE_CHECKING:
     from .vehicleadapter import State
     from .worldmodel import Orientation,Position
 
-class CommandLike(Protocol):
-    @property
-    def command_type(self)->str: ...
-
 @dataclass
 class ActionPrediction:
-    cmd: CommandLike
+    cmd: tools.Command
     potential_voxels: set[tuple[int,int,int]]
     distance: float
     terminal_position: Position
     terminal_orientation: Orientation
     frame_id: str
 
-class RiskAdapter(Protocol):
-    @property
-    def navigation_frame(self)->str: ...
-    def get_state(self)->State: ...
-    def get_collision_geometry(self)->tuple[Odometry | None,Any,Any]: ...
-    def plan_path(self,destination:Position,orientation:Orientation,frame_id:str | None=None,tolerance:float=0.0)->Path: ...
+@dataclass
+class PathVoxelAssessment:
+    occupied_voxels: set[tuple[int,int,int]]
+    free_voxels: set[tuple[int,int,int]]
+    unknown_voxels: set[tuple[int,int,int]]
 
-class RiskWorldModel(Protocol):
-    def get_voxel_map_frame(self)->str | None: ...
-    def get_voxel_size(self)->float: ...
-    def get_vehicle_voxels_at_pose(self,position:Position,orientation:Orientation,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]: ...
-    def get_voxel_states(self,indices:list[tuple[int,int,int]])->list[int | None]: ...
+    @property
+    def total_count(self)->int:
+        return len(self.occupied_voxels)+len(self.free_voxels)+len(self.unknown_voxels)
+
+    @property
+    def unknown_score(self)->float:
+        return len(self.unknown_voxels)/self.total_count if self.total_count else 1.0
+
+    @property
+    def occupied_score(self)->float:
+        return len(self.occupied_voxels)/self.total_count if self.total_count else 1.0
+
+    @property
+    def free_score(self)->float:
+        return len(self.free_voxels)/self.total_count if self.total_count else 1.0
+
+@dataclass(frozen=True)
+class VantagePoint:
+    position: wm.Position
+    orientation: wm.Orientation
+    target_position: wm.Position
+    observable_voxels: frozenset[tuple[int,int,int]]
+    standoff_distance: float
+    straight_line_distance: float
 
 class RiskCal():
-    def __init__(self,model:RiskWorldModel,adapter:RiskAdapter)->None:
+    def __init__(self,model:wm.WorldModel,adapter:va.VehicleAdapter)->None:
         self.model=model
         self.adapter=adapter
-    def initrcm(self,model:RiskWorldModel,adapter:RiskAdapter)->None:
+
+    def initrcm(self,model:wm.WorldModel,adapter:va.VehicleAdapter)->None:
         if not rospy.core.is_initialized():
             rospy.init_node("RiskCal",anonymous=True)
-    def checkcmd(self,command:CommandLike,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:
+    def checkcmd(self,command:tools.Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:
         state=self.adapter.get_state()
         safe,reason=self._hardsafetyfilter(command,state,destination,orientation,frame_id)
         if not safe:
             return {"Safe":False,"Reason":reason}
+
         if command.command_type=="navigate":
-            try:
-                prediction=self.predict_navigation(command,destination,orientation,frame_id)
-            except (RuntimeError,TypeError,ValueError) as error:
-                return {"Safe":False,"Reason":f"Navigation prediction failed: {error}"}
-            return {"Safe":True,"Reason":reason,"Prediction":prediction}
+            if destination is None or orientation is None or frame_id is None:
+                return {"Safe":False,"Reason":"Missing Arguments"}
+            navresult=self.navigate(command=command,destination=destination,orientation=orientation,frame_id=frame_id)
+            return navresult
+
+        if command.command_type=="inspect":
+            hiddenpoint=self.model.hiddenpoint(command.arguments["target"],self.adapter.state.position)
+            orient=self.adapter.state.orientation
+            if destination is None or orientation is None or frame_id is None:
+                return {"Safe":False,"Reason":"Missing Arguments"}
+            navresult=self.navigate(command=command, destination=hiddenpoint,orientation=orient,frame_id=frame_id)
+            return navresult
+        
         return {"Safe":True,"Reason":reason}
 
-    def predict_navigation(self,command:CommandLike,destination:Position | None,orientation:Orientation | None,frame_id:str | None,coverage_margin:float=0.10)->ActionPrediction:
+    def predict_navigation(self,command:tools.Command,destination:Position | None,orientation:Orientation | None,frame_id:str | None,coverage_margin:float=0.10)->ActionPrediction:
         """Convert a move_base path into a conservative orientation-independent voxel envelope."""
         if destination is None or orientation is None or frame_id is None:
             raise ValueError("Navigation destination, orientation, and frame are required.")
@@ -117,7 +142,7 @@ class RiskCal():
                 raise ValueError("Planned path contains a non-finite position.")
             positions.append(wm.Position(x=float(values[0]),y=float(values[1]),z=float(values[2])))
         return positions
-    def _hardsafetyfilter(self,cmd:CommandLike,state:State,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->tuple[bool,str]:
+    def _hardsafetyfilter(self,cmd:tools.Command,state:State,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->tuple[bool,str]:
         if not isinstance(state.battery_level,(int,float)) or isinstance(state.battery_level,bool) or not math.isfinite(state.battery_level) or not 0.0<=state.battery_level<=1.0:
             return False,"Battery level is unavailable or invalid."
         if state.battery_level<0.15:
@@ -162,14 +187,96 @@ class RiskCal():
                 return False,f"Target footprint contains {unknown_count} unknown voxel(s)."
         return True,"Command is safe to execute."
 
-    def _cost_reward(self,cmd: tools.Command):
-        reward,cost=0,0
-        if cmd.command_type is "finish":
-            pass
-            # insert something to confirm with the Vision Language Model
-        if cmd.command_type is "ask_user":
-            pass
-            # insert something to determine if ask user is worth it.
-        if cmd.command_type is "inspect":
-            pass
-            # insert something to determine the unknown regions of the tagret.
+    def center(self,assessment:PathVoxelAssessment)->tuple[int,int,int]:
+        """Find a voxel approximately at the center of all voxels."""
+        if not assessment.unknown_voxels:
+            raise ValueError("No unknown voxels present.")
+        unknown_voxels=sorted(assessment.unknown_voxels)
+        coordinates=np.asarray(unknown_voxels,dtype=np.float64)
+        centroid=np.median(coordinates,axis=0)
+        nearest_voxel=min(unknown_voxels,key=lambda voxel:(float(np.sum((np.asarray(voxel,dtype=np.float64)-centroid)**2)),voxel))
+        return int(nearest_voxel[0]),int(nearest_voxel[1]),int(nearest_voxel[2])
+
+    def navigate(self,command:tools.Command,destination:Position,orientation:Orientation,frame_id:str,sensor_range:float=5.0,observation_probability:float=0.7,distance_cost_weight:float=0.2)->dict[str,Any]:
+        if not isinstance(sensor_range,(int,float)) or isinstance(sensor_range,bool) or not math.isfinite(sensor_range) or sensor_range<=0:
+            raise ValueError("sensor_range must be a finite, positive number.")
+        if not isinstance(observation_probability,(int,float)) or isinstance(observation_probability,bool) or not math.isfinite(observation_probability) or not 0.0<=observation_probability<=1.0:
+            raise ValueError("observation_probability must be between zero and one.")
+        if not isinstance(distance_cost_weight,(int,float)) or isinstance(distance_cost_weight,bool) or not math.isfinite(distance_cost_weight) or distance_cost_weight<0:
+            raise ValueError("distance_cost_weight must be a finite, non-negative number.")
+        try:
+            prediction=self.predict_navigation(command,destination,orientation,frame_id)
+        except (RuntimeError,TypeError,ValueError) as error:
+            return {"Safe":False,"Reason":f"Navigation prediction failed: {error}"}
+
+        free_voxels:set[tuple[int,int,int]]=set()
+        occupied_voxels:set[tuple[int,int,int]]=set()
+        unknown_voxels:set[tuple[int,int,int]]=set()
+        potential_voxels=list(prediction.potential_voxels)
+        voxel_states=self.model.get_voxel_states(potential_voxels)
+        for voxel,state in zip(potential_voxels,voxel_states):
+            if state==0:
+                free_voxels.add(voxel)
+            elif state==1:
+                occupied_voxels.add(voxel)
+            elif state is None:
+                unknown_voxels.add(voxel)
+            else:
+                return {"Safe":False,"Reason":f"Voxel {voxel!r} has invalid state {state!r}."}
+        pathvoxel=PathVoxelAssessment(occupied_voxels=occupied_voxels,unknown_voxels=unknown_voxels,free_voxels=free_voxels)
+        if pathvoxel.total_count==0:
+            return {"Safe":False,"Reason":"Navigation prediction contains no voxels."}
+        if pathvoxel.occupied_score>0.2:
+            return {"Safe":False,"Reason":"Path contains excessive obstacles."}
+
+        if (len(occupied_voxels)+len(unknown_voxels))/pathvoxel.total_count>0.2 and pathvoxel.occupied_score<0.2:
+            vp=self.adapter.vantagepoint(pathvoxel)
+            center_position=self.model.voxel_to_position(self.center(pathvoxel))
+            total_unknown_value=float(len(unknown_voxels))
+            reference_distance=max(prediction.distance,1.0)
+            options=[]
+
+            for vantage_voxel in sorted(vp):
+                vantage_state=self.model.get_voxel_states([vantage_voxel])[0]
+                if vantage_state!=0:
+                    continue
+                vantage_position=self.model.voxel_to_position(vantage_voxel)
+                vantage_yaw=math.atan2(center_position.y-vantage_position.y,center_position.x-vantage_position.x)
+                vantage_orientation=wm.Orientation(pitch=0.0,yaw=vantage_yaw,roll=0.0)
+                try:
+                    vantage_prediction=self.predict_navigation(command,vantage_position,vantage_orientation,frame_id)
+                except (RuntimeError,TypeError,ValueError):
+                    continue
+                vantage_path_states=self.model.get_voxel_states(list(vantage_prediction.potential_voxels))
+                if not vantage_path_states or any(state!=0 for state in vantage_path_states):
+                    continue
+
+                observable_voxels=set()
+                for unknown_voxel in unknown_voxels:
+                    unknown_position=self.model.voxel_to_position(unknown_voxel)
+                    distance=math.sqrt((unknown_position.x-vantage_position.x)**2+(unknown_position.y-vantage_position.y)**2+(unknown_position.z-vantage_position.z)**2)
+                    if distance<=sensor_range:
+                        observable_voxels.add(unknown_voxel)
+
+                information_reward=observation_probability*(len(observable_voxels)/total_unknown_value)
+                path_cost=distance_cost_weight*(vantage_prediction.distance/reference_distance)
+                profit=information_reward-path_cost
+                options.append({
+                    "Vantage Voxel":vantage_voxel,
+                    "Position":vantage_position,
+                    "Orientation":vantage_orientation,
+                    "Path Distance":vantage_prediction.distance,
+                    "Observable Voxels":observable_voxels,
+                    "Information Reward":information_reward,
+                    "Path Cost":path_cost,
+                    "Profit":profit,
+                })
+
+            if not options:
+                return {"Safe":False,"Reason":"No vantage points availible.","Needs Information":True,"Inform User":True}
+            best_option=max(options,key=lambda option:option["Profit"])
+            if best_option["Profit"]<=0:
+                return {"Safe":False,"Reason":"No vantage points have an expected value greater than cost.","Needs Information":True,"Inform User":True,"Vantage Options":options}
+            return {"Safe":False,"Reason":"Route requires more information.","Needs Information":True, "Inform User":False,"Best Vantage Point":best_option,"Vantage Options":options,"Prediction":prediction,"Assessment":pathvoxel}
+
+        return {"Safe":True,"Reason":"Route accepted.","Prediction":prediction,"Assessment":pathvoxel}
