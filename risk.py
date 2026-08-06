@@ -61,10 +61,6 @@ class RiskCal():
     def __init__(self,model:wm.WorldModel,adapter:va.VehicleAdapter)->None:
         self.model=model
         self.adapter=adapter
-
-    def initrcm(self,model:wm.WorldModel,adapter:va.VehicleAdapter)->None:
-        if not rospy.core.is_initialized():
-            rospy.init_node("RiskCal",anonymous=True)
     def checkcmd(self,command:tools.Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:
         state=self.adapter.get_state()
         safe,reason=self._hardsafetyfilter(command,state,destination,orientation,frame_id)

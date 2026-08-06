@@ -4,6 +4,7 @@ from . import worldmodel as wm
 from . import vehicleadapter as va
 from . import risk as rcm
 import cv2
+import json
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from .yolo import YOLOAdapter
@@ -110,15 +111,31 @@ class ToolExecutor:
                 "__relations__": [{"type":"at_least_one_of", "arguments":["completion_text_message","completion_image_message"]}]
             }),
         ]
-
     def execute(self, commands: list[Command]) -> list[Return]:
+        action=["navigate", "inspect", "scan", "ask_user", "finish"]
         results=[]
-        for command in commands:
+        actionresult=None
+        newcmd=commands
+        total=sum(element in action for element in commands)
+        if total<=1:
+            if any(element in action for element in commands):
+                overlap=next((element for element in action if element in commands),None)
+                if overlap!=None:
+                    actionresult=self._command_reader(command=overlap)
+                    newcmd=[element for element in commands if element not in action]
+        else:
+            for cmd in [element for element in commands if element in action]:
+                results.append(Return(id=cmd.id,command_type=cmd.command_type, status="Failed",results={"Error":"Multiple action commands were involved in one step"}))
+
+        for command in newcmd:
             if command.command_type not in command_list:
                 results.append(Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error:":f"{command.command_type} is not a valid command."}))
             else:
                 results.append(self._command_reader(command))
+            if(actionresult!=None):
+                results.append(actionresult)
         return results
+    
     def _command_reader(self, command: Command) -> Return:
         if not isinstance(command.id,str) or not command.id.strip():
             return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Command id must be a non-empty string."})
@@ -400,6 +417,56 @@ class ToolExecutor:
         except(KeyError,ValueError,TypeError) as error:
             return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error": str(error)})
 
-    
+    @staticmethod
+    def stringtocmd(output:str) -> list[Command]:
+        try:
+            envelope=json.loads(output)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"VLM output is not valid JSON: {error}") from error
+
+        if not isinstance(envelope,dict):
+            raise ValueError("VLM output must be a JSON object.")
+
+        if envelope.get("decision")=="await":
+            return [Command(id="awaitflag",command_type="await",arguments={})]
+
+        if envelope.get("decision")!="execute":
+            raise ValueError("Expected an execute decision.")
+
+        command_data=envelope.get("commands")
+        if not isinstance(command_data,list) or not command_data:
+            raise ValueError("commands must be a non-empty list.")
+
+        commands=[]
+        command_ids=set()
+
+        for index,item in enumerate(command_data):
+            if not isinstance(item,dict):
+                raise ValueError(f"Command {index} must be an object.")
+
+            if set(item)!={"id","command_type","arguments"}:
+                raise ValueError(f"Command {index} must contain exactly id, command_type, and arguments.")
+
+            command_id=item["id"]
+            command_type=item["command_type"]
+            arguments=item["arguments"]
+
+            if not isinstance(command_id,str) or not command_id.strip():
+                raise ValueError(f"Command {index} has an invalid id.")
+
+            if command_id in command_ids:
+                raise ValueError(f"Duplicate command id: {command_id}")
+
+            if not isinstance(command_type,str) or not command_type.strip():
+                raise ValueError(f"Command {index} has an invalid command_type.")
+
+            if not isinstance(arguments,dict):
+                raise ValueError(f"Command {index} arguments must be an object.")
+
+            command_ids.add(command_id)
+            commands.append(Command(id=command_id,command_type=command_type,arguments=arguments))
+
+        return commands
+
 
     
