@@ -78,7 +78,7 @@ class RiskCal():
             return navresult
 
         if command.command_type=="inspect":
-            hiddenpoint=self.model.hiddenpoint(command.arguments["target"],self.adapter.state.position)
+            hiddenpoint=self.model.hiddenpoint(command.arguments["target"],self.adapter.state.position,state=self.adapter.get_state(), distance_behind=0.7)
             orient=self.adapter.state.orientation
             if destination is None or orientation is None or frame_id is None:
                 return {"Safe":False,"Reason":"Missing Arguments"}

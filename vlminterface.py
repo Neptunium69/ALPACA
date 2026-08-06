@@ -4,8 +4,6 @@ from pathlib import Path
 import torch
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-
-
 class VLMInterface():
     def __init__(self,system_prompt_think:str,system_prompt_act:str,model_path:str) -> None:
         self.system_prompt_act=system_prompt_act
@@ -24,7 +22,6 @@ class VLMInterface():
 
         self.model=Qwen2_5_VLForConditionalGeneration.from_pretrained(self.model_path,torch_dtype=dtype,device_map="auto" if device=="cuda" else "cpu").eval()
         self.processor=AutoProcessor.from_pretrained(self.model_path,min_pixels=256*28*28,max_pixels=1280*28*28)
-        
 
     def _predict(self):
         pass

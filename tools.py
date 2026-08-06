@@ -336,7 +336,7 @@ class ToolExecutor:
                      "Major Changes": changes,
         })
 
-    def _tool_navigate(self, command: Command) -> Return:
+    def _tool_navigate(self, command: Command, redirects_left:int=3) -> Return:
         try:
             destination_data=command.arguments.get("destination")
             orientation_data=command.arguments.get("orientation")
@@ -354,9 +354,52 @@ class ToolExecutor:
             orientation=va.Orientation(pitch=float(orientation_data["pitch"]),yaw=float(orientation_data["yaw"]),roll=float(orientation_data["roll"]))
             risk_result=self.risk.checkcmd(command,destination,orientation,frame_id)
             if risk_result.get("Safe") is not True:
-                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
+                reason=risk_result.get("Reason","Command failed the safety check.")
+                best_vantage=risk_result.get("Best Vantage Point")
+                if risk_result.get("Needs Information") is not True or best_vantage is None:
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":reason,"Inform User":risk_result.get("Inform User",False)})
+                if redirects_left<=0:
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Maximum number of vantage-point redirects reached.","Original Reason":reason})
+                if not isinstance(best_vantage,dict):
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned an invalid vantage-point record."})
+                destination_new=best_vantage.get("Position")
+                orientation_new=best_vantage.get("Orientation")
+                if not isinstance(destination_new,va.Position) or not isinstance(orientation_new,va.Orientation):
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned invalid vantage-point coordinates."})
+                cmd_new=Command(f"{command.id}_vantage","navigate",{
+                    "destination":{"x":destination_new.x,"y":destination_new.y,"z":destination_new.z},
+                    "orientation":{"pitch":orientation_new.pitch,"yaw":orientation_new.yaw,"roll":orientation_new.roll},
+                    "frame_id":frame_id,
+                })
+                result=self._tool_navigate(cmd_new,redirects_left-1)
+                if result.status!="Success":
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Unable to navigate to a safe vantage point.","Original Reason":reason,"Vantage Result":result.results})
+                return self._tool_navigate(command,redirects_left-1)
             self.adapter.navigate(destination,orientation,frame_id)
         except Exception as error:
             return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error)})
         return Return(id=command.id,command_type=command.command_type,status="Success",results={"Navigation":"Completed"})
+
+    def _tool_inspect(self, command:Command):
+        try:
+            stet=self.adapter.get_state()
+            target=self.model.hiddenpoint(object_id=command.arguments["target"],vehicle_position=stet.position, state=stet, distance_behind=0.7)
+            targetpose=stet.orientation
+            cmd=Command(id=f"{command.id}_navigate",command_type="navigate", arguments={"destination":{"x":target.x,"y":target.y,"z":target.z},
+                "orientation":{"pitch":targetpose.pitch,"yaw":targetpose.yaw,"roll":targetpose.roll},
+                "frame_id":self.adapter.navigation_frame,})
+            
+            result=self._tool_navigate(cmd)
+            if result.status!="Success":
+                return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Notes": "Navigation related error","Error": result.results})
+            cmd=Command(id=f"{command.id}_scan", command_type="scan", arguments={})
+            result=self._tool_scan(cmd)
+            if result.status!="Success":
+                return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Notes": "Scan related error.", "Error":result.results})
+            return Return(id=command.id, command_type=command.command_type, status="Success", results={"Inspection":"Completed","Major Changes":result.results.get("Major Changes")})
+        except(KeyError,ValueError,TypeError) as error:
+            return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error": str(error)})
+
+    
+
     

@@ -50,9 +50,6 @@ class VehicleAdapter(Protocol):
     def observe(self) -> None:
         """Observe the environment and update the world model."""
         raise NotImplementedError("This method should be implemented by subclasses.")
-    def inspect(self, object_id: str) -> None:
-        """Inspect an object in the world model."""
-        raise NotImplementedError("This method should be implemented by subclasses.")
     def get_collision_geometry(self) -> tuple[Odometry | None,np.ndarray,np.ndarray]:
         """Return the latest pose and body-frame collision bounds."""
         raise NotImplementedError("This method should be implemented by subclasses.")
@@ -71,6 +68,10 @@ class VehicleAdapter(Protocol):
     def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
         """Find a mostly known voxel ring around the unknown region."""
         raise NotImplementedError("This method should be implemented by subclasses.")
+    def coordinate_process(self, position: Position, state:State)->Position:
+        """Vehicle Specific coordinate processing(eg. UGV may need all coordinates to be flattened onto a 2D plane)"""
+        # By default this function just returns the original position.
+        return position
 
 class UGVAdapter(VehicleAdapter):
     def __init__(self, state: State, risk:risk.RiskCal, worldmodel: wm.WorldModel, *args, **kwargs) -> None:
@@ -447,7 +448,6 @@ class UGVAdapter(VehicleAdapter):
         if status!=GoalStatus.SUCCEEDED:
             raise RuntimeError(f"Navigation failed with action status {status}.")
 
-    def inspect(self, object_id: str) -> None:
-        # Implement UGV-specific inspection logic here
-        pass
+    def coordinate_process(self, position: Position,state: State):
+        return Position(position.x,position.y,state.position.z)
 
