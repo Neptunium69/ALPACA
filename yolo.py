@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from std_msgs.msg import String
 from sensor_msgs.msg import Image,CameraInfo
 from nav_msgs.msg import Odometry
@@ -23,7 +25,6 @@ class YOLOAdapter():
         self.cammountrot=np.asarray(cammountrot,dtype=float).reshape(3)
         self.classes=self.model.names.values()
     def init_yolo(self):
-        rospy.init_node("yolo_node", anonymous=True)
         self.rate = rospy.Rate(15)
         self.publisher = rospy.Publisher("detections",ObservationFrame,queue_size=1)
         self.bridge = CvBridge()
@@ -34,7 +35,6 @@ class YOLOAdapter():
         self.pose_subscriber=message_filters.Subscriber("vehicle_pose",Odometry)
         self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber, self.depth_subscriber,self.pose_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         self.synchronizer.registerCallback(self._image_callback)
-        rospy.spin()
 
     def get_classes(self):
         return self.classes
@@ -261,7 +261,6 @@ class YOLOAdapter():
     def init_yolo_legacy(self, webcam):
         if webcam==None:
             raise ValueError("Webcam is None. Please provide a valid webcam path.")
-        rospy.init_node("yolo_node", anonymous=True)
         rate = rospy.Rate(15)
         publisher = rospy.Publisher("yolodetections",String,queue_size=1)
         cap = cv2.VideoCapture(webcam)

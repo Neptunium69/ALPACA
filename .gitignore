@@ -4,4 +4,6 @@ __pycache__
 testing
 tmp
 pyrightconfig.json
+yolomodel
+system_prompt_master.txt
 .pytest_cache

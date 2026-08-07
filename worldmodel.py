@@ -14,12 +14,6 @@ import math
 from nav_msgs.msg import Odometry
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection,SpatialObservationFrame
 from sklearn.neighbors import KNeighborsClassifier
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .vehicleadapter import VehicleAdapter
-    from .vehicleadapter import State
-
 from math import e
 import json
 
@@ -78,11 +72,10 @@ class VoxelModel:
     frame_id: str | None = None
 
 class WorldModel:
-    def __init__(self, observations: Model, detection_classes, adapter:VehicleAdapter):
+    def __init__(self, observations: Model, detection_classes):
         self.observations = observations
         self.detection_classes = tuple(detection_classes)
         self.voxelmap = VoxelModel(voxelsize=float("nan"), voxels=[], grid_origin=None, frame_id=None)
-        self.adapter:VehicleAdapter = adapter
         self._voxel_lookup: dict[tuple[int,int,int],Voxel]={}
         self._bridge = CvBridge()
         self._latest_frame=None
@@ -92,14 +85,11 @@ class WorldModel:
 
     def initwm(self):
         # Automatic world model updater
-        if not rospy.core.is_initialized():
-            rospy.init_node("world_model_node", anonymous=True)
         self.detection_subscriber=message_filters.Subscriber("detections", ObservationFrame)
         self.depth_subscriber=message_filters.Subscriber("camera_depth", Image)
         self.voxel_subscriber=rospy.Subscriber("voxel_observations",SpatialObservationFrame,callback=self._voxel_callback)
         self.synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.detection_subscriber], queue_size=10, slop=0.05)
         self.synchronizer.registerCallback(self._update_callback)
-        rospy.spin()
 
     @staticmethod
     def sigmoid(x):
@@ -546,29 +536,6 @@ class WorldModel:
         voxel_regions=self._get_voxel_regions(minimum,maximum)
         score=voxel_regions[1]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
         return score
-
-    def hiddenpoint(self,object_id:str,vehicle_position:Position, state:State,distance_behind:float=0.5)->Position:
-        """Obtain coordinates of a point behind an object relative to the vehicle."""
-        if not isinstance(object_id,str) or not object_id.strip():
-            raise ValueError("Object ID must be a non-empty string.")
-        if not isinstance(distance_behind,(int,float)) or isinstance(distance_behind,bool) or not math.isfinite(distance_behind) or distance_behind<=0:
-            raise ValueError("distance_behind must be >=0 and finite.")
-        vehicle_array=np.array([vehicle_position.x,vehicle_position.y,vehicle_position.z],dtype=np.float64)
-        if not np.all(np.isfinite(vehicle_array)):
-            raise ValueError("Vehicle position must contain only finite values.")
-        with self._lock:
-            world_object=next((candidate for candidate in self.observations.objects if candidate.id==object_id),None)
-            if world_object is None:
-                raise KeyError(f"Object {object_id!r} does not exist in the current world model.")
-            object_array=np.array([world_object.position.x,world_object.position.y,world_object.position.z],dtype=np.float64)
-        if not np.all(np.isfinite(object_array)):
-            raise ValueError(f"Object {object_id!r}'s position is invalid.")
-        direction=object_array-vehicle_array
-        direction_length=float(np.linalg.norm(direction))
-        if direction_length<=np.finfo(np.float64).eps:
-            raise ValueError("Vehicle object positions overlap. Thus, a \"behind\" cannot be defined. ")
-        point=object_array+(float(distance_behind)/direction_length)*direction
-        return self.adapter.coordinate_process(Position(x=float(point[0]),y=float(point[1]),z=float(point[2])),state)
 
     def bounding_box_to_world(self,bounding_box)->Position:
         with self._lock:

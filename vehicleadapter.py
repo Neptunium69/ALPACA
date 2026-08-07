@@ -47,9 +47,6 @@ class VehicleAdapter(Protocol):
     def get_state(self) -> State:
         """Returns the current state of the vehicle as a State Object."""
         raise NotImplementedError("This method should be implemented by subclasses.")
-    def observe(self) -> None:
-        """Observe the environment and update the world model."""
-        raise NotImplementedError("This method should be implemented by subclasses.")
     def get_collision_geometry(self) -> tuple[Odometry | None,np.ndarray,np.ndarray]:
         """Return the latest pose and body-frame collision bounds."""
         raise NotImplementedError("This method should be implemented by subclasses.")
@@ -62,19 +59,15 @@ class VehicleAdapter(Protocol):
     def scan(self) -> None:
         """Scan the environment and update the world model."""
         raise NotImplementedError("This method should be implemented by subclasses.")
-    def sensordata(self) -> None:
-        """Collect raw sensor data from the vehicle's sensors."""
-        raise NotImplementedError("This method should be implemented by subclasses.")
     def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
         """Find a mostly known voxel ring around the unknown region."""
         raise NotImplementedError("This method should be implemented by subclasses.")
-    def coordinate_process(self, position: Position, state:State)->Position:
-        """Vehicle Specific coordinate processing(eg. UGV may need all coordinates to be flattened onto a 2D plane)"""
-        # By default this function just returns the original position.
-        return position
+    def hiddenpoint(self,object_id:str,state:State,distance_behind:float=0.5)->Position:
+        """Vehicle specific inspection points for the inspect function."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
 
 class UGVAdapter(VehicleAdapter):
-    def __init__(self, state: State, risk:risk.RiskCal, worldmodel: wm.WorldModel, *args, **kwargs) -> None:
+    def __init__(self, state: State, worldmodel: wm.WorldModel, risk:risk.RiskCal | None=None, **kwargs) -> None:
         self.state=state
         self.worldmodel=worldmodel
         self.riskcal=risk
@@ -106,8 +99,6 @@ class UGVAdapter(VehicleAdapter):
         return self._navigation_frame
 
     def init_sensordata(self) -> None:
-        if not rospy.core.is_initialized():
-            rospy.init_node("UGVAdapter",anonymous=True)
         translation=rospy.get_param("/mapping/extrinsic_T",self.lidar_to_body_translation.tolist())
         rotation=rospy.get_param("/mapping/extrinsic_R",self.lidar_to_body_rotation.reshape(-1).tolist())
         self.lidar_to_body_translation=np.asarray(translation,dtype=np.float64)
@@ -147,7 +138,10 @@ class UGVAdapter(VehicleAdapter):
     def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
         if not isinstance(max_updates,int) or isinstance(max_updates,bool) or max_updates<1:
             raise ValueError("max_updates must be a positive integer.")
-        center=self.riskcal.center(pathvoxel)
+        if self.riskcal is not None:
+            center=self.riskcal.center(pathvoxel)
+        else:
+            raise ValueError("Risk calibration module is None.")
         voxellist:set[tuple[int,int,int]]={center}
         visited:set[tuple[int,int,int]]={center}
         for _ in range(max_updates):
@@ -448,6 +442,32 @@ class UGVAdapter(VehicleAdapter):
         if status!=GoalStatus.SUCCEEDED:
             raise RuntimeError(f"Navigation failed with action status {status}.")
 
-    def coordinate_process(self, position: Position,state: State):
-        return Position(position.x,position.y,state.position.z)
+    def hiddenpoint(self,object_id:str,state:State,distance_behind:float=0.5)->Position:
+        """Find point behind object on the same plane as the UGV."""
+        position=np.array([state.position.x,state.position.y,state.position.z],dtype=np.float64)
+        if not isinstance(object_id,str) or not object_id.strip():
+            raise ValueError("Object ID must be a non-empty string.")
+        if not isinstance(distance_behind,(int,float)) or isinstance(distance_behind,bool) or not isfinite(distance_behind) or distance_behind<=0:
+            raise ValueError("distance_behind must be finite and positive.")
+        if not np.all(np.isfinite(position)):
+            raise ValueError("Vehicle position must contain only finite values.")    
+        matches=self.worldmodel.query_world(object_id)
+        if not matches:
+            raise KeyError(f"Object {object_id!r} does not exist in the current world model.")
+        if len(matches)>1:
+            raise KeyError("Only one object can be requested at a time.")
+        
+        object_values=np.array([matches[0].position.x,matches[0].position.y],dtype=np.float64)
+        if not np.all(np.isfinite(object_values)):
+            raise ValueError(f"Object {object_id!r}'s position is invalid.")
+        dir_vector=object_values-position[:2]
+        magnitude=float(np.hypot(dir_vector[0],dir_vector[1]))
+        if magnitude<=np.finfo(np.float64).eps:
+            raise ValueError("Vehicle and object positions overlap in the navigation plane, so a point behind the object cannot be defined.")
+
+        unit_vector=dir_vector/magnitude
+        translation_vector=unit_vector*(magnitude+distance_behind)
+        posnew=position[:2]+translation_vector
+        
+        return Position(x=float(posnew[0]),y=float(posnew[1]),z=float(state.position.z))
 

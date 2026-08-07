@@ -4,6 +4,8 @@ from . import worldmodel as wm
 from . import vehicleadapter as va
 from . import risk as rcm
 import cv2
+from std_msgs.msg import String
+import numpy as np
 import json
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
@@ -13,7 +15,7 @@ import math
 from typing import Any
 import rospy
 
-command_list=["query","robot_state","write","observe","scan","navigate","inspect","ask_user","finish"]
+command_list=["query","robot_state","write","observe","scan","navigate","inspect","image","ask_user","finish"]
 
 @dataclass(frozen=True)
 class Command:
@@ -29,8 +31,11 @@ class Return:
     results: dict[str, Any]
 
 class ToolExecutor:
-    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, detector:YOLOAdapter | None=None) -> None:
+    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, output_text_publisher:rospy.Publisher, output_image_publisher:rospy.Publisher, input_subscriber:rospy.Subscriber, detector:YOLOAdapter | None=None) -> None:
         self.model = model
+        self.output_text_publisher=output_text_publisher
+        self.output_image_publisher=output_image_publisher
+        self.input_subscriber=input_subscriber
         self.adapter = adapter
         self.risk=riskcalibration
         self.detector=detector
@@ -86,10 +91,16 @@ class ToolExecutor:
                     "required": True
                 }
             }),
+            Command(id="<id>",command_type="image",arguments={
+                "target":{
+                    "type":"string",
+                    "required": True
+                }
+            }),
             Command(id="<id>",command_type="ask_user",arguments={
                 "text_message":{
                     "type": "string",
-                    "required": False
+                    "required": True
                 },
                 "image_message":{
                     "type": "string",
@@ -112,19 +123,20 @@ class ToolExecutor:
             }),
         ]
     def execute(self, commands: list[Command]) -> list[Return]:
-        action=["navigate", "inspect", "scan", "ask_user", "finish"]
+        action=["navigate", "inspect", "scan","image", "ask_user", "finish"]
         results=[]
         actionresult=None
         newcmd=commands
-        total=sum(element in action for element in commands)
+        total=sum(element.command_type in action for element in commands)
         if total<=1:
-            if any(element in action for element in commands):
-                overlap=next((element for element in action if element in commands),None)
+            if any(element.command_type in action for element in commands):
+                overlap=next((element for element in commands if element.command_type in action),None)
                 if overlap!=None:
                     actionresult=self._command_reader(command=overlap)
-                    newcmd=[element for element in commands if element not in action]
+                    newcmd=[element for element in commands if element.command_type not in action]
         else:
-            for cmd in [element for element in commands if element in action]:
+            for cmd in [element for element in commands if element.command_type in action]:
+                newcmd=[element for element in commands if element.command_type not in action]
                 results.append(Return(id=cmd.id,command_type=cmd.command_type, status="Failed",results={"Error":"Multiple action commands were involved in one step"}))
 
         for command in newcmd:
@@ -132,8 +144,8 @@ class ToolExecutor:
                 results.append(Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error:":f"{command.command_type} is not a valid command."}))
             else:
                 results.append(self._command_reader(command))
-            if(actionresult!=None):
-                results.append(actionresult)
+        if(actionresult!=None):
+            results.append(actionresult)
         return results
     
     def _command_reader(self, command: Command) -> Return:
@@ -399,9 +411,9 @@ class ToolExecutor:
 
     def _tool_inspect(self, command:Command):
         try:
-            stet=self.adapter.get_state()
-            target=self.model.hiddenpoint(object_id=command.arguments["target"],vehicle_position=stet.position, state=stet, distance_behind=0.7)
-            targetpose=stet.orientation
+            state=self.adapter.get_state()
+            target=self.adapter.hiddenpoint(object_id=command.arguments["target"],state=state,distance_behind=0.7)
+            targetpose=state.orientation
             cmd=Command(id=f"{command.id}_navigate",command_type="navigate", arguments={"destination":{"x":target.x,"y":target.y,"z":target.z},
                 "orientation":{"pitch":targetpose.pitch,"yaw":targetpose.yaw,"roll":targetpose.roll},
                 "frame_id":self.adapter.navigation_frame,})
@@ -416,6 +428,53 @@ class ToolExecutor:
             return Return(id=command.id, command_type=command.command_type, status="Success", results={"Inspection":"Completed","Major Changes":result.results.get("Major Changes")})
         except(KeyError,ValueError,TypeError) as error:
             return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error": str(error)})
+
+    def _tool_image(self, command:Command):
+        try:
+            state=self.adapter.get_state()
+            target_obj=command.arguments.get("target")
+            if target_obj is not None and state is not None:
+                target=self.adapter.hiddenpoint(object_id=target_obj,state=state)
+                positionvector=np.array([state.position.x,state.position.y,state.position.z])
+                directionvector=np.array([target.x,target.y,target.z])-positionvector
+                if math.hypot(directionvector[0], directionvector[1]) < 1e-6:
+                    raise ValueError("Vehicle position is equal to target position. Thus, position is undefined.")
+                yaw=abs(math.atan2(directionvector[1],directionvector[0]))
+                if not(state.orientation.yaw+0.1>yaw>state.orientation.yaw-0.1):
+                    result=self._tool_navigate(command=Command(id=f"{command.id}_nav", command_type="navigate",arguments={"destination":{"x":state.position.x, "y":state.position.y, "z":state.position.z}, "orientation":{"pitch":state.orientation.pitch,"yaw":yaw,"roll":state.orientation.roll}}))
+                    if result.status=="Failed":
+                        return Return(id=command.id, command_type=command.command_type, status="Failed",results=result.results)
+                result=self._tool_observe(command=Command(id=f"{command.id}",command_type=command.command_type,arguments={}))
+                if result.status=="Failed":
+                    return Return(id=command.id, command_type=command.command_type, status="Failed",results=result.results)
+                else:
+                    return Return(id=command.id,command_type=command.command_type,status="Success",results=result.results)
+            else:
+                raise ValueError(f"Object {target_obj} is not found.")
+            
+        except(KeyError,ValueError,TypeError) as error:
+            return Return(id=command.id,command_type=command.command_type,status="Failed", results={"Error":str(error)})
+
+    def _tool_ask_user(self, command:Command):
+        if self.output_text_publisher is None or self.output_image_publisher is None:
+            raise RuntimeError("Output publishers has not been initialized.")
+        self.output_text_publisher.publish(String(data=command.arguments.get("text_message")))
+        self.output_image_publisher.publish(String(data=command.arguments.get("image_message")))
+
+        input=rospy.wait_for_message("user_input",String)
+        if input is not None:
+            return Return(id=command.id,command_type=command.command_type,status="Success",results={"User Response":input.data})
+        else:
+            raise ValueError("User input is none")
+        
+    def _tool_finish(self, command:Command):
+        if self.output_text_publisher is None or self.output_image_publisher is None:
+            raise RuntimeError("Output publishers has not been initialized.")
+        
+        self.output_text_publisher.publish(String(data=command.arguments.get("completion_text_message")))
+        self.output_image_publisher.publish(String(data=command.arguments.get("completion_image_message")))
+
+        return Return(id=command.id, command_type=command.command_type, status="Success", results={"Mission Completed":True})
 
     @staticmethod
     def stringtocmd(output:str) -> list[Command]:
