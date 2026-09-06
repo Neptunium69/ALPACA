@@ -459,13 +459,8 @@ class UGVAdapter(VehicleAdapter):
         current_yaw=None
         last_pose_update=None
         subscriber=rospy.Subscriber("vehicle_pose", Odometry, callback)
-
-        def normalize_angle(angle,initial_yaw):
-            # This function measures current yaw as a difference between current yaw and initial yaw, and normalizes it to a range of 0 to 2π radians(π/2 is north).
-            return (angle - initial_yaw + pi / 2) % (2 * pi)
         yaw_publisher = rospy.Publisher("/mavros/setpoint_velocity/cmd_vel",TwistStamped,queue_size=10,)
         try:
-            message=TwistStamped()
             initial_pose_deadline=time.monotonic()+2.0
             while current_yaw is None and not rospy.is_shutdown():
                 if time.monotonic()>initial_pose_deadline:
@@ -474,24 +469,13 @@ class UGVAdapter(VehicleAdapter):
 
             if rospy.is_shutdown():
                 return
-            initial_yaw=current_yaw
-
-            flag=0
-            initial_range=[(pi/2)+yaw_margin,(pi/2)-yaw_margin]
-            scan_deadline=time.monotonic()+40.0
-
-            while not rospy.is_shutdown() and (flag==0 or not(normalize_angle(current_yaw,initial_yaw)<initial_range[0] and normalize_angle(current_yaw,initial_yaw)>initial_range[1])):
-                if time.monotonic()>scan_deadline:
-                    raise TimeoutError("Scan rotation timed out.")
-                if last_pose_update is None or time.monotonic()-last_pose_update>0.5:
-                    raise RuntimeError("Vehicle pose stopped updating during scan.")
-                yawrate_d=0.5 # set the desired yaw rate to 0.5 rad/s(aka. start rotating)
-                if (not(normalize_angle(current_yaw,initial_yaw)<initial_range[0] and normalize_angle(current_yaw,initial_yaw)>initial_range[1])):
-                    flag=1
-                rospy.sleep(0.1)
-                message.twist.angular.z=yawrate_d
-                message.header.stamp = rospy.Time.now()
-                yaw_publisher.publish(message)
+            if current_yaw is None:
+                raise RuntimeError("Vehicle pose is unavailable.")
+            for _ in range(4):
+                initial_yaw=current_yaw
+                orientation=Orientation(roll=self.state.orientation.roll,pitch=self.state.orientation.pitch,yaw=initial_yaw+pi/2)
+                orientation.yaw=orientation.yaw%(2*pi)
+                self.navigate(self.state.position,orientation)
                 if rospy.is_shutdown():
                     return
 
@@ -531,7 +515,9 @@ class UGVAdapter(VehicleAdapter):
                         flag=True
 
                     distance=np.sqrt((pose.pose.position.x-destination.x)**2+(pose.pose.position.y-destination.y)**2)
-                    if distance<=0.1:
+                    yaw_error = (orientation.yaw - self.state.orientation.yaw + pi) % (2*pi) - pi
+                    heading_reached = abs(yaw_error) < 0.1  # radians
+                    if distance<=0.1 and heading_reached:
                         i+=1
             else:
                 raise RuntimeError("Planned path is empty or movement publisher is unavailable.")
