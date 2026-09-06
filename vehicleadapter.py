@@ -25,6 +25,7 @@ from . import worldmodel as wm
 from . import risk
 from .worldmodel import Position,Orientation
 from .risk import PathVoxelAssessment, VantagePoint
+import random
 
 @dataclass
 class State():
@@ -200,7 +201,11 @@ class UGVAdapter(VehicleAdapter):
         clutter_level=float(np.clip((occupied_count-self.N_open)/(self.N_dense-self.N_open),0.0,1.0))
 
         voxel_counts: dict[tuple[int,int,int],list[int]]={}
-        for point in self.lidar_points_world:
+        selected = self.lidar_points_world.tolist()
+        if len(selected)>300:
+            selected = random.sample(selected, 300)
+
+        for point in selected:
             free_voxels,occupied_voxel=self._raycast_voxels(self.lidar_origin_world,point,self.roi_min,self.voxel_size)
             for free_voxel in free_voxels:
                 counts=voxel_counts.setdefault(free_voxel,[0,0])
@@ -598,5 +603,6 @@ class UGVAdapter(VehicleAdapter):
         translation_vector=unit_vector*(magnitude+distance_behind)
         posnew=position[:2]+translation_vector
         return Position(x=float(posnew[0]),y=float(posnew[1]),z=float(state.position.z))
+    
 
 
