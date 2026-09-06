@@ -371,7 +371,7 @@ class UGVAdapter(VehicleAdapter):
         if not state.armed:
             raise NavigationReadinessError(f"Cannot {action_name}: vehicle is not armed.")
         if state.mode!="OFFBOARD":
-            raise NavigationReadinessError(f"Cannot {action_name}: vehicle is in {state.mode or 'an unknown mode'}, not GUIDED.")
+            raise NavigationReadinessError(f"Cannot {action_name}: vehicle is in {state.mode or 'an unknown mode'}, not OFFBOARD.")
         if last_pose_monotonic is None or now-last_pose_monotonic>self.max_pose_age:
             raise NavigationReadinessError(f"Cannot {action_name}: vehicle localization is unavailable or stale.")
     def require_navigation_ready(self,action_name:str)->None:
@@ -480,13 +480,6 @@ class UGVAdapter(VehicleAdapter):
                     return
 
         finally:
-            try:
-                if not rospy.is_shutdown():
-                    stop_message=TwistStamped()
-                    stop_message.twist.angular.z=0.0
-                    stop_message.header.stamp = rospy.Time.now()
-                    yaw_publisher.publish(stop_message)  # Stop rotation
-            finally:     
                 subscriber.unregister()
 
     def navigate(self, destination: Position, orientation: Orientation, frame_id: str | None=None) -> None:
@@ -504,21 +497,35 @@ class UGVAdapter(VehicleAdapter):
             flag=False
             i=0
             if path.poses is not None and self.movement_publisher is not None:
+                rate = rospy.Rate(20)
                 while flag==False and not rospy.is_shutdown():
+                    state = self.get_state()
                     pose=path.poses[i]
                     target=PoseStamped()
-                    target.header=pose.header
+                    target.header.stamp = rospy.Time.now()
                     target.pose=pose.pose
                     self.movement_publisher.publish(target)
 
-                    if i==len(path.poses)-1:
-                        flag=True
-
-                    distance=np.sqrt((pose.pose.position.x-destination.x)**2+(pose.pose.position.y-destination.y)**2)
+                    distance=np.sqrt((state.position.x-destination.x)**2+(state.position.y-destination.y)**2)
                     yaw_error = (orientation.yaw - self.state.orientation.yaw + pi) % (2*pi) - pi
+
+                    q = target.pose.orientation
+                    _, _, target_yaw = euler_from_quaternion([q.x,q.y,q.z,q.w])
+
+                    yaw_error_nextwp=(target_yaw - self.state.orientation.yaw + pi) % (2*pi) - pi
+
+                    dist2nextwp=np.sqrt((state.position.x-target.pose.position.x)**2+(state.position.y-target.pose.position.y)**2)
+
                     heading_reached = abs(yaw_error) < 0.1  # radians
-                    if distance<=0.1 and heading_reached:
+                    heading_reached_nextwp=abs(yaw_error_nextwp)<0.1
+                    if i==len(path.poses)-1:
+                        if distance<=0.1 and heading_reached:
+                            flag=True
+                    if dist2nextwp<=0.1 and heading_reached_nextwp:
                         i+=1
+                    if i>len(path.poses)-1:
+                        i=len(path.poses)-1
+                    rate.sleep()
             else:
                 raise RuntimeError("Planned path is empty or movement publisher is unavailable.")
         except rospy.exceptions.ROSException as error:
