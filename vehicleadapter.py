@@ -19,6 +19,7 @@ from nav_msgs.srv import GetPlan,GetPlanRequest
 from geometry_msgs.msg import PoseStamped,TwistStamped
 from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelObservationMsg
 from sensor_msgs.msg import Image, BatteryState,CameraInfo, PointCloud2
+from mavros_msgs.msg import State as MavrosState
 from tf.transformations import euler_from_quaternion,quaternion_from_euler,quaternion_matrix
 from . import worldmodel as wm
 from . import risk
@@ -27,9 +28,15 @@ from .risk import PathVoxelAssessment, VantagePoint
 
 @dataclass
 class State():
-    battery_level: float
+    battery_level: float | None
     position: Position
     orientation: Orientation
+    armed: bool = False
+    mode: str = ""
+    connected: bool = False
+
+class NavigationReadinessError(RuntimeError):
+    pass
 
 @dataclass
 class VoxelObservation():
@@ -40,12 +47,18 @@ class VoxelObservation():
 
 class VehicleAdapter(Protocol):
     state: State
+    def init_sensordata(self) -> None:
+        """Begins republishing sensor data."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
     @property
     def navigation_frame(self) -> str:
         """Return the coordinate frame used for navigation goals."""
         raise NotImplementedError("This method should be implemented by subclasses.")
     def get_state(self) -> State:
         """Returns the current state of the vehicle as a State Object."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
+    def require_navigation_ready(self,action_name:str) -> None:
+        """Raise when the vehicle is not currently ready for autonomous navigation."""
         raise NotImplementedError("This method should be implemented by subclasses.")
     def get_collision_geometry(self) -> tuple[Odometry | None,np.ndarray,np.ndarray]:
         """Return the latest pose and body-frame collision bounds."""
@@ -62,8 +75,11 @@ class VehicleAdapter(Protocol):
     def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
         """Find a mostly known voxel ring around the unknown region."""
         raise NotImplementedError("This method should be implemented by subclasses.")
-    def hiddenpoint(self,object_id:str,state:State,distance_behind:float=0.5)->Position:
+    def hiddenpoints(self,object_id:str,state:State,distance_behind:float=0.5)->list[Position]:
         """Vehicle specific inspection points for the inspect function."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
+    def hiddenpoint(self,object_id:str,state:State,distance_behind:float=0.5)->Position:
+        """Vehicle specific inspection point for the inspect function."""
         raise NotImplementedError("This method should be implemented by subclasses.")
 
 class UGVAdapter(VehicleAdapter):
@@ -80,6 +96,10 @@ class UGVAdapter(VehicleAdapter):
         self._navigation_frame:str=navigation_frame
         self.voxel_size = 0.05
         self.vehicle_pose=None
+        self.last_pose_monotonic:float | None=None
+        self.max_pose_age=0.5
+        self.last_state_monotonic:float | None=None
+        self.max_state_age=2.0
         self.lidar_points_world=None
         self.lidar_origin_world=None
         self.vehicle_min = np.array([-0.15, -0.17, -0.25])
@@ -87,7 +107,7 @@ class UGVAdapter(VehicleAdapter):
         self.search_offset = np.array([0.30, 0.30, 0.05])
         self.roi_min = self.vehicle_min - self.search_offset
         self.roi_max = self.vehicle_max + self.search_offset
-        self.ground_z = -0.25
+        self.ground_z = -0.05
         self.ground_margin = 0.06
         self.N_open = 5
         self.N_dense = 20
@@ -122,12 +142,13 @@ class UGVAdapter(VehicleAdapter):
             raise RuntimeError("The move_base planning service is unavailable.") from error
         self.make_plan_service=rospy.ServiceProxy("/move_base/make_plan",GetPlan)
 
-        self.gnss_position_subscriber = message_filters.Subscriber("mavros/global_position/local",Odometry,queue_size=10)
+        self.gnss_position_subscriber = message_filters.Subscriber("/Odometry",Odometry,queue_size=10)
         self.gnss_position_subscriber.registerCallback(self._pose_callback)
         self.color_subscriber = message_filters.Subscriber("/camera/color/image_raw", Image, queue_size=1)
         self.depth_subscriber = message_filters.Subscriber("/camera/aligned_depth_to_color/image_raw", Image, queue_size=1)
         self.camera_info_subscriber = message_filters.Subscriber("/camera/aligned_depth_to_color/camera_info",CameraInfo,queue_size=1)
         self.battery_subscriber = rospy.Subscriber("/mavros/battery", BatteryState, queue_size=1,callback=self._battery_callback)
+        self.mavros_state_subscriber = rospy.Subscriber("/mavros/state",MavrosState,queue_size=1,callback=self._mavros_state_callback)
         self.lidar_subscriber = message_filters.Subscriber("/cloud_registered_body",PointCloud2,queue_size=5)
 
         self.camera_synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
@@ -153,11 +174,11 @@ class UGVAdapter(VehicleAdapter):
                 return set()
             voxelstates=self.worldmodel.get_voxel_states(list(voxelnew))
             known_count=sum(state is not None for state in voxelstates)
-            if known_count/len(voxelnew)>0.5:
+            if known_count/len(voxelnew)>=0.15:
                 return voxelnew
             visited.update(voxelnew)
             voxellist=voxelnew
-        raise RuntimeError(f"Could not find a voxel ring with more than 50% known voxels after {max_updates} updates.")
+        raise RuntimeError(f"Could not find a voxel ring with at least 15% known voxels after {max_updates} updates.")
 
     def _lidar_callback(self,cloud: PointCloud2,vehicle_pose: Odometry)->None:
         points_body=np.asarray(list(pc2.read_points(cloud,field_names=("x","y","z"),skip_nans=True)),dtype=np.float64).reshape(-1,3)
@@ -200,23 +221,58 @@ class UGVAdapter(VehicleAdapter):
         self.clutter_publisher.publish(Float64(data=clutter_level))
 
     def _battery_callback(self,battery_msg):
+        if rospy.is_shutdown():
+            return
+        percentage=float(battery_msg.percentage)
+        valid_percentage=isfinite(percentage) and 0.0<=percentage<=1.0
         with self.state_lock:
-            self.state.battery_level=battery_msg.percentage
-            self.battery_publisher.publish(battery_msg)
+            self.state.battery_level=percentage if valid_percentage else None
+        if not valid_percentage:
+            rospy.logwarn_throttle(30.0,"MAVROS battery percentage is unavailable or invalid: %r",percentage)
+        self._publish_if_active(self.battery_publisher,battery_msg)
+
+    def _mavros_state_callback(self,state_msg:MavrosState)->None:
+        if rospy.is_shutdown():
+            return
+        with self.state_lock:
+            self.state.connected=bool(state_msg.connected)
+            self.state.armed=bool(state_msg.armed)
+            self.state.mode=str(state_msg.mode)
+            self.last_state_monotonic=time.monotonic()
 
     def _adapter_callback(self,cameracolor,cameradepth,camerainfo):
-        self.depth_publisher.publish(cameradepth)
-        self.color_publisher.publish(cameracolor)
-        self.camera_info_publisher.publish(camerainfo)
+        if rospy.is_shutdown():
+            return
+        self._publish_if_active(self.depth_publisher,cameradepth)
+        self._publish_if_active(self.color_publisher,cameracolor)
+        self._publish_if_active(self.camera_info_publisher,camerainfo)
 
     def _pose_callback(self,gnss_position):
-        q=gnss_position.pose.pose.orientation
+        if rospy.is_shutdown():
+            return
+        vehicle_pose=deepcopy(gnss_position)
+        if vehicle_pose.header.frame_id=="camera_init":
+            vehicle_pose.header.frame_id=self.navigation_frame
+        if vehicle_pose.child_frame_id=="body":
+            vehicle_pose.child_frame_id="base_link"
+        q=vehicle_pose.pose.pose.orientation
         roll,pitch,yaw=euler_from_quaternion([q.x,q.y,q.z,q.w])
         with self.state_lock:
-            self.state.position=Position(x=gnss_position.pose.pose.position.x,y=gnss_position.pose.pose.position.y,z=gnss_position.pose.pose.position.z)
+            self.state.position=Position(x=vehicle_pose.pose.pose.position.x,y=vehicle_pose.pose.pose.position.y,z=vehicle_pose.pose.pose.position.z)
             self.state.orientation=Orientation(pitch=pitch,yaw=yaw,roll=roll)
-            self.vehicle_pose=deepcopy(gnss_position)
-        self.pose_publisher.publish(gnss_position)
+            self.vehicle_pose=vehicle_pose
+            self.last_pose_monotonic=time.monotonic()
+        self._publish_if_active(self.pose_publisher,vehicle_pose)
+
+    @staticmethod
+    def _publish_if_active(publisher,message)->None:
+        if rospy.is_shutdown():
+            return
+        try:
+            publisher.publish(message)
+        except rospy.exceptions.ROSException as error:
+            if "closed topic" not in str(error).lower():
+                raise
 
     def _lidar_to_world(self,points_body: np.ndarray,vehicle_pose: Odometry)->tuple[np.ndarray,np.ndarray]:
         """Transform body-frame LiDAR points and the LiDAR origin into the pose's world frame."""
@@ -299,6 +355,27 @@ class UGVAdapter(VehicleAdapter):
         with self.state_lock:
             return deepcopy(self.state)
 
+    def _require_vehicle_ready(self,action_name:str)->None:
+        if rospy.is_shutdown():
+            raise NavigationReadinessError(f"Cannot {action_name}: ROS is shutting down.")
+        now=time.monotonic()
+        with self.state_lock:
+            state=deepcopy(self.state)
+            last_state_monotonic=self.last_state_monotonic
+            last_pose_monotonic=self.last_pose_monotonic
+        if last_state_monotonic is None or now-last_state_monotonic>self.max_state_age:
+            raise NavigationReadinessError(f"Cannot {action_name}: MAVROS vehicle state is unavailable or stale.")
+        if not state.connected:
+            raise NavigationReadinessError(f"Cannot {action_name}: MAVROS is not connected to the flight controller.")
+        if not state.armed:
+            raise NavigationReadinessError(f"Cannot {action_name}: vehicle is not armed.")
+        if state.mode!="GUIDED":
+            raise NavigationReadinessError(f"Cannot {action_name}: vehicle is in {state.mode or 'an unknown mode'}, not GUIDED.")
+        if last_pose_monotonic is None or now-last_pose_monotonic>self.max_pose_age:
+            raise NavigationReadinessError(f"Cannot {action_name}: vehicle localization is unavailable or stale.")
+    def require_navigation_ready(self,action_name:str)->None:
+        self._require_vehicle_ready(action_name)
+
     def get_collision_geometry(self)->tuple[Odometry | None,np.ndarray,np.ndarray]:
         with self.state_lock:
             return deepcopy(self.vehicle_pose),self.vehicle_min.copy(),self.vehicle_max.copy()
@@ -315,6 +392,7 @@ class UGVAdapter(VehicleAdapter):
             raise ValueError("Planning frame must be a non-empty string.")
         if not isinstance(tolerance,(int,float)) or isinstance(tolerance,bool) or not isfinite(tolerance) or tolerance<0:
             raise ValueError("Planning tolerance must be a finite, non-negative number.")
+        self._require_vehicle_ready("plan navigation")
         with self.state_lock:
             vehicle_pose=deepcopy(self.vehicle_pose)
         if vehicle_pose is None:
@@ -338,10 +416,24 @@ class UGVAdapter(VehicleAdapter):
         goal.pose.orientation.z=qz
         goal.pose.orientation.w=qw
 
-        try:
-            response=self.make_plan_service(GetPlanRequest(start=start,goal=goal,tolerance=float(tolerance)))
-        except rospy.ServiceException as error:
-            raise RuntimeError(f"move_base failed to generate a path: {error}") from error
+        planning_deadline=time.monotonic()+6.0
+        planning_attempts=0
+        active_states=(GoalStatus.PENDING,GoalStatus.ACTIVE,GoalStatus.PREEMPTING,GoalStatus.RECALLING)
+        while True:
+            self._require_vehicle_ready("continue planning navigation")
+            try:
+                response=self.make_plan_service(GetPlanRequest(start=start,goal=goal,tolerance=float(tolerance)))
+                break
+            except rospy.ServiceException as error:
+                planning_attempts+=1
+                action_state=self.client.get_state() if self.client is not None else None
+                if action_state not in active_states:
+                    raise RuntimeError(f"move_base failed to generate a path: {error}") from error
+                if time.monotonic()>=planning_deadline:
+                    raise RuntimeError(f"move_base failed to generate a path after {planning_attempts} attempts while waiting for its previous action to become inactive: {error}") from error
+                if planning_attempts==1:
+                    rospy.logwarn("move_base temporarily rejected /make_plan while finishing its previous action; retrying for up to 6 seconds.")
+                rospy.sleep(0.1)
         path=response.plan
         if not path.poses:
             raise RuntimeError("move_base returned an empty path.")
@@ -367,7 +459,6 @@ class UGVAdapter(VehicleAdapter):
         last_pose_update=None
         subscriber=rospy.Subscriber("vehicle_pose", Odometry, callback)
 
-        
         def normalize_angle(angle,initial_yaw):
             # This function measures current yaw as a difference between current yaw and initial yaw, and normalizes it to a range of 0 to 2π radians(π/2 is north).
             return (angle - initial_yaw + pi / 2) % (2 * pi)
@@ -386,7 +477,7 @@ class UGVAdapter(VehicleAdapter):
 
             flag=0
             initial_range=[(pi/2)+yaw_margin,(pi/2)-yaw_margin]
-            scan_deadline=time.monotonic()+20.0
+            scan_deadline=time.monotonic()+40.0
 
             while not rospy.is_shutdown() and (flag==0 or not(normalize_angle(current_yaw,initial_yaw)<initial_range[0] and normalize_angle(current_yaw,initial_yaw)>initial_range[1])):
                 if time.monotonic()>scan_deadline:
@@ -442,6 +533,46 @@ class UGVAdapter(VehicleAdapter):
         if status!=GoalStatus.SUCCEEDED:
             raise RuntimeError(f"Navigation failed with action status {status}.")
 
+    def hiddenpoints(self,object_id:str,state:State,distance_behind:float=0.5)->list[Position]:
+        """Find points behind object on the same plane as the UGV."""
+        position=np.array([state.position.x,state.position.y,state.position.z],dtype=np.float64)
+        if not isinstance(object_id,str) or not object_id.strip():
+            raise ValueError("Object ID must be a non-empty string.")
+        if not isinstance(distance_behind,(int,float)) or isinstance(distance_behind,bool) or not isfinite(distance_behind) or distance_behind<=0:
+            raise ValueError("distance_behind must be finite and positive.")
+        if not np.all(np.isfinite(position)):
+            raise ValueError("Vehicle position must contain only finite values.")    
+        matches=self.worldmodel.query_world(object_id)
+        if not matches:
+            raise KeyError(f"Object {object_id!r} does not exist in the current world model.")
+        if len(matches)>1:
+            raise KeyError("Only one object can be requested at a time.")
+        
+        object_values=np.array([matches[0].position.x,matches[0].position.y],dtype=np.float64)
+        if not np.all(np.isfinite(object_values)):
+            raise ValueError(f"Object {object_id!r}'s position is invalid.")
+        dir_vector=object_values-position[:2]
+        magnitude=float(np.hypot(dir_vector[0],dir_vector[1]))
+        if magnitude<=np.finfo(np.float64).eps:
+            raise ValueError("Vehicle and object positions overlap in the navigation plane, so a point behind the object cannot be defined.")
+
+        yaw=np.arctan2(dir_vector[1],dir_vector[0])
+
+        translation_vectors=[distance_behind*np.array([np.cos(yaw),np.sin(yaw)])]
+        for theta in range(10,91,10):
+            for invert in [1,-1]:
+                translation_vectors.append(distance_behind*np.array([np.cos(yaw+(invert*np.deg2rad(theta))),np.sin(yaw+(invert*np.deg2rad(theta)))]))
+        posnews=[]
+        for vector in translation_vectors:
+            posnews.append(object_values+vector)
+
+        posnewer=[]
+        
+        for pos in posnews:
+            posnewer.append(Position(x=float(pos[0]),y=float(pos[1]),z=float(state.position.z)))
+
+        return posnewer
+
     def hiddenpoint(self,object_id:str,state:State,distance_behind:float=0.5)->Position:
         """Find point behind object on the same plane as the UGV."""
         position=np.array([state.position.x,state.position.y,state.position.z],dtype=np.float64)
@@ -468,6 +599,6 @@ class UGVAdapter(VehicleAdapter):
         unit_vector=dir_vector/magnitude
         translation_vector=unit_vector*(magnitude+distance_behind)
         posnew=position[:2]+translation_vector
-        
         return Position(x=float(posnew[0]),y=float(posnew[1]),z=float(state.position.z))
+
 

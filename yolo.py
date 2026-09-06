@@ -5,6 +5,9 @@ from sensor_msgs.msg import Image,CameraInfo
 from nav_msgs.msg import Odometry
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection
 from typing import Any
+from threading import Lock
+from copy import deepcopy
+import time
 
 import message_filters
 import numpy as np
@@ -24,6 +27,11 @@ class YOLOAdapter():
         self.cammountpos=np.asarray(cammountpos,dtype=float).reshape(3)
         self.cammountrot=np.asarray(cammountrot,dtype=float).reshape(3)
         self.classes=self.model.names.values()
+        self.pose_lock=Lock()
+        self.inference_lock=Lock()
+        self.latest_pose:Odometry | None=None
+        self.latest_pose_monotonic:float | None=None
+        self.max_pose_age=0.5
     def init_yolo(self):
         self.rate = rospy.Rate(15)
         self.publisher = rospy.Publisher("detections",ObservationFrame,queue_size=1)
@@ -32,9 +40,23 @@ class YOLOAdapter():
         self.color_subscriber = message_filters.Subscriber("camera_color", Image)
         self.camera_info_subscriber = message_filters.Subscriber("camera_info", CameraInfo)
         self.depth_subscriber = message_filters.Subscriber("camera_depth", Image)
-        self.pose_subscriber=message_filters.Subscriber("vehicle_pose",Odometry)
-        self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber, self.depth_subscriber,self.pose_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
+        self.pose_subscriber=rospy.Subscriber("vehicle_pose",Odometry,queue_size=10,callback=self._pose_callback)
+        self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber],queue_size=10,slop=0.05)
         self.synchronizer.registerCallback(self._image_callback)
+
+    def _pose_callback(self,pose_msg:Odometry)->None:
+        if rospy.is_shutdown():
+            return
+        with self.pose_lock:
+            self.latest_pose=deepcopy(pose_msg)
+            self.latest_pose_monotonic=time.monotonic()
+
+    def _get_recent_pose(self)->tuple[Odometry | None,float]:
+        with self.pose_lock:
+            pose_msg=deepcopy(self.latest_pose)
+            last_pose_monotonic=self.latest_pose_monotonic
+        pose_age=float("inf") if last_pose_monotonic is None else time.monotonic()-last_pose_monotonic
+        return pose_msg,pose_age
 
     def get_classes(self):
         return self.classes
@@ -97,8 +119,18 @@ class YOLOAdapter():
             raise TypeError(f"YOLO returned an unexpected result type: {type(result).__name__}")
         return result
 
-    def _image_callback(self, color_msg, depth_msg, pose_msg, camera_info_msg):
+    def _image_callback(self,color_msg,depth_msg,camera_info_msg):
+        if not self.inference_lock.acquire(blocking=False):
+            return
+        inference_started=time.monotonic()
         try:
+            if rospy.is_shutdown():
+                return
+            pose_msg,pose_age=self._get_recent_pose()
+            if pose_msg is None or pose_age>self.max_pose_age:
+                rospy.logwarn_throttle(5.0,"Skipping camera frame because the cached vehicle pose is unavailable or stale (age %.3f s).",pose_age)
+                return
+            rospy.loginfo_once("YOLO received synchronized camera data; running the first inference.")
             frame=self.bridge.imgmsg_to_cv2(color_msg,desired_encoding="bgr8")
             depth=self.bridge.imgmsg_to_cv2(depth_msg,desired_encoding="passthrough")
             color_height,color_width=frame.shape[:2]
@@ -256,8 +288,12 @@ class YOLOAdapter():
                 output_detections.append(detection_output)
 
             self.publisher.publish(output)
+            rospy.loginfo_throttle(5.0,"YOLO detection update: %d detections in %.2f seconds.",len(output_detections),time.monotonic()-inference_started)
         except Exception as error:
-            rospy.logerr("YOLO callback failed: %s",error)
+            if not (isinstance(error,rospy.exceptions.ROSException) and "closed topic" in str(error).lower()):
+                rospy.logerr("YOLO callback failed: %s",error)
+        finally:
+            self.inference_lock.release()
     def init_yolo_legacy(self, webcam):
         if webcam==None:
             raise ValueError("Webcam is None. Please provide a valid webcam path.")

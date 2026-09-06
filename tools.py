@@ -12,6 +12,8 @@ from cv_bridge import CvBridge
 from .yolo import YOLOAdapter
 from dataclasses import dataclass,fields
 import math
+import os
+from pathlib import Path
 from typing import Any
 import rospy
 
@@ -31,7 +33,7 @@ class Return:
     results: dict[str, Any]
 
 class ToolExecutor:
-    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, output_text_publisher:rospy.Publisher, output_image_publisher:rospy.Publisher, input_subscriber:rospy.Subscriber, detector:YOLOAdapter | None=None) -> None:
+    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, output_text_publisher:rospy.Publisher, output_image_publisher:rospy.Publisher, input_subscriber:rospy.Subscriber, detector:YOLOAdapter | None=None, completion_publisher:rospy.Publisher | None=None) -> None:
         self.model = model
         self.output_text_publisher=output_text_publisher
         self.output_image_publisher=output_image_publisher
@@ -39,6 +41,7 @@ class ToolExecutor:
         self.adapter = adapter
         self.risk=riskcalibration
         self.detector=detector
+        self.completion_publisher=completion_publisher
         self.bridge=CvBridge()
 
     def get_command_requirements(self) -> list[Command]:
@@ -125,27 +128,14 @@ class ToolExecutor:
     def execute(self, commands: list[Command]) -> list[Return]:
         action=["navigate", "inspect", "scan","image", "ask_user", "finish"]
         results=[]
-        actionresult=None
-        newcmd=commands
         total=sum(element.command_type in action for element in commands)
-        if total<=1:
-            if any(element.command_type in action for element in commands):
-                overlap=next((element for element in commands if element.command_type in action),None)
-                if overlap!=None:
-                    actionresult=self._command_reader(command=overlap)
-                    newcmd=[element for element in commands if element.command_type not in action]
-        else:
-            for cmd in [element for element in commands if element.command_type in action]:
-                newcmd=[element for element in commands if element.command_type not in action]
-                results.append(Return(id=cmd.id,command_type=cmd.command_type, status="Failed",results={"Error":"Multiple action commands were involved in one step"}))
-
-        for command in newcmd:
+        if total>1:
+            return [Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Multiple action commands were involved in one step"}) for command in commands]
+        for command in commands:
             if command.command_type not in command_list:
                 results.append(Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error:":f"{command.command_type} is not a valid command."}))
             else:
                 results.append(self._command_reader(command))
-        if(actionresult!=None):
-            results.append(actionresult)
         return results
     
     def _command_reader(self, command: Command) -> Return:
@@ -174,6 +164,8 @@ class ToolExecutor:
             return f"Missing required {path}: {', '.join(missing_arguments)}."
         for name,value in arguments.items():
             specification=argument_requirements[name]
+            if value is None and specification.get("required") is not True:
+                continue
             expected_type=specification.get("type")
             if not self._argument_matches_type(value,expected_type):
                 return f"{path}.{name} must be of type {expected_type}."
@@ -321,7 +313,9 @@ class ToolExecutor:
             image=self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
             height,width=image.shape[:2]
             timestamp=message.header.stamp.to_nsec()
-            image_path=f"/tmp/camera_image_{timestamp}.png"
+            image_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp"))/"images"
+            image_directory.mkdir(parents=True,exist_ok=True)
+            image_path=str(image_directory/f"camera_image_{timestamp}.png")
             if not cv2.imwrite(image_path,image):
                 raise IOError(f"Could not write {image_path}")
             return Return(id=command.id,command_type=command.command_type,status="Success",results={
@@ -335,13 +329,16 @@ class ToolExecutor:
             return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error)})
         
     def _tool_scan(self, command: Command) -> Return:
+        recording_started=False
         try:
             risk_result=self.risk.checkcmd(command)
             if risk_result.get("Safe") is False:
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
             self.model.record()
+            recording_started=True
             self.adapter.scan()
             changes=self.model.stop_record()
+            recording_started=False
         except rospy.ROSInterruptException as error:
             return Return(
                 id=command.id,
@@ -356,6 +353,12 @@ class ToolExecutor:
                 status="Failed",
                 results={"Error": str(error)},
             )
+        finally:
+            if recording_started:
+                try:
+                    self.model.stop_record()
+                except RuntimeError:
+                    pass
 
         return Return(
             id=command.id,
@@ -366,6 +369,7 @@ class ToolExecutor:
         })
 
     def _tool_navigate(self, command: Command, redirects_left:int=3) -> Return:
+        retryable_markers=("move_base returned an empty path","target footprint intersects","path contains excessive obstacles","route requires more information","no vantage points","expected value greater than cost","navigation failed with action status 4","navigation timed out")
         try:
             destination_data=command.arguments.get("destination")
             orientation_data=command.arguments.get("orientation")
@@ -381,20 +385,23 @@ class ToolExecutor:
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"frame_id must be a non-empty string."})
             destination=va.Position(x=float(destination_data["x"]),y=float(destination_data["y"]),z=float(destination_data["z"]))
             orientation=va.Orientation(pitch=float(orientation_data["pitch"]),yaw=float(orientation_data["yaw"]),roll=float(orientation_data["roll"]))
+            self.adapter.require_navigation_ready("navigate")
             risk_result=self.risk.checkcmd(command,destination,orientation,frame_id)
             if risk_result.get("Safe") is not True:
                 reason=risk_result.get("Reason","Command failed the safety check.")
+                if "move_base returned an empty path" in reason:
+                    reason+=" The exact destination is not traversable. If it was copied from a known object's position, use inspect with that object's ID instead; object coordinates describe occupied geometry, not a safe waypoint."
                 best_vantage=risk_result.get("Best Vantage Point")
                 if risk_result.get("Needs Information") is not True or best_vantage is None:
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":reason,"Inform User":risk_result.get("Inform User",False)})
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":reason,"Inform User":risk_result.get("Inform User",False),"Retryable":any(marker in reason.lower() for marker in retryable_markers)})
                 if redirects_left<=0:
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Maximum number of vantage-point redirects reached.","Original Reason":reason})
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Maximum number of vantage-point redirects reached.","Original Reason":reason,"Retryable":True})
                 if not isinstance(best_vantage,dict):
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned an invalid vantage-point record."})
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned an invalid vantage-point record.","Retryable":False})
                 destination_new=best_vantage.get("Position")
                 orientation_new=best_vantage.get("Orientation")
                 if not isinstance(destination_new,va.Position) or not isinstance(orientation_new,va.Orientation):
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned invalid vantage-point coordinates."})
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned invalid vantage-point coordinates.","Retryable":False})
                 cmd_new=Command(f"{command.id}_vantage","navigate",{
                     "destination":{"x":destination_new.x,"y":destination_new.y,"z":destination_new.z},
                     "orientation":{"pitch":orientation_new.pitch,"yaw":orientation_new.yaw,"roll":orientation_new.roll},
@@ -402,30 +409,49 @@ class ToolExecutor:
                 })
                 result=self._tool_navigate(cmd_new,redirects_left-1)
                 if result.status!="Success":
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Unable to navigate to a safe vantage point.","Original Reason":reason,"Vantage Result":result.results})
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Unable to navigate to a safe vantage point.","Original Reason":reason,"Vantage Result":result.results,"Retryable":result.results.get("Retryable") is True})
                 return self._tool_navigate(command,redirects_left-1)
             self.adapter.navigate(destination,orientation,frame_id)
+        except va.NavigationReadinessError as error:
+            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error),"Category":"navigation_not_ready","Retryable":False})
         except Exception as error:
-            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error)})
+            reason=str(error)
+            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":reason,"Retryable":isinstance(error,TimeoutError) or any(marker in reason.lower() for marker in retryable_markers)})
         return Return(id=command.id,command_type=command.command_type,status="Success",results={"Navigation":"Completed"})
 
     def _tool_inspect(self, command:Command):
         try:
             state=self.adapter.get_state()
-            target=self.adapter.hiddenpoint(object_id=command.arguments["target"],state=state,distance_behind=0.7)
-            targetpose=state.orientation
-            cmd=Command(id=f"{command.id}_navigate",command_type="navigate", arguments={"destination":{"x":target.x,"y":target.y,"z":target.z},
-                "orientation":{"pitch":targetpose.pitch,"yaw":targetpose.yaw,"roll":targetpose.roll},
-                "frame_id":self.adapter.navigation_frame,})
-            
-            result=self._tool_navigate(cmd)
-            if result.status!="Success":
-                return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Notes": "Navigation related error","Error": result.results})
+            targets=self.adapter.hiddenpoints(object_id=command.arguments["target"],state=state,distance_behind=0.7)
+            targetobjects=self.model.query_world(object_id=command.arguments["target"])
+            if len(targetobjects)!=1:
+                raise KeyError(f"Object {command.arguments['target']!r} does not uniquely exist in the current world model.")
+            targetobject=targetobjects[0]
+            cmd=None
+            result=None
+            failures=[]
+            for target_index,target in enumerate(targets,1):
+                targetpose=va.Orientation(pitch=0.0,yaw=math.atan2(targetobject.position.y-target.y,targetobject.position.x-target.x),roll=0.0)
+                cmd=Command(id=f"{command.id}_navigate_{target_index}",command_type="navigate", arguments={"destination":{"x":target.x,"y":target.y,"z":target.z},
+                    "orientation":{"pitch":targetpose.pitch,"yaw":targetpose.yaw,"roll":targetpose.roll},
+                    "frame_id":self.adapter.navigation_frame,})
+                result=self._tool_navigate(cmd)
+                if result is not None and result.status=="Success":
+                    break
+                if result is not None:
+                    failures.append({"Candidate":target_index,"Destination":{"x":target.x,"y":target.y,"z":target.z},"Error":result.results})
+                    if result.results.get("Retryable") is not True:
+                        return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Notes":"Navigation related error","Error":result.results,"Candidate Failures":failures})
+            if result is not None:
+                if result.status!="Success":
+                    return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Notes":"Navigation related error","Error":result.results,"Candidate Failures":failures})
+            else:
+                return Return(id=command.id, command_type=command.command_type,status="Failed",results={"Error":"All of the navigation commands failed for some reason."})
             cmd=Command(id=f"{command.id}_scan", command_type="scan", arguments={})
             result=self._tool_scan(cmd)
             if result.status!="Success":
                 return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Notes": "Scan related error.", "Error":result.results})
-            return Return(id=command.id, command_type=command.command_type, status="Success", results={"Inspection":"Completed","Major Changes":result.results.get("Major Changes")})
+            return Return(id=command.id, command_type=command.command_type, status="Success", results={"Inspection":"Completed","Major Changes":result.results.get("Major Changes"),"Candidate Failures":failures})
         except(KeyError,ValueError,TypeError) as error:
             return Return(id=command.id, command_type=command.command_type, status="Failed", results={"Error": str(error)})
 
@@ -439,8 +465,9 @@ class ToolExecutor:
                 directionvector=np.array([target.x,target.y,target.z])-positionvector
                 if math.hypot(directionvector[0], directionvector[1]) < 1e-6:
                     raise ValueError("Vehicle position is equal to target position. Thus, position is undefined.")
-                yaw=abs(math.atan2(directionvector[1],directionvector[0]))
-                if not(state.orientation.yaw+0.1>yaw>state.orientation.yaw-0.1):
+                yaw=math.atan2(directionvector[1],directionvector[0])
+                yaw_error=(yaw-state.orientation.yaw+math.pi)%(2*math.pi)-math.pi
+                if abs(yaw_error)>0.1:
                     result=self._tool_navigate(command=Command(id=f"{command.id}_nav", command_type="navigate",arguments={"destination":{"x":state.position.x, "y":state.position.y, "z":state.position.z}, "orientation":{"pitch":state.orientation.pitch,"yaw":yaw,"roll":state.orientation.roll}}))
                     if result.status=="Failed":
                         return Return(id=command.id, command_type=command.command_type, status="Failed",results=result.results)
@@ -458,8 +485,10 @@ class ToolExecutor:
     def _tool_ask_user(self, command:Command):
         if self.output_text_publisher is None or self.output_image_publisher is None:
             raise RuntimeError("Output publishers has not been initialized.")
-        self.output_text_publisher.publish(String(data=command.arguments.get("text_message")))
-        self.output_image_publisher.publish(String(data=command.arguments.get("image_message")))
+        text_message=command.arguments.get("text_message")
+        image_message=command.arguments.get("image_message")
+        self.output_text_publisher.publish(String(data="" if text_message is None else text_message))
+        self.output_image_publisher.publish(String(data="" if image_message is None else image_message))
 
         input=rospy.wait_for_message("user_input",String)
         if input is not None:
@@ -471,8 +500,14 @@ class ToolExecutor:
         if self.output_text_publisher is None or self.output_image_publisher is None:
             raise RuntimeError("Output publishers has not been initialized.")
         
-        self.output_text_publisher.publish(String(data=command.arguments.get("completion_text_message")))
-        self.output_image_publisher.publish(String(data=command.arguments.get("completion_image_message")))
+        completion_text=command.arguments.get("completion_text_message")
+        completion_image=command.arguments.get("completion_image_message")
+        completion_payload={"text":"" if completion_text is None else completion_text,"image":"" if completion_image is None else completion_image}
+        if self.completion_publisher is not None:
+            self.completion_publisher.publish(String(data=json.dumps(completion_payload,ensure_ascii=False)))
+        else:
+            self.output_text_publisher.publish(String(data=completion_payload["text"]))
+            self.output_image_publisher.publish(String(data=completion_payload["image"]))
 
         return Return(id=command.id, command_type=command.command_type, status="Success", results={"Mission Completed":True})
 
@@ -485,9 +520,6 @@ class ToolExecutor:
 
         if not isinstance(envelope,dict):
             raise ValueError("VLM output must be a JSON object.")
-
-        if envelope.get("decision")=="await":
-            return [Command(id="awaitflag",command_type="await",arguments={})]
 
         if envelope.get("decision")!="execute":
             raise ValueError("Expected an execute decision.")

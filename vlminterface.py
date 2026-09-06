@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 # This is where the VLM actually runs
 import rospy
 from pathlib import Path
@@ -104,7 +102,7 @@ class VLMInterface():
             imagflag=0
             imag=None
             for i in range(len(results)):
-                if results[i].command_type=="image" and results[i].status=="Success":
+                if results[i].command_type in ("image","observe") and results[i].status=="Success":
                     imag=results[i].results.get("image_path")
                     imagflag=1
             if imagflag==1:

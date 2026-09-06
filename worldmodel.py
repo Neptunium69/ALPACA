@@ -173,11 +173,16 @@ class WorldModel:
                     detected_size=Size(detected_width,detected_height)
 
             if(detection.has_world_position):
-                matched_object=None
-                for candidate in objects:
-                    if candidate.class_name==detection.class_name and (candidate.position.x-0.1)<detection.world_position.x<(candidate.position.x+0.1) and (candidate.position.y-0.1)<detection.world_position.y<(candidate.position.y+0.1) and (candidate.position.z-0.1)<detection.world_position.z<(candidate.position.z+0.1):
-                        matched_object=candidate
-                        break
+                detection_position=np.array([detection.world_position.x,detection.world_position.y,detection.world_position.z],dtype=np.float64)
+                same_class=[candidate for candidate in objects if candidate.class_name==detection.class_name]
+                matched_object=min(same_class,key=lambda candidate:float(np.linalg.norm(detection_position-np.array([candidate.position.x,candidate.position.y,candidate.position.z],dtype=np.float64))),default=None)
+                association_distance=0.15
+                if detection.has_depth and math.isfinite(detection.camera_range):
+                    association_distance=max(association_distance,min(0.30,0.05*detection.camera_range))
+                if matched_object is not None:
+                    matched_distance=float(np.linalg.norm(detection_position-np.array([matched_object.position.x,matched_object.position.y,matched_object.position.z],dtype=np.float64)))
+                    if matched_distance>association_distance:
+                        matched_object=None
 
                 if matched_object is not None:
                     rawscore=matched_object.confidence_scores.get("existence_rawscore",-2.0)+0.1*detection.confidence
@@ -202,8 +207,8 @@ class WorldModel:
                             if old_width is None or old_height is None or new_width is None or new_height is None:
                                 matched_object.size=detected_size
                             else:
-                                matched_object.size.conservative_width=(old_width*positioning_score)+((1-positioning_score)*new_width)
-                                matched_object.size.conservative_height=(old_height*positioning_score)+((1-positioning_score)*new_height)
+                                matched_object.size.conservative_width=(old_width*(1-detection.confidence))+(detection.confidence*new_width)
+                                matched_object.size.conservative_height=(old_height*(1-detection.confidence))+(detection.confidence*new_height)
                 else:
                     id=f"{detection.class_name}_{self._get_latest(detection.class_name, objects)+1}"
                     updated_object=Object(id=id,class_name=detection.class_name,size=detected_size if detected_size is not None else Size(),position=Position(detection.world_position.x,detection.world_position.y,detection.world_position.z),confidence_scores={"existence_rawscore":-2.0,"existence_score":self.sigmoid(-2.0)})
@@ -214,6 +219,9 @@ class WorldModel:
                 if updated_object is not None and updated_object.confidence_scores["existence_rawscore"]>5.0:
                     updated_object.confidence_scores["existence_rawscore"]=5.0
                     updated_object.confidence_scores["existence_score"]=self.sigmoid(5.0)
+                if updated_object is not None and updated_object.confidence_scores["positioning_rawscore"]>5.0:
+                    updated_object.confidence_scores["positioning_rawscore"]=5.0
+                    updated_object.confidence_scores["positioning_score"]=self.sigmoid(5.0)
 
         for object in objects:
             if object.attributes.get("VLMFlag")==1:
@@ -495,6 +503,11 @@ class WorldModel:
                 voxel=self._voxel_lookup.get(index)
                 states.append(None if voxel is None else voxel.state)
             return states
+
+    def get_voxel_states_and_scores(self,indices:list[tuple[int,int,int]])->list[tuple[int,float] | None]:
+        """Return atomic occupancy state/confidence snapshots for the requested voxels."""
+        with self._lock:
+            return [None if (voxel:=self._voxel_lookup.get(index)) is None else (voxel.state,voxel.score) for index in indices]
 
     def _get_voxel_regions(self,minimum: Position,maximum: Position)->list[int]:
         """Return [filled, empty, unknown] voxel counts within a world-frame bounding box."""
