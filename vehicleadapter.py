@@ -128,6 +128,7 @@ class UGVAdapter(VehicleAdapter):
         self.client=actionlib.SimpleActionClient("/move_base",MoveBaseAction)
 
         self.voxel_publisher = rospy.Publisher("voxel_observations",SpatialObservationFrame,queue_size=1)
+        self.movement_publisher = rospy.Publisher("/mavros/setpoint_position/local",PoseStamped,queue_size=1)
         self.pose_publisher = rospy.Publisher("vehicle_pose",Odometry,queue_size=1)
         self.camera_info_publisher = rospy.Publisher("camera_info", CameraInfo, queue_size=1)
         self.battery_publisher = rospy.Publisher("battery_level",BatteryState,queue_size=1)
@@ -369,7 +370,7 @@ class UGVAdapter(VehicleAdapter):
             raise NavigationReadinessError(f"Cannot {action_name}: MAVROS is not connected to the flight controller.")
         if not state.armed:
             raise NavigationReadinessError(f"Cannot {action_name}: vehicle is not armed.")
-        if state.mode!="GUIDED":
+        if state.mode!="OFFBOARD":
             raise NavigationReadinessError(f"Cannot {action_name}: vehicle is in {state.mode or 'an unknown mode'}, not GUIDED.")
         if last_pose_monotonic is None or now-last_pose_monotonic>self.max_pose_age:
             raise NavigationReadinessError(f"Cannot {action_name}: vehicle localization is unavailable or stale.")
@@ -505,7 +506,7 @@ class UGVAdapter(VehicleAdapter):
                 subscriber.unregister()
 
     def navigate(self, destination: Position, orientation: Orientation, frame_id: str | None=None) -> None:
-        """Navigate Tool: Navigate to a specified destination using the move_base action server."""
+        """Moves the vehicle."""
         if self.client is None:
             raise RuntimeError("Sensor data must be initialized before navigation.")
         goal_values=np.array([destination.x,destination.y,destination.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
@@ -514,24 +515,28 @@ class UGVAdapter(VehicleAdapter):
         frame_id=self.navigation_frame if frame_id is None else frame_id
         if not isinstance(frame_id,str) or not frame_id.strip():
             raise ValueError("Navigation frame must be a non-empty string.")
-        goal=MoveBaseGoal()
-        goal.target_pose.header.frame_id=frame_id
-        goal.target_pose.header.stamp=rospy.Time.now()
-        goal.target_pose.pose.position.x=destination.x
-        goal.target_pose.pose.position.y=destination.y
-        goal.target_pose.pose.position.z=destination.z
-        qx,qy,qz,qw=quaternion_from_euler(orientation.roll,orientation.pitch,orientation.yaw)
-        goal.target_pose.pose.orientation.x=qx
-        goal.target_pose.pose.orientation.y=qy
-        goal.target_pose.pose.orientation.z=qz
-        goal.target_pose.pose.orientation.w=qw
-        self.client.send_goal(goal)
-        if not self.client.wait_for_result(rospy.Duration(secs=120)):
-            self.client.cancel_goal()
-            raise TimeoutError("Navigation timed out.")
-        status=self.client.get_state()
-        if status!=GoalStatus.SUCCEEDED:
-            raise RuntimeError(f"Navigation failed with action status {status}.")
+        path=self.plan_path(destination,orientation,frame_id)
+        try:
+            flag=False
+            i=0
+            if path.poses is not None and self.movement_publisher is not None:
+                while flag==False and not rospy.is_shutdown():
+                    pose=path.poses[i]
+                    target=PoseStamped()
+                    target.header=pose.header
+                    target.pose=pose.pose
+                    self.movement_publisher.publish(target)
+
+                    if i==len(path.poses)-1:
+                        flag=True
+
+                    distance=np.sqrt((pose.pose.position.x-destination.x)**2+(pose.pose.position.y-destination.y)**2)
+                    if distance<=0.1:
+                        i+=1
+            else:
+                raise RuntimeError("Planned path is empty or movement publisher is unavailable.")
+        except rospy.exceptions.ROSException as error:
+            raise RuntimeError("Failed to publish the planned path to the movement topic.") from error
 
     def hiddenpoints(self,object_id:str,state:State,distance_behind:float=0.5)->list[Position]:
         """Find points behind object on the same plane as the UGV."""
