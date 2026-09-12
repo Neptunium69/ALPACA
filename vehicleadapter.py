@@ -116,6 +116,7 @@ class UGVAdapter(VehicleAdapter):
         self.lidar_to_body_rotation = np.eye(3,dtype=np.float64)
         self.whereitisnt:PoseStamped|None=None
         self.moveflag=False
+        self.theta=None
 
     @property
     def navigation_frame(self)->str:
@@ -155,6 +156,8 @@ class UGVAdapter(VehicleAdapter):
         self.mavros_state_subscriber = rospy.Subscriber("/mavros/state",MavrosState,queue_size=1,callback=self._mavros_state_callback)
         self.lidar_subscriber = message_filters.Subscriber("/cloud_registered_body",PointCloud2,queue_size=5)
 
+        self.px4_pose:PoseStamped|None=None
+        self.randompx4thing=rospy.Subscriber("/mavros/local_position/pose",PoseStamped,callback=self._px4_callback)
         self.camera_synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         self.camera_synchronizer.registerCallback(self._adapter_callback)
         self.lidar_synchronizer = message_filters.ApproximateTimeSynchronizer([self.lidar_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.03)
@@ -162,7 +165,7 @@ class UGVAdapter(VehicleAdapter):
         self.timer = rospy.Timer(rospy.Duration.from_sec(0.05), lambda event: self.update_target())
 
     def update_target(self):
-        if self.last_pose_monotonic is None:
+        if self.last_pose_monotonic is None or self.px4_pose is None:
             return
         state=self.get_state()
         if self.whereitisnt is None:
@@ -174,7 +177,7 @@ class UGVAdapter(VehicleAdapter):
 
             q=quaternion_from_euler(state.orientation.roll,state.orientation.pitch,state.orientation.yaw)
             self.whereitisnt.pose.orientation=Quaternion(x=float(q[0]),y=float(q[1]),z=float(q[2]),w=float(q[3]))
-        if(self.moveflag==False):
+        if self.moveflag==False or getattr(self,"stopping",False):
             whereitis=PoseStamped()
             whereitis.header.stamp = rospy.Time.now()
             
@@ -184,9 +187,11 @@ class UGVAdapter(VehicleAdapter):
 
             q=quaternion_from_euler(state.orientation.roll,state.orientation.pitch,state.orientation.yaw)
             whereitis.pose.orientation=Quaternion(x=float(q[0]),y=float(q[1]),z=float(q[2]),w=float(q[3]))
+            whereitis=self._waypointconverter(state,self.px4_pose,deepcopy(whereitis))
             self.movement_publisher.publish(whereitis)
         else:
-            self.movement_publisher.publish(self.whereitisnt)
+            whereitisnt=whereitis=self._waypointconverter(state,self.px4_pose,deepcopy(self.whereitisnt))
+            self.movement_publisher.publish(whereitisnt)
 
     def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
         if not isinstance(max_updates,int) or isinstance(max_updates,bool) or max_updates<1:
@@ -211,6 +216,9 @@ class UGVAdapter(VehicleAdapter):
             visited.update(voxelnew)
             voxellist=voxelnew
         raise RuntimeError(f"Could not find a voxel ring with at least 15% known voxels after {max_updates} updates.")
+
+    def _px4_callback(self,msg:PoseStamped):
+        self.px4_pose=msg
 
     def _lidar_callback(self,cloud: PointCloud2,vehicle_pose: Odometry)->None:
         points_body=np.asarray(list(pc2.read_points(cloud,field_names=("x","y","z"),skip_nans=True)),dtype=np.float64).reshape(-1,3)
@@ -309,6 +317,32 @@ class UGVAdapter(VehicleAdapter):
         except rospy.exceptions.ROSException as error:
             if "closed topic" not in str(error).lower():
                 raise
+
+    def _waypointconverter(self,state:State,msg:PoseStamped,waypoint:PoseStamped)->PoseStamped:
+        if self.theta is None:
+            q = msg.pose.orientation
+            _,_,yawp = euler_from_quaternion([q.x,q.y,q.z,q.w])
+            self.theta = (yawp-state.orientation.yaw+np.pi)%(2*np.pi)-np.pi
+            self.c,self.s = np.cos(self.theta),np.sin(self.theta)
+            xl=state.position.x
+            yl=state.position.y
+            yp=msg.pose.position.y
+            xp=msg.pose.position.x
+            self.tx = xp-(self.c*xl-self.s*yl)
+            self.ty = yp-(self.s*xl+self.c*yl)
+        x,y=waypoint.pose.position.x,waypoint.pose.position.y
+
+        waypoint.pose.position.x=self.c*x-self.s*y+self.tx
+        waypoint.pose.position.y=self.s*x+self.c*y+self.ty
+
+        q=waypoint.pose.orientation
+        roll,pitch,yaw=euler_from_quaternion([q.x,q.y,q.z,q.w])
+        q=quaternion_from_euler(roll,pitch,yaw+self.theta)
+        waypoint.pose.orientation=Quaternion(x=float(q[0]),y=float(q[1]),z=float(q[2]),w=float(q[3]))
+        
+        waypoint.header.frame_id=msg.header.frame_id
+        waypoint.header.stamp=rospy.Time.now()
+        return waypoint
 
     def _lidar_to_world(self,points_body: np.ndarray,vehicle_pose: Odometry)->tuple[np.ndarray,np.ndarray]:
         """Transform body-frame LiDAR points and the LiDAR origin into the pose's world frame."""
@@ -534,7 +568,7 @@ class UGVAdapter(VehicleAdapter):
                 i=0
                 if path.poses is not None and self.movement_publisher is not None:
                     rate = rospy.Rate(20)
-                    while flag==False and not rospy.is_shutdown():
+                    while flag==False and not rospy.is_shutdown() and not getattr(self,"stopping",False):
                         state = self.get_state()
                         pose=path.poses[i]
                         target=PoseStamped()
