@@ -16,7 +16,7 @@ from threading import Lock
 from copy import deepcopy
 from nav_msgs.msg import Odometry,Path
 from nav_msgs.srv import GetPlan,GetPlanRequest
-from geometry_msgs.msg import PoseStamped,TwistStamped
+from geometry_msgs.msg import PoseStamped,TwistStamped,Quaternion
 from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelObservationMsg
 from sensor_msgs.msg import Image, BatteryState,CameraInfo, PointCloud2
 from mavros_msgs.msg import State as MavrosState
@@ -114,6 +114,8 @@ class UGVAdapter(VehicleAdapter):
         self.N_dense = 20
         self.lidar_to_body_translation = np.array([-0.011, -0.02329, 0.04412],dtype=np.float64)
         self.lidar_to_body_rotation = np.eye(3,dtype=np.float64)
+        self.whereitisnt:PoseStamped|None=None
+        self.moveflag=False
 
     @property
     def navigation_frame(self)->str:
@@ -157,6 +159,34 @@ class UGVAdapter(VehicleAdapter):
         self.camera_synchronizer.registerCallback(self._adapter_callback)
         self.lidar_synchronizer = message_filters.ApproximateTimeSynchronizer([self.lidar_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.03)
         self.lidar_synchronizer.registerCallback(self._lidar_callback)
+        self.timer = rospy.Timer(rospy.Duration.from_sec(0.05), lambda event: self.update_target())
+
+    def update_target(self):
+        if self.last_pose_monotonic is None:
+            return
+        state=self.get_state()
+        if self.whereitisnt is None:
+            self.whereitisnt=PoseStamped()
+            self.whereitisnt.header.stamp = rospy.Time.now()
+            self.whereitisnt.pose.position.x=state.position.x
+            self.whereitisnt.pose.position.y=state.position.y
+            self.whereitisnt.pose.position.z=state.position.z
+
+            q=quaternion_from_euler(state.orientation.roll,state.orientation.pitch,state.orientation.yaw)
+            self.whereitisnt.pose.orientation=Quaternion(x=float(q[0]),y=float(q[1]),z=float(q[2]),w=float(q[3]))
+        if(self.moveflag==False):
+            whereitis=PoseStamped()
+            whereitis.header.stamp = rospy.Time.now()
+            
+            whereitis.pose.position.x=state.position.x
+            whereitis.pose.position.y=state.position.y
+            whereitis.pose.position.z=state.position.z
+
+            q=quaternion_from_euler(state.orientation.roll,state.orientation.pitch,state.orientation.yaw)
+            whereitis.pose.orientation=Quaternion(x=float(q[0]),y=float(q[1]),z=float(q[2]),w=float(q[3]))
+            self.movement_publisher.publish(whereitis)
+        else:
+            self.movement_publisher.publish(self.whereitisnt)
 
     def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
         if not isinstance(max_updates,int) or isinstance(max_updates,bool) or max_updates<1:
@@ -499,42 +529,46 @@ class UGVAdapter(VehicleAdapter):
             raise ValueError("Navigation frame must be a non-empty string.")
         path=self.plan_path(destination,orientation,frame_id)
         try:
-            flag=False
-            i=0
-            if path.poses is not None and self.movement_publisher is not None:
-                rate = rospy.Rate(20)
-                while flag==False and not rospy.is_shutdown():
-                    state = self.get_state()
-                    pose=path.poses[i]
-                    target=PoseStamped()
-                    target.header.stamp = rospy.Time.now()
-                    target.pose=pose.pose
-                    self.movement_publisher.publish(target)
+            try:
+                flag=False
+                i=0
+                if path.poses is not None and self.movement_publisher is not None:
+                    rate = rospy.Rate(20)
+                    while flag==False and not rospy.is_shutdown():
+                        state = self.get_state()
+                        pose=path.poses[i]
+                        target=PoseStamped()
+                        target.header.stamp = rospy.Time.now()
+                        target.pose=deepcopy(pose.pose)
+                        self.whereitisnt=target
+                        self.moveflag=True
 
-                    distance=np.sqrt((state.position.x-destination.x)**2+(state.position.y-destination.y)**2)
-                    yaw_error = (orientation.yaw - self.state.orientation.yaw + pi) % (2*pi) - pi
+                        distance=np.sqrt((state.position.x-destination.x)**2+(state.position.y-destination.y)**2)
+                        yaw_error = (orientation.yaw - self.state.orientation.yaw + pi) % (2*pi) - pi
 
-                    q = target.pose.orientation
-                    _, _, target_yaw = euler_from_quaternion([q.x,q.y,q.z,q.w])
+                        q = target.pose.orientation
+                        _, _, target_yaw = euler_from_quaternion([q.x,q.y,q.z,q.w])
 
-                    yaw_error_nextwp=(target_yaw - self.state.orientation.yaw + pi) % (2*pi) - pi
+                        yaw_error_nextwp=(target_yaw - self.state.orientation.yaw + pi) % (2*pi) - pi
 
-                    dist2nextwp=np.sqrt((state.position.x-target.pose.position.x)**2+(state.position.y-target.pose.position.y)**2)
+                        dist2nextwp=np.sqrt((state.position.x-target.pose.position.x)**2+(state.position.y-target.pose.position.y)**2)
 
-                    heading_reached = abs(yaw_error) < 0.1  # radians
-                    heading_reached_nextwp=abs(yaw_error_nextwp)<0.1
-                    if i==len(path.poses)-1:
-                        if distance<=0.1 and heading_reached:
-                            flag=True
-                    if dist2nextwp<=0.1 and heading_reached_nextwp:
-                        i+=1
-                    if i>len(path.poses)-1:
-                        i=len(path.poses)-1
-                    rate.sleep()
-            else:
-                raise RuntimeError("Planned path is empty or movement publisher is unavailable.")
-        except rospy.exceptions.ROSException as error:
-            raise RuntimeError("Failed to publish the planned path to the movement topic.") from error
+                        heading_reached = abs(yaw_error) < 0.1  # radians
+                        heading_reached_nextwp=abs(yaw_error_nextwp)<0.1
+                        if i==len(path.poses)-1:
+                            if distance<=0.1 and heading_reached:
+                                flag=True
+                        if dist2nextwp<=0.1 and heading_reached_nextwp:
+                            i+=1
+                        if i>len(path.poses)-1:
+                            i=len(path.poses)-1
+                        rate.sleep()
+                else:
+                    raise RuntimeError("Planned path is empty or movement publisher is unavailable.")
+            except rospy.exceptions.ROSException as error:
+                raise RuntimeError("Failed to publish the planned path to the movement topic.") from error
+        finally:
+            self.moveflag=False
 
     def hiddenpoints(self,object_id:str,state:State,distance_behind:float=0.5)->list[Position]:
         """Find points behind object on the same plane as the UGV."""
@@ -603,6 +637,3 @@ class UGVAdapter(VehicleAdapter):
         translation_vector=unit_vector*(magnitude+distance_behind)
         posnew=position[:2]+translation_vector
         return Position(x=float(posnew[0]),y=float(posnew[1]),z=float(state.position.z))
-    
-
-
