@@ -119,6 +119,8 @@ class UGVAdapter(VehicleAdapter):
         self.lidar_to_body_translation = np.array([-0.011, -0.02329, 0.04412],dtype=np.float64)
         self.lidar_to_body_rotation = np.eye(3,dtype=np.float64)
         self.whereitisnt:PoseStamped|None=None
+        self.intermediate_wp_marg=0.4
+        self.final_wp_marg=0.15
         self.moveflag=False
         self.theta=None
 
@@ -647,12 +649,10 @@ class UGVAdapter(VehicleAdapter):
 
                         dist2nextwp=np.sqrt((state.position.x-target.pose.position.x)**2+(state.position.y-target.pose.position.y)**2)
 
-                        heading_reached = abs(yaw_error) < 0.1  # radians
-                        heading_reached_nextwp=abs(yaw_error_nextwp)<0.1
                         if i==len(path.poses)-1:
-                            if distance<=0.15:
+                            if distance<=self.final_wp_marg:
                                 flag=True
-                        if dist2nextwp<=0.15:
+                        if dist2nextwp<=self.intermediate_wp_marg:
                             i+=1
                         if i>len(path.poses)-1:
                             i=len(path.poses)-1
