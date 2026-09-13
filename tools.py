@@ -336,7 +336,7 @@ class ToolExecutor:
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
             self.model.record()
             recording_started=True
-            self.adapter.scan()
+            self.adapter.scan(yaw_margin=np.deg2rad(15))
             changes=self.model.stop_record()
             recording_started=False
         except rospy.ROSInterruptException as error:
@@ -468,9 +468,13 @@ class ToolExecutor:
                 yaw=math.atan2(directionvector[1],directionvector[0])
                 yaw_error=(yaw-state.orientation.yaw+math.pi)%(2*math.pi)-math.pi
                 if abs(yaw_error)>0.1:
-                    result=self._tool_navigate(command=Command(id=f"{command.id}_nav", command_type="navigate",arguments={"destination":{"x":state.position.x, "y":state.position.y, "z":state.position.z}, "orientation":{"pitch":state.orientation.pitch,"yaw":yaw,"roll":state.orientation.roll}}))
-                    if result.status=="Failed":
-                        return Return(id=command.id, command_type=command.command_type, status="Failed",results=result.results)
+                    try:
+                        risk_result=self.risk.checkcmd(command)
+                        if risk_result.get("Safe") is False:
+                            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
+                        self.adapter.image(targpos=target)
+                    except Exception as error:
+                        return Return(id=command.id, command_type=command.command_type, status="Failed",results={"error":str(error)})
                 result=self._tool_observe(command=Command(id=f"{command.id}",command_type=command.command_type,arguments={}))
                 if result.status=="Failed":
                     return Return(id=command.id, command_type=command.command_type, status="Failed",results=result.results)

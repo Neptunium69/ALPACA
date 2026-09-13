@@ -153,7 +153,7 @@ class RiskCal():
                 return False,"Vehicle is not armed."
             if state.mode!="OFFBOARD":
                 return False,f"Vehicle is in {state.mode or 'an unknown mode'}, not OFFBOARD."
-        if(cmd.command_type=="scan"):
+        if(cmd.command_type=="scan" or cmd.command_type=="image"):
             try:
                 clutter=rospy.wait_for_message("clutter_level",Float64,timeout=5)
                 if clutter is None:

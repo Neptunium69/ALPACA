@@ -539,7 +539,64 @@ class UGVAdapter(VehicleAdapter):
             raise ValueError("The planned path contains poses in an unexpected coordinate frame.")
         return path
 
-    def scan(self, yaw_margin: float=np.deg2rad(10)) -> None:
+    def image(self,targpos:Position,yaw_margin: float=np.deg2rad(15))-> None:
+        """Rotate towards the desired object"""
+        try:
+            state=self.get_state()
+            target_yaw=np.arctan2(targpos.y-state.position.y,targpos.x-state.position.x)
+            error=(target_yaw-state.orientation.yaw+np.pi)%(2*np.pi)-np.pi
+            if abs(error)<yaw_margin:
+                return
+            x,y,z=state.position.x,state.position.y,state.position.z
+            yaw=state.orientation.yaw
+            d=2.0  # metres
+            c,s=np.cos(yaw),np.sin(yaw)
+
+            front=Position(x=x+d*c,y=y+d*s,z=z)
+            behind=Position(x=x-d*c,y=y-d*s,z=z)
+            left=Position(x=x-d*s,y=y+d*c,z=z)
+            right=Position(x=x+d*s,y=y-d*c,z=z)
+            arr=[]
+            if(error>0):
+                arr=[left,behind,right,front]
+            if(error<0):
+                arr=[right,behind,left,front]
+            i=0
+            yaw_error=error
+            rate=rospy.Rate(20)
+            initial_yaw=state.orientation.yaw
+            while i<4 and abs(yaw_error)>yaw_margin:
+                state=self.get_state()
+                if getattr(self,"stopping",False):
+                    raise rospy.ROSInterruptException("Scan interrupted by cleanup.")
+
+                orientation=Orientation(roll=self.state.orientation.roll,pitch=self.state.orientation.pitch,yaw=initial_yaw+pi/2)
+                orientation.yaw=orientation.yaw%(2*pi)
+                bearing=np.arctan2(arr[i].y-state.position.y,arr[i].x-state.position.x)
+                error=(bearing-state.orientation.yaw+pi)%(2*pi)-pi
+                yaw_error=(target_yaw-state.orientation.yaw+np.pi)%(2*np.pi)-np.pi
+                if abs(yaw_error)<=yaw_margin:
+                    break
+                if abs(error)<=yaw_margin:
+                    i+=1
+                    if i==4:
+                        raise RuntimeError("Imaging rotation went past one full circle without reaching target(impossible).")
+                target=PoseStamped()
+                target.header.stamp = rospy.Time.now()
+                target.pose.position.x=arr[i].x
+                target.pose.position.y=arr[i].y
+                target.pose.position.z=arr[i].z
+                self.whereitisnt=target
+
+                self.moveflag=True
+                if rospy.is_shutdown():
+                    raise rospy.ROSInterruptException("Rospy shut down")
+                rate.sleep()
+        finally:
+            self.moveflag=False
+
+        
+    def scan(self, yaw_margin: float=np.deg2rad(15)) -> None:
         """Rotate 360 degrees while collecting sensor data(Data collection is not done in this script)"""
         marginmax=pi/6
         if not isfinite(yaw_margin):
