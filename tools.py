@@ -422,7 +422,7 @@ class ToolExecutor:
     def _tool_inspect(self, command:Command):
         try:
             state=self.adapter.get_state()
-            targets=self.adapter.hiddenpoints(object_id=command.arguments["target"],state=state,distance_behind=0.7)
+            targets=self.adapter.hiddenpoints(object_id=command.arguments["target"],state=state,distance_behind=1)
             targetobjects=self.model.query_world(object_id=command.arguments["target"])
             if len(targetobjects)!=1:
                 raise KeyError(f"Object {command.arguments['target']!r} does not uniquely exist in the current world model.")

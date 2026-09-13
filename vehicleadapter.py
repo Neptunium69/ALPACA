@@ -24,6 +24,7 @@ from tf.transformations import euler_from_quaternion,quaternion_from_euler,quate
 from . import worldmodel as wm
 from . import risk
 from .worldmodel import Position,Orientation
+from sensor_msgs.msg import Imu
 from .risk import PathVoxelAssessment, VantagePoint
 import random
 
@@ -123,6 +124,7 @@ class UGVAdapter(VehicleAdapter):
         self.final_wp_marg=0.15
         self.moveflag=False
         self.theta=None
+        self.current_yawrate=None
 
     @property
     def navigation_frame(self)->str:
@@ -161,6 +163,7 @@ class UGVAdapter(VehicleAdapter):
         self.battery_subscriber = rospy.Subscriber("/mavros/battery", BatteryState, queue_size=1,callback=self._battery_callback)
         self.mavros_state_subscriber = rospy.Subscriber("/mavros/state",MavrosState,queue_size=1,callback=self._mavros_state_callback)
         self.lidar_subscriber = message_filters.Subscriber("/cloud_registered_body",PointCloud2,queue_size=5)
+        self.imu_subscriber=rospy.Subscriber("/mavros/imu/data",Imu,self._imu_callback,queue_size=1)
 
         self.px4_pose:PoseStamped|None=None
         self.randompx4thing=rospy.Subscriber("/mavros/local_position/pose",PoseStamped,callback=self._px4_callback)
@@ -189,6 +192,9 @@ class UGVAdapter(VehicleAdapter):
                 self._lidar_callback(*pending)
             except Exception as error:
                 rospy.logerr("LiDAR processing failed: %s",error)
+
+    def _imu_callback(self,msg:Imu):
+        self.current_yawrate=msg.angular_velocity.z
 
     def update_target(self):
         if self.last_pose_monotonic is None or self.px4_pose is None:
@@ -592,12 +598,26 @@ class UGVAdapter(VehicleAdapter):
                 if rospy.is_shutdown():
                     raise rospy.ROSInterruptException("Rospy shut down")
                 rate.sleep()
+            self.moveflag=False
+            sumofzeroreadings=0
+            if self.current_yawrate is not None:
+                flag=False
+                while flag==False:
+                    if(abs(self.current_yawrate)<0.01):
+                        sumofzeroreadings+=1
+                    else:
+                        sumofzeroreadings=0
+                    if(sumofzeroreadings>=100):
+                        flag=True
+                    rospy.sleep(0.01)
+            else:
+                raise RuntimeError("Yawrate Unavailible")
         finally:
             self.moveflag=False
 
         
     def scan(self, yaw_margin: float=np.deg2rad(15)) -> None:
-        """Rotate 360 degrees while collecting sensor data(Data collection is not done in this script)"""
+        """Scan six headings 60 degrees apart, pausing three seconds at each heading."""
         marginmax=pi/6
         if not isfinite(yaw_margin):
             raise ValueError("yaw_margin must be finite.")
@@ -628,28 +648,25 @@ class UGVAdapter(VehicleAdapter):
             x,y,z=state.position.x,state.position.y,state.position.z
             yaw=state.orientation.yaw
             d=2.0  # metres
-            c,s=np.cos(yaw),np.sin(yaw)
-
-            front=Position(x=x+d*c,y=y+d*s,z=z)
-            behind=Position(x=x-d*c,y=y-d*s,z=z)
-            left=Position(x=x-d*s,y=y+d*c,z=z)
-            right=Position(x=x+d*s,y=y-d*c,z=z)
-            arr=[left,behind,right,front]
+            arr=[Position(x=x+d*np.cos(yaw+k*pi/3),y=y+d*np.sin(yaw+k*pi/3),z=z) for k in range(1,7)]
 
             i=0
-            initial_yaw=current_yaw
-            while i<4 and not rospy.is_shutdown():
+            while i<len(arr) and not rospy.is_shutdown():
                 state=self.get_state()
                 if getattr(self,"stopping",False):
                     raise rospy.ROSInterruptException("Scan interrupted by cleanup.")
 
-                orientation=Orientation(roll=self.state.orientation.roll,pitch=self.state.orientation.pitch,yaw=initial_yaw+pi/2)
-                orientation.yaw=orientation.yaw%(2*pi)
                 bearing=np.arctan2(arr[i].y-state.position.y,arr[i].x-state.position.x)
                 error=(bearing-state.orientation.yaw+pi)%(2*pi)-pi
                 if abs(error)<=yaw_margin:
+                    self.moveflag=False
+                    pause_deadline=time.monotonic()+3.0
+                    while time.monotonic()<pause_deadline:
+                        if rospy.is_shutdown() or getattr(self,"stopping",False):
+                            raise rospy.ROSInterruptException("Scan interrupted while paused.")
+                        rospy.sleep(0.05)
                     i+=1
-                    if i==4:
+                    if i==len(arr):
                         break
 
                 target=PoseStamped()
