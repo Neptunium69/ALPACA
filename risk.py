@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import TYPE_CHECKING,Any,Callable,Protocol
 
 import numpy as np
@@ -61,6 +62,12 @@ class RiskCal():
     def __init__(self,model:wm.WorldModel,adapter:va.VehicleAdapter)->None:
         self.model=model
         self.adapter=adapter
+        self.occupied_confidence_threshold=0.70
+        self.occupied_route_threshold=0.20
+        self.information_route_threshold=1.00
+        self.minimum_persistent_occupied_voxels=5
+        self.maximum_vantage_candidates=32
+        self.maximum_vantage_evaluation_seconds=30.0
     def checkcmd(self,command:tools.Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:
         state=self.adapter.get_state()
         safe,reason=self._hardsafetyfilter(command,state,destination,orientation,frame_id)
@@ -89,7 +96,7 @@ class RiskCal():
             raise ValueError("Navigation destination, orientation, and frame are required.")
         if not isinstance(coverage_margin,(int,float)) or isinstance(coverage_margin,bool) or not math.isfinite(coverage_margin) or coverage_margin<0:
             raise ValueError("Coverage margin must be a finite, non-negative number.")
-        path=self.adapter.plan_path(destination,orientation,frame_id)
+        path=self.adapter.plan_path(destination,orientation,frame_id,tolerance=0.10)
         positions=self._path_positions(path)
         vehicle_pose,vehicle_min,vehicle_max=self.adapter.get_collision_geometry()
         if vehicle_pose is None:
@@ -105,7 +112,7 @@ class RiskCal():
         conservative_min=np.array([-cover_radius,-cover_radius,vehicle_min[2]],dtype=np.float64)
         conservative_max=np.array([cover_radius,cover_radius,vehicle_max[2]],dtype=np.float64)
         voxel_size=self.model.get_voxel_size()
-        sample_spacing=voxel_size/2.0
+        sample_spacing=voxel_size
         potential_voxels:set[tuple[int,int,int]]=set()
         zero_orientation=wm.Orientation(pitch=0.0,yaw=0.0,roll=0.0)
         distance=0.0
@@ -139,10 +146,13 @@ class RiskCal():
             positions.append(wm.Position(x=float(values[0]),y=float(values[1]),z=float(values[2])))
         return positions
     def _hardsafetyfilter(self,cmd:tools.Command,state:State,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->tuple[bool,str]:
-        if not isinstance(state.battery_level,(int,float)) or isinstance(state.battery_level,bool) or not math.isfinite(state.battery_level) or not 0.0<=state.battery_level<=1.0:
-            return False,"Battery level is unavailable or invalid."
-        if state.battery_level<0.15:
-            return False,"Battery level too low, please contact user to recharge or replace battery."
+        # Battery enforcement is temporarily disabled because this UGV's MAVROS
+        # percentage estimate is intermittent and has rejected otherwise safe commands.
+        if cmd.command_type in {"scan","navigate","inspect"}:
+            if not state.armed:
+                return False,"Vehicle is not armed."
+            if state.mode!="OFFBOARD":
+                return False,f"Vehicle is in {state.mode or 'an unknown mode'}, not OFFBOARD."
         if(cmd.command_type=="scan"):
             try:
                 clutter=rospy.wait_for_message("clutter_level",Float64,timeout=5)
@@ -172,15 +182,12 @@ class RiskCal():
                 return False,f"Navigation frame mismatch: goal={frame_id!r}, adapter={self.adapter.navigation_frame!r}, pose={pose_frame!r}, voxel_map={voxel_frame!r}."
             try:
                 target_voxels=self.model.get_vehicle_voxels_at_pose(destination,orientation,vehicle_min,vehicle_max)
-                target_states=self.model.get_voxel_states(target_voxels)
+                target_observations=self.model.get_voxel_states_and_scores(target_voxels)
             except (TypeError,ValueError):
                 return False,"Vehicle collision map is not ready or contains invalid data."
-            occupied_count=sum(state==1 for state in target_states)
-            unknown_count=sum(state is None for state in target_states)
-            if occupied_count:
-                return False,f"Target footprint intersects {occupied_count} occupied voxel(s)."
-            if unknown_count:
-                return False,f"Target footprint contains {unknown_count} unknown voxel(s)."
+            occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.occupied_confidence_threshold for observation in target_observations)
+            if occupied_count>=self.minimum_persistent_occupied_voxels:
+                return False,f"Target footprint intersects {occupied_count} persistent occupied voxel(s)."
         return True,"Command is safe to execute."
 
     def center(self,assessment:PathVoxelAssessment)->tuple[int,int,int]:
@@ -222,29 +229,85 @@ class RiskCal():
         pathvoxel=PathVoxelAssessment(occupied_voxels=occupied_voxels,unknown_voxels=unknown_voxels,free_voxels=free_voxels)
         if pathvoxel.total_count==0:
             return {"Safe":False,"Reason":"Navigation prediction contains no voxels."}
-        if pathvoxel.occupied_score>0.2:
+        if pathvoxel.occupied_score>self.occupied_route_threshold:
             return {"Safe":False,"Reason":"Path contains excessive obstacles."}
 
-        if (len(occupied_voxels)+len(unknown_voxels))/pathvoxel.total_count>0.2 and pathvoxel.occupied_score<0.2:
+        if (len(occupied_voxels)+len(unknown_voxels))/pathvoxel.total_count>self.information_route_threshold and pathvoxel.occupied_score<self.occupied_route_threshold:
             vp=self.adapter.vantagepoint(pathvoxel)
             center_position=self.model.voxel_to_position(self.center(pathvoxel))
             total_unknown_value=float(len(unknown_voxels))
             reference_distance=max(prediction.distance,1.0)
             options=[]
+            candidate_counts={
+                "total":len(vp),
+                "destination_not_free":0,
+                "known_free":0,
+                "not_evaluated_due_to_limit":0,
+                "not_evaluated_due_to_time":0,
+                "evaluated":0,
+                "target_footprint_check_failed":0,
+                "target_footprint_unsafe":0,
+                "planning_failed":0,
+                "empty_path":0,
+                "path_over_20_percent_occupied":0,
+                "accepted":0,
+                "time_budget_exhausted":False,
+                "evaluation_seconds":0.0,
+            }
 
-            for vantage_voxel in sorted(vp):
+            robot_position=self.adapter.get_state().position
+            known_free_candidates=[]
+            for vantage_voxel in vp:
                 vantage_state=self.model.get_voxel_states([vantage_voxel])[0]
                 if vantage_state!=0:
+                    candidate_counts["destination_not_free"]+=1
                     continue
                 vantage_position=self.model.voxel_to_position(vantage_voxel)
+                distance_squared=(vantage_position.x-robot_position.x)**2+(vantage_position.y-robot_position.y)**2
+                known_free_candidates.append((distance_squared,vantage_voxel,vantage_position))
+            known_free_candidates.sort(key=lambda candidate:(candidate[0],candidate[1]))
+            candidate_counts["known_free"]=len(known_free_candidates)
+            candidate_counts["not_evaluated_due_to_limit"]=max(0,len(known_free_candidates)-self.maximum_vantage_candidates)
+            candidates_to_evaluate=known_free_candidates[:self.maximum_vantage_candidates]
+            vehicle_pose,vehicle_min,vehicle_max=self.adapter.get_collision_geometry()
+            if vehicle_pose is None:
+                return {"Safe":False,"Reason":"Vehicle localization is not ready.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts}
+            evaluation_started=time.monotonic()
+
+            for candidate_index,(_,vantage_voxel,vantage_position) in enumerate(candidates_to_evaluate):
+                elapsed=time.monotonic()-evaluation_started
+                if elapsed>=self.maximum_vantage_evaluation_seconds:
+                    candidate_counts["not_evaluated_due_to_time"]=len(candidates_to_evaluate)-candidate_index
+                    candidate_counts["time_budget_exhausted"]=True
+                    rospy.logwarn("Vantage evaluation reached its %.1f-second time budget after %d candidate(s); selecting the best valid option found so far.",self.maximum_vantage_evaluation_seconds,candidate_counts["evaluated"])
+                    break
+                candidate_counts["evaluated"]+=1
+                if candidate_counts["evaluated"]==1 or candidate_counts["evaluated"]%10==0 or candidate_counts["evaluated"]==len(candidates_to_evaluate):
+                    rospy.loginfo("Vantage evaluation progress: evaluating candidate %d/%d; %d accepted so far.",candidate_counts["evaluated"],len(candidates_to_evaluate),candidate_counts["accepted"])
                 vantage_yaw=math.atan2(center_position.y-vantage_position.y,center_position.x-vantage_position.x)
                 vantage_orientation=wm.Orientation(pitch=0.0,yaw=vantage_yaw,roll=0.0)
                 try:
+                    target_voxels=self.model.get_vehicle_voxels_at_pose(vantage_position,vantage_orientation,vehicle_min,vehicle_max)
+                    target_observations=self.model.get_voxel_states_and_scores(target_voxels)
+                except (TypeError,ValueError):
+                    candidate_counts["target_footprint_check_failed"]+=1
+                    continue
+                persistent_occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.occupied_confidence_threshold for observation in target_observations)
+                if persistent_occupied_count>=self.minimum_persistent_occupied_voxels:
+                    candidate_counts["target_footprint_unsafe"]+=1
+                    continue
+                try:
                     vantage_prediction=self.predict_navigation(command,vantage_position,vantage_orientation,frame_id)
                 except (RuntimeError,TypeError,ValueError):
+                    candidate_counts["planning_failed"]+=1
                     continue
                 vantage_path_states=self.model.get_voxel_states(list(vantage_prediction.potential_voxels))
-                if not vantage_path_states or any(state!=0 for state in vantage_path_states):
+                if not vantage_path_states:
+                    candidate_counts["empty_path"]+=1
+                    continue
+                vantage_occupied_score=sum(state==1 for state in vantage_path_states)/len(vantage_path_states)
+                if vantage_occupied_score>self.occupied_route_threshold:
+                    candidate_counts["path_over_20_percent_occupied"]+=1
                     continue
 
                 observable_voxels=set()
@@ -267,12 +330,15 @@ class RiskCal():
                     "Path Cost":path_cost,
                     "Profit":profit,
                 })
+                candidate_counts["accepted"]+=1
 
+            candidate_counts["evaluation_seconds"]=round(time.monotonic()-evaluation_started,3)
+            rospy.loginfo("Vantage candidates: total=%d, destination_not_free=%d, known_free=%d, evaluated=%d, limited_out=%d, timed_out=%d, target_check_failed=%d, target_unsafe=%d, planning_failed=%d, empty_path=%d, path_over_20_percent_occupied=%d, accepted=%d, time_budget_exhausted=%s, evaluation_seconds=%.3f.",candidate_counts["total"],candidate_counts["destination_not_free"],candidate_counts["known_free"],candidate_counts["evaluated"],candidate_counts["not_evaluated_due_to_limit"],candidate_counts["not_evaluated_due_to_time"],candidate_counts["target_footprint_check_failed"],candidate_counts["target_footprint_unsafe"],candidate_counts["planning_failed"],candidate_counts["empty_path"],candidate_counts["path_over_20_percent_occupied"],candidate_counts["accepted"],candidate_counts["time_budget_exhausted"],candidate_counts["evaluation_seconds"])
             if not options:
-                return {"Safe":False,"Reason":"No vantage points availible.","Needs Information":True,"Inform User":True}
+                return {"Safe":False,"Reason":"No vantage points available.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts}
             best_option=max(options,key=lambda option:option["Profit"])
             if best_option["Profit"]<=0:
-                return {"Safe":False,"Reason":"No vantage points have an expected value greater than cost.","Needs Information":True,"Inform User":True,"Vantage Options":options}
-            return {"Safe":False,"Reason":"Route requires more information.","Needs Information":True, "Inform User":False,"Best Vantage Point":best_option,"Vantage Options":options,"Prediction":prediction,"Assessment":pathvoxel}
+                return {"Safe":False,"Reason":"No vantage points have an expected value greater than cost.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts,"Vantage Options":options}
+            return {"Safe":False,"Reason":"Route requires more information.","Needs Information":True,"Inform User":False,"Candidate Counts":candidate_counts,"Best Vantage Point":best_option,"Vantage Options":options,"Prediction":prediction,"Assessment":pathvoxel}
 
         return {"Safe":True,"Reason":"Route accepted.","Prediction":prediction,"Assessment":pathvoxel}

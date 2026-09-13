@@ -8,6 +8,17 @@ from . import yolo
 
 import rospy
 from pathlib import Path
+from dataclasses import asdict
+import json
+import os
+import time
+from threading import RLock
+from std_msgs.msg import Float64
+from std_srvs.srv import Trigger,TriggerResponse
+from mavros_msgs.msg import State as MavrosState
+from mavros_msgs.srv import CommandBool
+from .deploy.px4_shutdown import run_shutdown
+from alpaca_msgs.msg import ObservationFrame,SpatialObservationFrame
 
 # Prompts and stuff
 prompt_path=Path(__file__).resolve().with_name("system_prompt_master.txt")
@@ -18,31 +29,91 @@ project_root=Path(__file__).resolve().parent.parent
 model_path=str(project_root/"Models"/"Qwen3-VL-4B-Instruct")
 yolo_path="./ALPACA/yolomodel/best.pt"
 
+def start_world_model_logging(model:worldmodel.WorldModel,log_dir:Path):
+    log_path=log_dir/"world_model_objects.jsonl"
+    def log_objects(_event):
+        try:
+            objects=model.query_world()
+            record={"monotonic_seconds":time.monotonic(),"object_count":len(objects),"objects":[asdict(world_object) for world_object in objects]}
+            with log_path.open("a",encoding="utf-8") as log_file:
+                log_file.write(json.dumps(record,ensure_ascii=False,default=str)+"\n")
+        except Exception as error:
+            rospy.logerr("World-model logging failed: %s",error)
+    return rospy.Timer(rospy.Duration(1),log_objects)
+
+def wait_for_runtime_inputs(timeout_seconds:float=30.0)->None:
+    required_topics=[("voxel_observations",SpatialObservationFrame,timeout_seconds),("clutter_level",Float64,timeout_seconds),("detections",ObservationFrame,max(timeout_seconds,90.0))]
+    for topic,message_type,topic_timeout in required_topics:
+        rospy.loginfo("Waiting for ALPACA runtime data on /%s...",topic)
+        try:
+            rospy.wait_for_message(topic,message_type,timeout=topic_timeout)
+        except rospy.ROSException as error:
+            message=f"No ALPACA runtime data on /{topic} within {topic_timeout:.0f} seconds."
+            raise RuntimeError(message) from error
+    rospy.loginfo("Voxel, clutter, and detection pipelines are live.")
+
 def main():
     # Initialize stuff
     rospy.init_node("alpaca", anonymous=True)
+    log_dir=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
+    log_dir.mkdir(parents=True,exist_ok=True)
     observations=worldmodel.Model()
     model=worldmodel.WorldModel(observations,["apple","board"])
-    initial_state=vehicleadapter.State(battery_level=float("nan"),position=worldmodel.Position(0.0,0.0,0.0),orientation=worldmodel.Orientation(0.0,0.0,0.0))
+    initial_state=vehicleadapter.State(battery_level=None,position=worldmodel.Position(0.0,0.0,0.0),orientation=worldmodel.Orientation(0.0,0.0,0.0))
     adapter=vehicleadapter.UGVAdapter(initial_state,model,None)
     rcm=risk.RiskCal(model,adapter)
     adapter.riskcal=rcm
     detector=yolo.YOLOAdapter(model_path=yolo_path)
     vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
     vlm_interface.init_vlm()
-    toolexecutor=tools.ToolExecutor(model,adapter, rcm,vlm_interface.output_text_publisher,vlm_interface.output_image_publisher,vlm_interface.input_subscriber, detector)
+    toolexecutor=tools.ToolExecutor(model,adapter,rcm,vlm_interface.output_text_publisher,vlm_interface.output_image_publisher,vlm_interface.input_subscriber,detector,completion_publisher=getattr(vlm_interface,"completion_publisher",None))
     vlm_interface.toolexe=toolexecutor
     ui=userinterface.UI()
 
     # Initialize the stuff that just got initialized
     model.initwm()
+    world_model_log_timer=start_world_model_logging(model,log_dir)
     detector.init_yolo()
     adapter.init_sensordata()
-    ui.initui()
-
-    vlm_interface.run_mission(user_prompt="Find the apple behind a board. After you are done, send me a message that you found it and an image of the apple.")
-
-    rospy.spin()
+    shutdown_lock=RLock()
+    adapter.stopping=False
+    adapter.stopped=False
+    def shutdown_hold(_request=None):
+        adapter.stopping=True
+        return TriggerResponse(success=True,message="Adapter switched to idle; navigation disabled until restart.")
+    def stop_adapter():
+        with shutdown_lock:
+            if adapter.stopped: return
+            shutdown_hold()
+            while not rospy.is_shutdown():
+                try:
+                    if run_shutdown(rospy,MavrosState,CommandBool,Trigger,initialize_node=False)==0:
+                        adapter.timer.shutdown()
+                        adapter.stopped=True
+                        return
+                except Exception as error:
+                    rospy.logerr("Disarm confirmation failed; retaining adapter stream: %s",error)
+                time.sleep(1.0)
+    hold_service=rospy.Service("/alpaca/px4_shutdown_hold",Trigger,shutdown_hold)
+    rospy.on_shutdown(stop_adapter)
+    try:
+        ui.initui()
+        wait_for_runtime_inputs()
+        rospy.set_param("/alpaca/runtime_ready",True)
+        if rospy.get_param("~wait_for_start",False):
+            rospy.loginfo("Adapter streaming; waiting for launcher authorization after armed OFFBOARD.")
+            while not rospy.is_shutdown() and not adapter.stopping and not rospy.get_param("/alpaca/start_mission",False):
+                rospy.sleep(0.1)
+            if rospy.is_shutdown() or adapter.stopping: return 0
+            adapter.require_navigation_ready("start the mission")
+        vlm_interface.run_mission(user_prompt="Find the apple behind a board. After you are done, send me a message that you found it and an image of the apple.")
+        rospy.spin()
+    except RuntimeError as error:
+        rospy.logerr("ALPACA stopped: %s",error)
+        return 1
+    finally:
+        stop_adapter()
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

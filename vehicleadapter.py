@@ -12,7 +12,7 @@ from std_msgs.msg import Float64
 import sensor_msgs.point_cloud2 as pc2
 import rospy
 import message_filters
-from threading import Lock
+from threading import Condition,Lock,Thread
 from copy import deepcopy
 from nav_msgs.msg import Odometry,Path
 from nav_msgs.srv import GetPlan,GetPlanRequest
@@ -103,6 +103,10 @@ class UGVAdapter(VehicleAdapter):
         self.max_state_age=2.0
         self.lidar_points_world=None
         self.lidar_origin_world=None
+        self.lidar_condition=Condition()
+        self.pending_lidar=None
+        self.stopping=False
+        self.stopped=False
         self.vehicle_min = np.array([-0.15, -0.17, -0.25])
         self.vehicle_max = np.array([0.15, 0.17, 0.0])
         self.search_offset = np.array([0.30, 0.30, 0.05])
@@ -161,8 +165,28 @@ class UGVAdapter(VehicleAdapter):
         self.camera_synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         self.camera_synchronizer.registerCallback(self._adapter_callback)
         self.lidar_synchronizer = message_filters.ApproximateTimeSynchronizer([self.lidar_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.03)
-        self.lidar_synchronizer.registerCallback(self._lidar_callback)
+        self.lidar_worker=Thread(target=self._process_lidar,daemon=True)
+        self.lidar_worker.start()
+        self.lidar_synchronizer.registerCallback(self._queue_lidar)
         self.timer = rospy.Timer(rospy.Duration.from_sec(0.05), lambda event: self.update_target())
+
+    def _queue_lidar(self,cloud:PointCloud2,vehicle_pose:Odometry)->None:
+        with self.lidar_condition:
+            self.pending_lidar=(cloud,vehicle_pose)
+            self.lidar_condition.notify()
+
+    def _process_lidar(self)->None:
+        while not rospy.is_shutdown():
+            with self.lidar_condition:
+                self.lidar_condition.wait_for(lambda:self.pending_lidar is not None or rospy.is_shutdown(),timeout=0.1)
+                if rospy.is_shutdown(): return
+                pending=self.pending_lidar
+                self.pending_lidar=None
+            if pending is None: continue
+            try:
+                self._lidar_callback(*pending)
+            except Exception as error:
+                rospy.logerr("LiDAR processing failed: %s",error)
 
     def update_target(self):
         if self.last_pose_monotonic is None or self.px4_pose is None:
@@ -253,7 +277,7 @@ class UGVAdapter(VehicleAdapter):
         voxel_messages=[VoxelObservationMsg(x=voxel[0],y=voxel[1],z=voxel[2],free_observations=counts[0],occupied_observations=counts[1]) for voxel,counts in voxel_counts.items()]
         voxel_frame=SpatialObservationFrame()
         voxel_frame.header.stamp=cloud.header.stamp
-        voxel_frame.header.frame_id=vehicle_pose.header.frame_id
+        voxel_frame.header.frame_id=self.navigation_frame
         voxel_frame.voxels=voxel_messages
         voxel_frame.voxel_size=self.voxel_size
         voxel_frame.grid_origin.x=self.roi_min[0]
@@ -513,7 +537,7 @@ class UGVAdapter(VehicleAdapter):
             raise ValueError("The planned path contains poses in an unexpected coordinate frame.")
         return path
 
-    def scan(self, yaw_margin: float=0.1) -> None:
+    def scan(self, yaw_margin: float=np.deg2rad(10)) -> None:
         """Rotate 360 degrees while collecting sensor data(Data collection is not done in this script)"""
         marginmax=pi/6
         if not isfinite(yaw_margin):
@@ -528,7 +552,7 @@ class UGVAdapter(VehicleAdapter):
         current_yaw=None
         last_pose_update=None
         subscriber=rospy.Subscriber("vehicle_pose", Odometry, callback)
-        yaw_publisher = rospy.Publisher("/mavros/setpoint_velocity/cmd_vel",TwistStamped,queue_size=10,)
+        rate=rospy.Rate(20)
         try:
             initial_pose_deadline=time.monotonic()+2.0
             while current_yaw is None and not rospy.is_shutdown():
@@ -537,19 +561,55 @@ class UGVAdapter(VehicleAdapter):
                 rospy.sleep(0.01)
 
             if rospy.is_shutdown():
-                return
+                raise rospy.ROSInterruptException("Rospy shut down")
             if current_yaw is None:
                 raise RuntimeError("Vehicle pose is unavailable.")
-            for _ in range(4):
-                initial_yaw=current_yaw
+
+            state=self.get_state()
+            x,y,z=state.position.x,state.position.y,state.position.z
+            yaw=state.orientation.yaw
+            d=2.0  # metres
+            c,s=np.cos(yaw),np.sin(yaw)
+
+            front=Position(x=x+d*c,y=y+d*s,z=z)
+            behind=Position(x=x-d*c,y=y-d*s,z=z)
+            left=Position(x=x-d*s,y=y+d*c,z=z)
+            right=Position(x=x+d*s,y=y-d*c,z=z)
+            arr=[left,behind,right,front]
+
+            i=0
+            initial_yaw=current_yaw
+            while i<4 and not rospy.is_shutdown():
+                state=self.get_state()
+                if getattr(self,"stopping",False):
+                    raise rospy.ROSInterruptException("Scan interrupted by cleanup.")
+
                 orientation=Orientation(roll=self.state.orientation.roll,pitch=self.state.orientation.pitch,yaw=initial_yaw+pi/2)
                 orientation.yaw=orientation.yaw%(2*pi)
-                self.navigate(self.state.position,orientation)
+                bearing=np.arctan2(arr[i].y-state.position.y,arr[i].x-state.position.x)
+                error=(bearing-state.orientation.yaw+pi)%(2*pi)-pi
+                if abs(error)<=yaw_margin:
+                    i+=1
+                    if i==4:
+                        break
+
+                target=PoseStamped()
+                target.header.stamp = rospy.Time.now()
+                target.pose.position.x=arr[i].x
+                target.pose.position.y=arr[i].y
+                target.pose.position.z=arr[i].z
+                self.whereitisnt=target
+
+                self.moveflag=True
                 if rospy.is_shutdown():
-                    return
+                    raise rospy.ROSInterruptException("Rospy shut down")
+                rate.sleep()
+            if rospy.is_shutdown():
+                raise rospy.ROSInterruptException("Rospy shut down")
 
         finally:
-                subscriber.unregister()
+            subscriber.unregister()
+            self.moveflag=False
 
     def navigate(self, destination: Position, orientation: Orientation, frame_id: str | None=None) -> None:
         """Moves the vehicle."""
@@ -590,9 +650,9 @@ class UGVAdapter(VehicleAdapter):
                         heading_reached = abs(yaw_error) < 0.1  # radians
                         heading_reached_nextwp=abs(yaw_error_nextwp)<0.1
                         if i==len(path.poses)-1:
-                            if distance<=0.1 and heading_reached:
+                            if distance<=0.15:
                                 flag=True
-                        if dist2nextwp<=0.1 and heading_reached_nextwp:
+                        if dist2nextwp<=0.15:
                             i+=1
                         if i>len(path.poses)-1:
                             i=len(path.poses)-1

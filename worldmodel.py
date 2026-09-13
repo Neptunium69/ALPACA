@@ -672,6 +672,13 @@ class WorldModel:
 
             return deepcopy(result)
 
+    def getallobjects(self)->str:
+        listofobjects=[]
+        for object in deepcopy(self.observations.objects):
+            listofobjects.append({"ID":object.id, "Class Name":object.class_name})
+        stringofobjects=json.dumps(listofobjects)
+        return stringofobjects
+
     def _add_object(self, world_object: Object) -> None:
         with self._lock:
             if any(existing_object.id == world_object.id for existing_object in self.observations.objects):
