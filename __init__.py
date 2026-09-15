@@ -1,1 +1,0 @@
-"""ALPACA ROS package."""

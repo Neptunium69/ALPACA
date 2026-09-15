@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from . import worldmodel as wm
-from . import vehicleadapter as va
-from . import risk as rcm
+from ... import worldmodel as wm
+from ... import vehicleadapter as va
+from ... import risk as rcm
 import cv2
 from std_msgs.msg import String
 import numpy as np
@@ -16,6 +16,9 @@ import os
 from pathlib import Path
 from typing import Any
 import rospy
+from typing import Protocol
+import warnings
+
 
 command_list=["query","robot_state","write","observe","scan","navigate","inspect","image","ask_user","finish"]
 
@@ -31,6 +34,59 @@ class Return:
     command_type: str
     status: str
     results: dict[str, Any]
+
+@dataclass(frozen=True)
+class ToolSpecification:
+    name:str
+    description:str
+    arguments: dict[str,dict[str,int]]
+
+class Tool(Protocol):
+    @property
+    def specification(self)->ToolSpecification:
+        """Returns verbal description about the use of this tool"""
+        raise NotImplementedError("This method should be implemented by subclasses.")
+    def run(self,cmd:Command):
+        """Method to run this tool."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
+
+class ToolList():
+    def __init__(self)->None:
+        self._tools:dict[str:Tool]={}
+    def add(self,tool:Tool)->None:
+        try:
+            if(self._tools.get(tool.specification.name) is None):
+                self._tools[tool.specification.name]=tool
+            else:
+                raise ValueError(f"Tool with name {tool.specification.name} already exists. No changes were made.")
+        except Exception as error:
+            warnings.warn(f"Tool {tool.specification.name} not added due to error: {error}")
+    def remove(self,toolname:str)->None:
+        if toolname in self._getallnames:
+            del self._tools[toolname]
+        else:
+            warnings.warn(f"Tool {toolname} is not present, no changes were made.")
+    def get(self,toolname:str)->Tool|None:
+        val=self._tools.get(toolname)
+        if val is None:
+            warnings.warn(f"Tool {toolname} not present.")
+            return None
+        else:
+            return val
+    def getall(self)->dict[str:Tool]:
+        return self._tools
+    def getspec(self,toolname:str)->ToolSpecification:
+        return self._tools.get(toolname).specification
+    def getallspec(self)->list[ToolSpecification]:
+        spec=[]
+        for tool in self._tools:
+            spec.append(tool.specification)
+        return spec
+    def _getallnames(self)->list[str]:
+        a=self.getallspec
+        for i in range(a):
+            a[i]=a[i].name
+        return a
 
 class ToolExecutor:
     def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, output_text_publisher:rospy.Publisher, output_image_publisher:rospy.Publisher, input_subscriber:rospy.Subscriber, detector:YOLOAdapter | None=None, completion_publisher:rospy.Publisher | None=None) -> None:

@@ -21,8 +21,8 @@ from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelOb
 from sensor_msgs.msg import Image, BatteryState,CameraInfo, PointCloud2
 from mavros_msgs.msg import State as MavrosState
 from tf.transformations import euler_from_quaternion,quaternion_from_euler,quaternion_matrix
-from . import worldmodel as wm
-from . import risk
+from ... import worldmodel as wm
+from ... import risk
 from .worldmodel import Position,Orientation
 from sensor_msgs.msg import Imu
 from .risk import PathVoxelAssessment, VantagePoint
