@@ -39,7 +39,13 @@ class Return:
 class ToolSpecification:
     name:str
     description:str
-    arguments: dict[str,dict[str,int]]
+    arguments: list[ToolArgument]
+
+@dataclass(frozen=True)
+class ToolArgument:
+    name: str
+    required: int
+    type: str
 
 class Tool(Protocol):
     @property
@@ -363,17 +369,24 @@ class ToolExecutor:
 
     def _tool_observe(self, command:Command) -> Return:
         try:
-            message=rospy.wait_for_message("camera_color", Image, timeout=5.0)
-            if message is None:
-                raise RuntimeError("Camera returned no image message")
-            image=self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
-            height,width=image.shape[:2]
-            timestamp=message.header.stamp.to_nsec()
-            image_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp"))/"images"
-            image_directory.mkdir(parents=True,exist_ok=True)
-            image_path=str(image_directory/f"camera_image_{timestamp}.png")
-            if not cv2.imwrite(image_path,image):
-                raise IOError(f"Could not write {image_path}")
+            calltime=rospy.Time.now()
+            flag=False
+            while flag==False:
+                message=rospy.wait_for_message("camera_color", Image, timeout=5.0)
+                if message is None:
+                    raise RuntimeError("Camera returned no image message")
+                stamp=message.header.stamp
+                age_s = (calltime - stamp).to_sec()
+                image=self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
+                height,width=image.shape[:2]
+                timestamp=message.header.stamp.to_nsec()
+                image_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp"))/"images"
+                image_directory.mkdir(parents=True,exist_ok=True)
+                image_path=str(image_directory/f"camera_image_{timestamp}.png")
+                if not cv2.imwrite(image_path,image):
+                    raise IOError(f"Could not write {image_path}")
+                if(age_s<0.5):
+                    flag=True
             return Return(id=command.id,command_type=command.command_type,status="Success",results={
                 "image_path":image_path,
                 "width":width,
@@ -618,6 +631,3 @@ class ToolExecutor:
             commands.append(Command(id=command_id,command_type=command_type,arguments=arguments))
 
         return commands
-
-
-    
