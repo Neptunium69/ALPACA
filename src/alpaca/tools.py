@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 import rospy
 
+
 command_list=["query","robot_state","write","observe","scan","navigate","inspect","image","ask_user","finish"]
 
 @dataclass(frozen=True)
@@ -307,17 +308,24 @@ class ToolExecutor:
 
     def _tool_observe(self, command:Command) -> Return:
         try:
-            message=rospy.wait_for_message("camera_color", Image, timeout=5.0)
-            if message is None:
-                raise RuntimeError("Camera returned no image message")
-            image=self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
-            height,width=image.shape[:2]
-            timestamp=message.header.stamp.to_nsec()
-            image_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp"))/"images"
-            image_directory.mkdir(parents=True,exist_ok=True)
-            image_path=str(image_directory/f"camera_image_{timestamp}.png")
-            if not cv2.imwrite(image_path,image):
-                raise IOError(f"Could not write {image_path}")
+            calltime=rospy.Time.now()
+            while True:
+                message=rospy.wait_for_message("camera_color", Image, timeout=5.0)
+                if message is None:
+                    raise RuntimeError("Camera returned no image message")
+                stamp=message.header.stamp
+                age_s = (calltime - stamp).to_sec()
+                image=self.bridge.imgmsg_to_cv2(message, desired_encoding="bgr8")
+                height,width=image.shape[:2]
+                timestamp=message.header.stamp.to_nsec()
+                image_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp"))/"images"
+                image_directory.mkdir(parents=True,exist_ok=True)
+                image_path=str(image_directory/f"camera_image_{timestamp}.png")
+                if not cv2.imwrite(image_path,image):
+                    raise IOError(f"Could not write {image_path}")
+                if(age_s<0.5):
+                    break
+            
             return Return(id=command.id,command_type=command.command_type,status="Success",results={
                 "image_path":image_path,
                 "width":width,
@@ -336,7 +344,7 @@ class ToolExecutor:
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
             self.model.record()
             recording_started=True
-            self.adapter.scan(yaw_margin=np.deg2rad(15))
+            self.adapter.scan(yaw_margin=np.deg2rad(45))
             changes=self.model.stop_record()
             recording_started=False
         except rospy.ROSInterruptException as error:
@@ -562,6 +570,3 @@ class ToolExecutor:
             commands.append(Command(id=command_id,command_type=command_type,arguments=arguments))
 
         return commands
-
-
-    

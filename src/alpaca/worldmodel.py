@@ -42,6 +42,7 @@ class Object:
     position: Position
     attributes: dict[str, Any] = field(default_factory=dict)
     confidence_scores: dict[str, float] = field(default_factory=dict)
+    detection_history:list[bool]=field(default_factory=list)
 
     def __post_init__(self):
         defaults = {
@@ -74,8 +75,11 @@ class VoxelModel:
 class WorldModel:
     def __init__(self, observations: Model, detection_classes):
         self.observations = observations
+        self.observationstemp=Model()
+        self._last_detection_stamp=None
         self.detection_classes = tuple(detection_classes)
         self.voxelmap = VoxelModel(voxelsize=float("nan"), voxels=[], grid_origin=None, frame_id=None)
+        self.association_distance=0.3
         self._voxel_lookup: dict[tuple[int,int,int],Voxel]={}
         self._bridge = CvBridge()
         self._latest_frame=None
@@ -88,7 +92,7 @@ class WorldModel:
         self.detection_subscriber=message_filters.Subscriber("detections", ObservationFrame)
         self.depth_subscriber=message_filters.Subscriber("camera_depth", Image)
         self.voxel_subscriber=rospy.Subscriber("voxel_observations",SpatialObservationFrame,callback=self._voxel_callback)
-        self.synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.detection_subscriber], queue_size=10, slop=0.05)
+        self.synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.detection_subscriber], queue_size=60, slop=0.05)
         self.synchronizer.registerCallback(self._update_callback)
 
     @staticmethod
@@ -103,16 +107,26 @@ class WorldModel:
             return
 
         with self._lock:
+            stamp=detections.header.stamp.to_nsec()
+            if self._last_detection_stamp is not None and stamp<=self._last_detection_stamp:
+                if detection_list:
+                    rospy.loginfo("World-model rejected old frame: stamp_ns=%d last_stamp_ns=%d",stamp,self._last_detection_stamp)
+                return
             self._latest_frame=detections
             self._latest_depth=depth
             try:
                 working_objects = deepcopy(self.observations.objects)
-                self._apply_detections(working_objects, detection_list, detections, depth)
+                working_temp=deepcopy(self.observationstemp.objects)
+                self._apply_detections(working_objects, detection_list, detections, depth, working_temp)
             except Exception as error:
                 rospy.logerr("World-model update failed: %s", error)
                 return
 
             self.observations.objects[:] = working_objects
+            self.observationstemp.objects[:]=working_temp
+            self._last_detection_stamp=stamp
+            if detection_list or working_temp:
+                rospy.loginfo("World-model confirmation: %s",json.dumps({"stamp_ns":stamp,"detections":len(detection_list),"confirmed_ids":[obj.id for obj in working_objects],"temporary":[{"id":obj.id,"position":[obj.position.x,obj.position.y,obj.position.z],"history":obj.detection_history} for obj in working_temp]}))
 
     def _voxel_callback(self, message: SpatialObservationFrame):
         voxel_size=float(message.voxel_size)
@@ -159,7 +173,7 @@ class WorldModel:
                     voxel.score=self.sigmoid(voxel.rawscore)
                     voxel.state=int(voxel.score>=0.5)
 
-    def _apply_detections(self, objects: list[Object], detection_list: list[ObjectDetection], frame: ObservationFrame, depthmap: Image) -> None:
+    def _apply_detections(self, objects: list[Object], detection_list: list[ObjectDetection], frame: ObservationFrame, depthmap: Image, temp_objects:list[Object]) -> None:
         observed_list=[]
         for detection in detection_list:
             updated_object=None
@@ -174,9 +188,9 @@ class WorldModel:
 
             if(detection.has_world_position):
                 detection_position=np.array([detection.world_position.x,detection.world_position.y,detection.world_position.z],dtype=np.float64)
-                same_class=[candidate for candidate in objects if candidate.class_name==detection.class_name]
+                same_class=[candidate for candidate in objects+temp_objects if candidate.class_name==detection.class_name]
                 matched_object=min(same_class,key=lambda candidate:float(np.linalg.norm(detection_position-np.array([candidate.position.x,candidate.position.y,candidate.position.z],dtype=np.float64))),default=None)
-                association_distance=0.15
+                association_distance=self.association_distance
                 if detection.has_depth and math.isfinite(detection.camera_range):
                     association_distance=max(association_distance,min(0.30,0.05*detection.camera_range))
                 if matched_object is not None:
@@ -210,9 +224,9 @@ class WorldModel:
                                 matched_object.size.conservative_width=(old_width*(1-detection.confidence))+(detection.confidence*new_width)
                                 matched_object.size.conservative_height=(old_height*(1-detection.confidence))+(detection.confidence*new_height)
                 else:
-                    id=f"{detection.class_name}_{self._get_latest(detection.class_name, objects)+1}"
+                    id=f"{detection.class_name}_{self._get_latest(detection.class_name, objects+temp_objects)+1}"
                     updated_object=Object(id=id,class_name=detection.class_name,size=detected_size if detected_size is not None else Size(),position=Position(detection.world_position.x,detection.world_position.y,detection.world_position.z),confidence_scores={"existence_rawscore":-2.0,"existence_score":self.sigmoid(-2.0)})
-                    objects.append(updated_object)
+                    temp_objects.append(updated_object)
                     observed_list.append(id)
 
                 # Prevents the rawscore form being too large, which may cause world model updates to be slow if the object's position is changed.
@@ -222,6 +236,13 @@ class WorldModel:
                 if updated_object is not None and updated_object.confidence_scores["positioning_rawscore"]>5.0:
                     updated_object.confidence_scores["positioning_rawscore"]=5.0
                     updated_object.confidence_scores["positioning_score"]=self.sigmoid(5.0)
+
+        observed_ids=set(observed_list)
+        for obj in temp_objects:
+            obj.detection_history=(obj.detection_history+[obj.id in observed_ids])[-5:]
+            if sum(obj.detection_history)>=3:
+                objects.append(obj)
+        temp_objects[:]=[obj for obj in temp_objects if sum(obj.detection_history)<3]
 
         for object in objects:
             if object.attributes.get("VLMFlag")==1:

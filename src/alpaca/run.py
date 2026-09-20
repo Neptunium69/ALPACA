@@ -17,17 +17,17 @@ from std_msgs.msg import Float64
 from std_srvs.srv import Trigger,TriggerResponse
 from mavros_msgs.msg import State as MavrosState
 from mavros_msgs.srv import CommandBool
-from .deploy.px4_shutdown import run_shutdown
+from ...deploy.px4_shutdown import run_shutdown
 from alpaca_msgs.msg import ObservationFrame,SpatialObservationFrame
 
 # Prompts and stuff
-prompt_path=Path(__file__).resolve().with_name("system_prompt_master.txt")
+prompt_path=Path(__file__).resolve().parents[2]/"system_prompt_master.txt"
 system_prompt_master=prompt_path.read_text(encoding="utf-8").strip()
 system_prompt_think="\nEnter PLANNING MODE. Think of a plan of what you should do next but don't write commands yet."
 system_prompt_act="\nOutput a set of JSON commands following the command format for the next step."
-project_root=Path(__file__).resolve().parent.parent
+project_root=Path(__file__).resolve().parents[3]
 model_path=str(project_root/"Models"/"Qwen3-VL-4B-Instruct")
-yolo_path="./ALPACA/yolomodel/best.pt"
+yolo_path="./ALPACA/yolomodel/best.engine"
 
 def start_world_model_logging(model:worldmodel.WorldModel,log_dir:Path):
     log_path=log_dir/"world_model_objects.jsonl"
