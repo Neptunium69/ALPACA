@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from ... import worldmodel as wm
-from ... import vehicleadapter as va
-from ... import risk as rcm
+from . import worldmodel as wm
+from . import vehicleadapter as va
+from . import risk as rcm
 import cv2
 from std_msgs.msg import String
 import numpy as np
@@ -58,7 +58,7 @@ class Tool(Protocol):
 
 class ToolList():
     def __init__(self)->None:
-        self._tools:dict[str:Tool]={}
+        self._tools:dict[str,Tool]={}
     def add(self,tool:Tool)->None:
         try:
             if(self._tools.get(tool.specification.name) is None):
@@ -68,7 +68,7 @@ class ToolList():
         except Exception as error:
             warnings.warn(f"Tool {tool.specification.name} not added due to error: {error}")
     def remove(self,toolname:str)->None:
-        if toolname in self._getallnames:
+        if toolname in self._getallnames():
             del self._tools[toolname]
         else:
             warnings.warn(f"Tool {toolname} is not present, no changes were made.")
@@ -79,20 +79,19 @@ class ToolList():
             return None
         else:
             return val
-    def getall(self)->dict[str:Tool]:
+    def getall(self)->dict[str,Tool]:
         return self._tools
-    def getspec(self,toolname:str)->ToolSpecification:
-        return self._tools.get(toolname).specification
+    
+    def getspec(self,toolname:str)->ToolSpecification|None:
+        tool=self._tools.get(toolname)
+        return tool.specification if tool is not None else None
     def getallspec(self)->list[ToolSpecification]:
         spec=[]
-        for tool in self._tools:
+        for tool in self._tools.values():
             spec.append(tool.specification)
         return spec
     def _getallnames(self)->list[str]:
-        a=self.getallspec
-        for i in range(a):
-            a[i]=a[i].name
-        return a
+        return [spec.name for spec in self.getallspec()]
 
 class ToolExecutor:
     def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, output_text_publisher:rospy.Publisher, output_image_publisher:rospy.Publisher, input_subscriber:rospy.Subscriber, detector:YOLOAdapter | None=None, completion_publisher:rospy.Publisher | None=None) -> None:
@@ -370,8 +369,7 @@ class ToolExecutor:
     def _tool_observe(self, command:Command) -> Return:
         try:
             calltime=rospy.Time.now()
-            flag=False
-            while flag==False:
+            while True:
                 message=rospy.wait_for_message("camera_color", Image, timeout=5.0)
                 if message is None:
                     raise RuntimeError("Camera returned no image message")
@@ -386,7 +384,8 @@ class ToolExecutor:
                 if not cv2.imwrite(image_path,image):
                     raise IOError(f"Could not write {image_path}")
                 if(age_s<0.5):
-                    flag=True
+                    break
+            
             return Return(id=command.id,command_type=command.command_type,status="Success",results={
                 "image_path":image_path,
                 "width":width,
@@ -405,7 +404,7 @@ class ToolExecutor:
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
             self.model.record()
             recording_started=True
-            self.adapter.scan(yaw_margin=np.deg2rad(15))
+            self.adapter.scan(yaw_margin=np.deg2rad(45))
             changes=self.model.stop_record()
             recording_started=False
         except rospy.ROSInterruptException as error:

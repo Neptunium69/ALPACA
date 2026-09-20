@@ -8,10 +8,10 @@ import numpy as np
 import rospy
 from std_msgs.msg import Float64
 from dataclasses import dataclass
-from ... import worldmodel as wm
-from ... import vehicleadapter as va
+from . import worldmodel as wm
+from . import vehicleadapter as va
 from .worldmodel import Voxel
-from ... import tools
+from . import tools
 
 if TYPE_CHECKING:
     from nav_msgs.msg import Odometry,Path
@@ -62,10 +62,10 @@ class RiskCal():
     def __init__(self,model:wm.WorldModel,adapter:va.VehicleAdapter)->None:
         self.model=model
         self.adapter=adapter
-        self.occupied_confidence_threshold=0.70
+        self.occupied_confidence_threshold=0.1
         self.occupied_route_threshold=0.20
-        self.information_route_threshold=1.00
-        self.minimum_persistent_occupied_voxels=5
+        self.information_route_threshold=0.8
+        self.minimum_persistent_occupied_voxels=1
         self.maximum_vantage_candidates=32
         self.maximum_vantage_evaluation_seconds=30.0
     def checkcmd(self,command:tools.Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:

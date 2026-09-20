@@ -8,6 +8,9 @@ from typing import Any
 from threading import Lock
 from copy import deepcopy
 import time
+import os
+import logging
+from pathlib import Path
 
 import message_filters
 import numpy as np
@@ -21,7 +24,7 @@ import rospy
 import json
 
 class YOLOAdapter():
-    def __init__(self, model_path: str, cammountpos: tuple=(0.15, 0.0, 0.0), cammountrot: tuple=(0.0, np.deg2rad(20), 0.0)):
+    def __init__(self, model_path: str, cammountpos: tuple=(0.15, 0.0, 0.0), cammountrot: tuple=(0.0, 0.0, 0.0)):
         self.model_path = model_path
         self.model = self._load_model(model_path)
         self.cammountpos=np.asarray(cammountpos,dtype=float).reshape(3)
@@ -32,16 +35,26 @@ class YOLOAdapter():
         self.latest_pose:Odometry | None=None
         self.latest_pose_monotonic:float | None=None
         self.max_pose_age=0.5
+        self.last_detection_image_time=float("-inf")
     def init_yolo(self):
         self.rate = rospy.Rate(15)
         self.publisher = rospy.Publisher("detections",ObservationFrame,queue_size=1)
         self.bridge = CvBridge()
+        log_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
+        log_directory.mkdir(parents=True,exist_ok=True)
+        self.detection_logger=logging.getLogger(f"alpaca.yolo.detections.{id(self)}")
+        self.detection_logger.setLevel(logging.INFO)
+        self.detection_logger.propagate=False
+        handler=logging.FileHandler(log_directory/"yolo.log",encoding="utf-8")
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+        self.detection_logger.addHandler(handler)
+        self.last_detection_status_time=float("-inf")
 
         self.color_subscriber = message_filters.Subscriber("camera_color", Image)
         self.camera_info_subscriber = message_filters.Subscriber("camera_info", CameraInfo)
         self.depth_subscriber = message_filters.Subscriber("camera_depth", Image)
-        self.pose_subscriber=rospy.Subscriber("vehicle_pose",Odometry,queue_size=10,callback=self._pose_callback)
-        self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber],queue_size=10,slop=0.05)
+        self.pose_subscriber=message_filters.Subscriber("vehicle_pose",Odometry,queue_size=1)
+        self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber,self.pose_subscriber],queue_size=30,slop=0.1)
         self.synchronizer.registerCallback(self._image_callback)
 
     def _pose_callback(self,pose_msg:Odometry)->None:
@@ -114,21 +127,17 @@ class YOLOAdapter():
         )
 
     def _run_model(self, image: np.ndarray) -> Results:
-        result=next(iter(self.model(image,verbose=False)))
+        result=next(iter(self.model(image,conf=0.5,verbose=False)))
         if not isinstance(result,Results):
             raise TypeError(f"YOLO returned an unexpected result type: {type(result).__name__}")
         return result
 
-    def _image_callback(self,color_msg,depth_msg,camera_info_msg):
+    def _image_callback(self,color_msg,depth_msg,camera_info_msg,pose_msg):
         if not self.inference_lock.acquire(blocking=False):
             return
         inference_started=time.monotonic()
         try:
             if rospy.is_shutdown():
-                return
-            pose_msg,pose_age=self._get_recent_pose()
-            if pose_msg is None or pose_age>self.max_pose_age:
-                rospy.logwarn_throttle(5.0,"Skipping camera frame because the cached vehicle pose is unavailable or stale (age %.3f s).",pose_age)
                 return
             rospy.loginfo_once("YOLO received synchronized camera data; running the first inference.")
             frame=self.bridge.imgmsg_to_cv2(color_msg,desired_encoding="bgr8")
@@ -288,7 +297,26 @@ class YOLOAdapter():
                 output_detections.append(detection_output)
 
             self.publisher.publish(output)
-            rospy.loginfo_throttle(5.0,"YOLO detection update: %d detections in %.2f seconds.",len(output_detections),time.monotonic()-inference_started)
+            if output_detections:
+                self.detection_logger.info("YOLO candidates: %s",json.dumps({"stamp_ns":output.header.stamp.to_nsec(),"pose_stamp_ns":pose_msg.header.stamp.to_nsec(),"age_s":(rospy.Time.now()-output.header.stamp).to_sec(),"detections":[{"class":d.class_name,"confidence":d.confidence,"has_depth":d.has_depth,"has_world_position":d.has_world_position,"position":[d.world_position.x,d.world_position.y,d.world_position.z]} for d in output_detections]}))
+            if len(boxes)>0 and time.monotonic()-self.last_detection_image_time>=5.0:
+                self.last_detection_image_time=time.monotonic()
+                try:
+                    image_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))/"detection_images"
+                    image_directory.mkdir(parents=True,exist_ok=True)
+                    timestamp=color_msg.header.stamp.to_nsec()
+                    image_path=image_directory/f"detections_{timestamp}.jpg"
+                    if not cv2.imwrite(str(image_path),results.plot(labels=True,conf=True)):
+                        raise IOError(f"Could not write {image_path}")
+                    raw_path=image_directory/f"camera_{timestamp}.png"
+                    if not cv2.imwrite(str(raw_path),frame):
+                        raise IOError(f"Could not write {raw_path}")
+                    self.detection_logger.info("Saved YOLO detection image: %s",image_path)
+                except Exception as error:
+                    self.detection_logger.warning("Could not save YOLO detection image: %s",error)
+            if time.monotonic()-self.last_detection_status_time>=5.0:
+                self.last_detection_status_time=time.monotonic()
+                self.detection_logger.info("YOLO detection update: %d detections in %.2f seconds.",len(output_detections),time.monotonic()-inference_started)
         except Exception as error:
             if not (isinstance(error,rospy.exceptions.ROSException) and "closed topic" in str(error).lower()):
                 rospy.logerr("YOLO callback failed: %s",error)

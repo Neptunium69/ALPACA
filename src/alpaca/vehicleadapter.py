@@ -17,12 +17,12 @@ from copy import deepcopy
 from nav_msgs.msg import Odometry,Path
 from nav_msgs.srv import GetPlan,GetPlanRequest
 from geometry_msgs.msg import PoseStamped,TwistStamped,Quaternion
-from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelObservationMsg
+from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelObservationMsg, ObservationFrame
 from sensor_msgs.msg import Image, BatteryState,CameraInfo, PointCloud2
 from mavros_msgs.msg import State as MavrosState
 from tf.transformations import euler_from_quaternion,quaternion_from_euler,quaternion_matrix
-from ... import worldmodel as wm
-from ... import risk
+from . import worldmodel as wm
+from . import risk
 from .worldmodel import Position,Orientation
 from sensor_msgs.msg import Imu
 from .risk import PathVoxelAssessment, VantagePoint
@@ -210,16 +210,8 @@ class UGVAdapter(VehicleAdapter):
             q=quaternion_from_euler(state.orientation.roll,state.orientation.pitch,state.orientation.yaw)
             self.whereitisnt.pose.orientation=Quaternion(x=float(q[0]),y=float(q[1]),z=float(q[2]),w=float(q[3]))
         if self.moveflag==False or getattr(self,"stopping",False):
-            whereitis=PoseStamped()
-            whereitis.header.stamp = rospy.Time.now()
-            
-            whereitis.pose.position.x=state.position.x
-            whereitis.pose.position.y=state.position.y
-            whereitis.pose.position.z=state.position.z
-
-            q=quaternion_from_euler(state.orientation.roll,state.orientation.pitch,state.orientation.yaw)
-            whereitis.pose.orientation=Quaternion(x=float(q[0]),y=float(q[1]),z=float(q[2]),w=float(q[3]))
-            whereitis=self._waypointconverter(state,self.px4_pose,deepcopy(whereitis))
+            whereitis=deepcopy(self.px4_pose)
+            whereitis.header.stamp=rospy.Time.now()
             self.movement_publisher.publish(whereitis)
         else:
             whereitisnt=whereitis=self._waypointconverter(state,self.px4_pose,deepcopy(self.whereitisnt))
@@ -569,7 +561,7 @@ class UGVAdapter(VehicleAdapter):
                 arr=[right,behind,left,front]
             i=0
             yaw_error=error
-            rate=rospy.Rate(20)
+            rate=rospy.Rate(100)
             initial_yaw=state.orientation.yaw
             while i<4 and abs(yaw_error)>yaw_margin:
                 state=self.get_state()
@@ -616,9 +608,9 @@ class UGVAdapter(VehicleAdapter):
             self.moveflag=False
 
         
-    def scan(self, yaw_margin: float=np.deg2rad(15)) -> None:
-        """Scan six headings 60 degrees apart, pausing three seconds at each heading."""
-        marginmax=pi/6
+    def scan(self, yaw_margin: float=np.deg2rad(45)) -> None:
+        """Scan eight headings 45 degrees apart, waiting for a fresh detection at each heading."""
+        marginmax=pi/4
         if not isfinite(yaw_margin):
             raise ValueError("yaw_margin must be finite.")
         if (yaw_margin<=0 or yaw_margin>marginmax):
@@ -628,10 +620,15 @@ class UGVAdapter(VehicleAdapter):
             q=data.pose.pose.orientation
             _,_,current_yaw=euler_from_quaternion([q.x,q.y,q.z,q.w])
             last_pose_update=time.monotonic()
+        def detection_callback(data):
+            nonlocal last_detection_stamp
+            last_detection_stamp=data.header.stamp
         current_yaw=None
         last_pose_update=None
+        last_detection_stamp=None
         subscriber=rospy.Subscriber("vehicle_pose", Odometry, callback)
-        rate=rospy.Rate(20)
+        detection_subscriber=rospy.Subscriber("detections",ObservationFrame,detection_callback)
+        rate=rospy.Rate(100)
         try:
             initial_pose_deadline=time.monotonic()+2.0
             while current_yaw is None and not rospy.is_shutdown():
@@ -648,32 +645,34 @@ class UGVAdapter(VehicleAdapter):
             x,y,z=state.position.x,state.position.y,state.position.z
             yaw=state.orientation.yaw
             d=2.0  # metres
-            arr=[Position(x=x+d*np.cos(yaw+k*pi/3),y=y+d*np.sin(yaw+k*pi/3),z=z) for k in range(1,7)]
+            next_position=Position(x=x+d*np.cos(yaw+pi/2),y=y+d*np.sin(yaw+pi/2),z=z)
 
             i=0
-            while i<len(arr) and not rospy.is_shutdown():
+            while i<8 and not rospy.is_shutdown():
                 state=self.get_state()
                 if getattr(self,"stopping",False):
                     raise rospy.ROSInterruptException("Scan interrupted by cleanup.")
 
-                bearing=np.arctan2(arr[i].y-state.position.y,arr[i].x-state.position.x)
+                bearing=np.arctan2(next_position.y-state.position.y,next_position.x-state.position.x)
                 error=(bearing-state.orientation.yaw+pi)%(2*pi)-pi
                 if abs(error)<=yaw_margin:
                     self.moveflag=False
-                    pause_deadline=time.monotonic()+3.0
-                    while time.monotonic()<pause_deadline:
+                    heading_reached_at=rospy.Time.now()
+                    while last_detection_stamp is None or last_detection_stamp<heading_reached_at:
                         if rospy.is_shutdown() or getattr(self,"stopping",False):
-                            raise rospy.ROSInterruptException("Scan interrupted while paused.")
+                            raise rospy.ROSInterruptException("Scan interrupted while waiting for detection.")
                         rospy.sleep(0.05)
                     i+=1
-                    if i==len(arr):
+                    if i==8:
                         break
+                    state=self.get_state()
+                    next_position=Position(x=state.position.x+d*np.cos(state.orientation.yaw+pi/2),y=state.position.y+d*np.sin(state.orientation.yaw+pi/2),z=state.position.z)
 
                 target=PoseStamped()
                 target.header.stamp = rospy.Time.now()
-                target.pose.position.x=arr[i].x
-                target.pose.position.y=arr[i].y
-                target.pose.position.z=arr[i].z
+                target.pose.position.x=next_position.x
+                target.pose.position.y=next_position.y
+                target.pose.position.z=next_position.z
                 self.whereitisnt=target
 
                 self.moveflag=True
@@ -685,6 +684,7 @@ class UGVAdapter(VehicleAdapter):
 
         finally:
             subscriber.unregister()
+            detection_subscriber.unregister()
             self.moveflag=False
 
     def navigate(self, destination: Position, orientation: Orientation, frame_id: str | None=None) -> None:
