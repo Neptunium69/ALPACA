@@ -6,7 +6,6 @@ from ...wmtools.protocols import WorldModelInterface
 
 class Query(Tool):
     def __init__(self,interface:WorldModelInterface):
-        self.model=0
         self.interface=interface
     @property
     def specification(self)->ToolSpecification:
