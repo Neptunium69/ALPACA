@@ -2,7 +2,7 @@ from dataclasses import dataclass,fields
 from typing import Any, Protocol
 from ..toolshared import Tool,ToolArgument,ToolList,ToolSpecification,Command,Return
 from importlib.resources import files
-from ...wmtools.protocols import WorldModelInterface
+from ...wmtools.wminterface import WorldModelInterface
 from ...worldmodel import Object,Size,Position
 import math
 import numpy as np

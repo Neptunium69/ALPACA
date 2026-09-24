@@ -1,0 +1,61 @@
+from dataclasses import dataclass,fields
+from typing import Any, Protocol
+from ..toolshared import Tool,ToolArgument,ToolList,ToolSpecification,Command,Return
+from importlib.resources import files
+from ...wmtools.wminterface import WorldModelInterface
+from ...vatools import VAInterface, VAExecute
+from ...worldmodel import Object,Size,Position
+import math
+from ...risk import RiskCal
+import numpy as np
+import rospy
+
+class Scan(Tool):
+    def __init__(self,wminterface:WorldModelInterface,vainterface:VAInterface,risk:RiskCal):
+        self.wminterface=wminterface
+        self.vainterface=vainterface
+        self.risk=risk
+    @property
+    def specification(self)->ToolSpecification:
+        description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8")
+        return ToolSpecification(name="Scan", description=description,arguments=[])
+
+    def run(self, command: Command) -> Return:
+        recording_started=False
+        try:
+            risk_result=self.risk.checkcmd(command)
+            if risk_result.get("Safe") is False:
+                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
+            self.model.record()
+            recording_started=True
+            _=self.vainterface.execute(VAExecute(function="scan",arguments={"yaw_margin":np.deg2rad(45)}))
+            changes=self.model.stop_record()
+            recording_started=False
+        except rospy.ROSInterruptException as error:
+            return Return(
+                id=command.id,
+                command_type=command.command_type,
+                status="Interrupted",
+                results={"Reason": str(error)},
+            )
+        except Exception as error:
+            return Return(
+                id=command.id,
+                command_type=command.command_type,
+                status="Failed",
+                results={"Error": str(error)},
+            )
+        finally:
+            if recording_started:
+                try:
+                    self.model.stop_record()
+                except RuntimeError:
+                    pass
+
+        return Return(
+            id=command.id,
+            command_type=command.command_type,
+            status="Success",
+            results={"Scan": "Completed",
+                        "Major Changes": changes,
+        })

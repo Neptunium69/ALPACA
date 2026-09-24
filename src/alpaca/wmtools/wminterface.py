@@ -1,7 +1,6 @@
 from typing import Protocol,Any
 from ..worldmodel import WorldModel, Object
 from ..vehicleadapter import State
-from .dataclasses import WMQuery
 
 class WorldModelInterface(Protocol):
     model: WorldModel
@@ -14,4 +13,9 @@ class WorldModelInterface(Protocol):
     def robot_state(self,arguments:dict[str:Any])->State:
         """Obtain robot state"""
         raise NotImplementedError("This method should be implemented by subclasses.")
-    
+    def record(self):
+        """Record stuff"""
+        raise NotImplementedError("This method should be implemented by subclasses.")
+    def stop_record(self):
+        """Stop recording stuff"""
+        raise NotImplementedError("This method should be implemented by subclasses.")

@@ -1,6 +1,6 @@
 from ..toolshared import Tool,ToolSpecification,Command,Return
 from importlib.resources import files
-from ...wmtools.protocols import WorldModelInterface
+from ...wmtools.wminterface import WorldModelInterface
 import rospy
 import cv2
 from pathlib import Path
@@ -14,7 +14,7 @@ class Observe(Tool):
     @property
     def specification(self)->ToolSpecification:
         description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8")
-        return ToolSpecification(name="Write", description=description,arguments=[])
+        return ToolSpecification(name="Observe", description=description,arguments=[])
 
     def run(self, command:Command) -> Return:
         try:

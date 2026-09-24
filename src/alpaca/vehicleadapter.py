@@ -27,6 +27,7 @@ from .worldmodel import Position,Orientation
 from sensor_msgs.msg import Imu
 from .risk import PathVoxelAssessment, VantagePoint
 import random
+from .vatools import VARegistry,Function
 
 @dataclass
 class State():
@@ -49,6 +50,7 @@ class VoxelObservation():
 
 class VehicleAdapter(Protocol):
     state: State
+    registry:VARegistry
     def init_sensordata(self) -> None:
         """Begins republishing sensor data."""
         raise NotImplementedError("This method should be implemented by subclasses.")
@@ -87,6 +89,7 @@ class VehicleAdapter(Protocol):
 class UGVAdapter(VehicleAdapter):
     def __init__(self, state: State, worldmodel: wm.WorldModel, risk:risk.RiskCal | None=None, **kwargs) -> None:
         self.state=state
+        self.registry=VARegistry([Function(name="scan",arguments={"yaw_margin":["int",False]})])
         self.worldmodel=worldmodel
         self.riskcal=risk
         self.state_lock=Lock()

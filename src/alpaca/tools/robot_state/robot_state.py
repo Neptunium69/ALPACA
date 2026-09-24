@@ -2,7 +2,7 @@ from dataclasses import dataclass,fields
 from typing import Any, Protocol
 from ..toolshared import Tool,ToolArgument,ToolList,ToolSpecification,Command,Return
 from importlib.resources import files
-from ...wmtools.protocols import WorldModelInterface
+from ...wmtools.wminterface import WorldModelInterface
 
 class RobotState(Tool):
     def __init__(self,interface:WorldModelInterface):
