@@ -1,24 +1,23 @@
-from dataclasses import dataclass,fields
-from typing import Any, Protocol
-from ..toolshared import Tool,ToolArgument,ToolList,ToolSpecification,Command,Return
 from importlib.resources import files
-from ...wmtools.wminterface import WorldModelInterface
-from ...vatools import VAInterface, VAExecute
-from ...worldmodel import Object,Size,Position
-import math
-from ...risk import RiskCal
+
 import numpy as np
 import rospy
+
+from ...risk import RiskCal
+from ...vatools import VAExecute,VAInterface
+from ...wmtools.wminterface import WorldModelInterface
+from ..toolshared import Command,Return,Tool,ToolSpecification
 
 class Scan(Tool):
     def __init__(self,wminterface:WorldModelInterface,vainterface:VAInterface,risk:RiskCal):
         self.wminterface=wminterface
         self.vainterface=vainterface
         self.risk=risk
-    @property
-    def specification(self)->ToolSpecification:
-        description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8")
-        return ToolSpecification(name="Scan", description=description,arguments=[])
+        self.specification=ToolSpecification(
+            name="Scan",
+            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            arguments=[],
+        )
 
     def run(self, command: Command) -> Return:
         recording_started=False

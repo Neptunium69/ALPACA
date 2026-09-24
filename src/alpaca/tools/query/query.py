@@ -1,16 +1,19 @@
-from dataclasses import dataclass
-from typing import Any, Protocol
-from ..toolshared import Tool,ToolArgument,ToolList,ToolSpecification,Command,Return
 from importlib.resources import files
+
 from ...wmtools.wminterface import WorldModelInterface
+from ..toolshared import Command,Return,Tool,ToolArgument,ToolSpecification
 
 class Query(Tool):
     def __init__(self,interface:WorldModelInterface):
         self.interface=interface
-    @property
-    def specification(self)->ToolSpecification:
-        description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8")
-        return ToolSpecification(name="Query", description=description,arguments=[ToolArgument(name="object_id",required=False,type="str"), ToolArgument(name="class_name",required=False,type="str")])
+        self.specification=ToolSpecification(
+            name="Query",
+            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            arguments=[
+                ToolArgument(name="object_id",required=False,type="str"),
+                ToolArgument(name="class_name",required=False,type="str"),
+            ],
+        )
 
     def run(self, command: Command) -> Return:
         object_id = command.arguments.get("object_id")

@@ -1,5 +1,11 @@
-from ..vehicleadapter import VehicleAdapter
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from .dataclasses import VAReturn,VAExecute
+
+if TYPE_CHECKING:
+    from ..vehicleadapter import VehicleAdapter
 
 class VAInterface():
     def __init__(self,vehicle_adapter:VehicleAdapter,vaname:str):

@@ -1,20 +1,22 @@
-from ..toolshared import Tool,ToolSpecification,Command,Return
-from importlib.resources import files
-from ...wmtools.wminterface import WorldModelInterface
-import rospy
-import cv2
-from pathlib import Path
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
 import os
+from importlib.resources import files
+from pathlib import Path
+
+import cv2
+import rospy
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+
+from ..toolshared import Command,Return,Tool,ToolSpecification
 
 class Observe(Tool):
     def __init__(self):
         self.bridge=CvBridge()
-    @property
-    def specification(self)->ToolSpecification:
-        description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8")
-        return ToolSpecification(name="Observe", description=description,arguments=[])
+        self.specification=ToolSpecification(
+            name="Observe",
+            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            arguments=[],
+        )
 
     def run(self, command:Command) -> Return:
         try:

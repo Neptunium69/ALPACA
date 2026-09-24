@@ -29,11 +29,9 @@ class ToolSpecification:
     arguments: list[ToolArgument]
 
 class Tool(Protocol):
-    @property
-    def specification(self)->ToolSpecification:
-        """Returns verbal description about the use of this tool"""
-        raise NotImplementedError("This method should be implemented by subclasses.")
-    def run(self,cmd:Command):
+    specification: ToolSpecification
+
+    def run(self,cmd:Command)->Return:
         """Method to run this tool."""
         raise NotImplementedError("This method should be implemented by subclasses.")
 

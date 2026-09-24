@@ -1,19 +1,17 @@
-from dataclasses import dataclass,fields
-from typing import Any, Protocol
-from ..toolshared import Tool,ToolArgument,ToolList,ToolSpecification,Command,Return
 from importlib.resources import files
+
 from ...wmtools.wminterface import WorldModelInterface
-from ...worldmodel import Object,Size,Position
-import math
-import numpy as np
+from ...worldmodel import Object,Size
+from ..toolshared import Command,Return,Tool,ToolArgument,ToolSpecification
 
 class Write(Tool):
     def __init__(self,interface:WorldModelInterface):
         self.interface=interface
-    @property
-    def specification(self)->ToolSpecification:
-        description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8")
-        return ToolSpecification(name="Write", description=description,arguments=[])
+        self.specification=ToolSpecification(
+            name="Write",
+            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            arguments=[ToolArgument(name="object",required=True,type="dict")],
+        )
 
     def run(self, command: Command) -> Return:
         object_data = command.arguments.get("object")
