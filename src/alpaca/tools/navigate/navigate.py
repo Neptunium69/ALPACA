@@ -14,6 +14,7 @@ class Navigate(Tool):
         self.vainterface=vainterface
         self.adapter=vainterface.vehicle_adapter
         self.risk=risk
+        self.redirects_left=3
         self.specification=ToolSpecification(
             name="Navigate",
             description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
@@ -25,9 +26,6 @@ class Navigate(Tool):
         )
 
     def run(self,command:Command)->Return:
-        return self._tool_navigate(command)
-
-    def _tool_navigate(self, command: Command, redirects_left:int=3) -> Return:
         retryable_markers=("move_base returned an empty path","target footprint intersects","path contains excessive obstacles","route requires more information","no vantage points","expected value greater than cost","navigation failed with action status 4","navigation timed out")
         try:
             destination_data=command.arguments.get("destination")
@@ -53,7 +51,7 @@ class Navigate(Tool):
                 best_vantage=risk_result.get("Best Vantage Point")
                 if risk_result.get("Needs Information") is not True or best_vantage is None:
                     return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":reason,"Inform User":risk_result.get("Inform User",False),"Retryable":any(marker in reason.lower() for marker in retryable_markers)})
-                if redirects_left<=0:
+                if self.redirects_left<=0:
                     return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Maximum number of vantage-point redirects reached.","Original Reason":reason,"Retryable":True})
                 if not isinstance(best_vantage,dict):
                     return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned an invalid vantage-point record.","Retryable":False})
@@ -66,10 +64,14 @@ class Navigate(Tool):
                     "orientation":{"pitch":orientation_new.pitch,"yaw":orientation_new.yaw,"roll":orientation_new.roll},
                     "frame_id":frame_id,
                 })
-                result=self._tool_navigate(cmd_new,redirects_left-1)
-                if result.status!="Success":
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Unable to navigate to a safe vantage point.","Original Reason":reason,"Vantage Result":result.results,"Retryable":result.results.get("Retryable") is True})
-                return self._tool_navigate(command,redirects_left-1)
+                self.redirects_left-=1
+                try:
+                    result=self.run(cmd_new)
+                    if result.status!="Success":
+                        return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Unable to navigate to a safe vantage point.","Original Reason":reason,"Vantage Result":result.results,"Retryable":result.results.get("Retryable") is True})
+                    return self.run(command)
+                finally:
+                    self.redirects_left+=1
             self.adapter.navigate(destination,orientation,frame_id)
         except va.NavigationReadinessError as error:
             return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error),"Category":"navigation_not_ready","Retryable":False})
