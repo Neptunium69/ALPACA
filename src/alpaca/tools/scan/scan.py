@@ -15,7 +15,7 @@ class Scan(Tool):
         self.risk=risk
         self.specification=ToolSpecification(
             name="Scan",
-            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[],
         )
 
@@ -25,10 +25,10 @@ class Scan(Tool):
             risk_result=self.risk.checkcmd(command)
             if risk_result.get("Safe") is False:
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
-            self.model.record()
+            self.wminterface.record()
             recording_started=True
-            _=self.vainterface.execute(VAExecute(function="scan",arguments={"yaw_margin":np.deg2rad(45)}))
-            changes=self.model.stop_record()
+            _=self.vainterface.execute(VAExecute(function="scan",arguments={"yaw_margin":float(np.deg2rad(45))}))
+            changes=self.wminterface.stop_record()
             recording_started=False
         except rospy.ROSInterruptException as error:
             return Return(
@@ -47,7 +47,7 @@ class Scan(Tool):
         finally:
             if recording_started:
                 try:
-                    self.model.stop_record()
+                    self.wminterface.stop_record()
                 except RuntimeError:
                     pass
 

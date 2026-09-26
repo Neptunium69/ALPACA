@@ -32,7 +32,7 @@ class VAInterface():
         functionschema=next(fcn for fcn in functions if fcn.name==cmd.function)
 
         for name,specification in functionschema.arguments.items():
-            if not isinstance(specification,list) or len(specification)!=2:
+            if not isinstance(specification,tuple) or len(specification)!=2:
                 raise ValueError(f"Invalid registry specification for argument {name!r} in {functionschema.name}.")
             expected_type,required=specification
             if not isinstance(expected_type,str) or not isinstance(required,bool):

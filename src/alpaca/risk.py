@@ -11,7 +11,14 @@ from dataclasses import dataclass
 from . import worldmodel as wm
 from . import vehicleadapter as va
 from .worldmodel import Voxel
-from . import tools
+
+class Command(Protocol):
+    @property
+    def id(self)->str: ...
+    @property
+    def command_type(self)->str: ...
+    @property
+    def arguments(self)->dict[str,Any]: ...
 
 if TYPE_CHECKING:
     from nav_msgs.msg import Odometry,Path
@@ -20,7 +27,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class ActionPrediction:
-    cmd: tools.Command
+    cmd: Command
     potential_voxels: set[tuple[int,int,int]]
     distance: float
     terminal_position: Position
@@ -68,7 +75,7 @@ class RiskCal():
         self.minimum_persistent_occupied_voxels=1
         self.maximum_vantage_candidates=32
         self.maximum_vantage_evaluation_seconds=30.0
-    def checkcmd(self,command:tools.Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:
+    def checkcmd(self,command:Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:
         state=self.adapter.get_state()
         safe,reason=self._hardsafetyfilter(command,state,destination,orientation,frame_id)
         if not safe:
@@ -90,7 +97,7 @@ class RiskCal():
         
         return {"Safe":True,"Reason":reason}
 
-    def predict_navigation(self,command:tools.Command,destination:Position | None,orientation:Orientation | None,frame_id:str | None,coverage_margin:float=0.10)->ActionPrediction:
+    def predict_navigation(self,command:Command,destination:Position | None,orientation:Orientation | None,frame_id:str | None,coverage_margin:float=0.10)->ActionPrediction:
         """Convert a move_base path into a conservative orientation-independent voxel envelope."""
         if destination is None or orientation is None or frame_id is None:
             raise ValueError("Navigation destination, orientation, and frame are required.")
@@ -145,7 +152,7 @@ class RiskCal():
                 raise ValueError("Planned path contains a non-finite position.")
             positions.append(wm.Position(x=float(values[0]),y=float(values[1]),z=float(values[2])))
         return positions
-    def _hardsafetyfilter(self,cmd:tools.Command,state:State,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->tuple[bool,str]:
+    def _hardsafetyfilter(self,cmd:Command,state:State,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->tuple[bool,str]:
         # Battery enforcement is temporarily disabled because this UGV's MAVROS
         # percentage estimate is intermittent and has rejected otherwise safe commands.
         if cmd.command_type in {"scan","navigate","inspect"}:
@@ -200,7 +207,7 @@ class RiskCal():
         nearest_voxel=min(unknown_voxels,key=lambda voxel:(float(np.sum((np.asarray(voxel,dtype=np.float64)-centroid)**2)),voxel))
         return int(nearest_voxel[0]),int(nearest_voxel[1]),int(nearest_voxel[2])
 
-    def navigate(self,command:tools.Command,destination:Position,orientation:Orientation,frame_id:str,sensor_range:float=5.0,observation_probability:float=0.7,distance_cost_weight:float=0.2)->dict[str,Any]:
+    def navigate(self,command:Command,destination:Position,orientation:Orientation,frame_id:str,sensor_range:float=5.0,observation_probability:float=0.7,distance_cost_weight:float=0.2)->dict[str,Any]:
         if not isinstance(sensor_range,(int,float)) or isinstance(sensor_range,bool) or not math.isfinite(sensor_range) or sensor_range<=0:
             raise ValueError("sensor_range must be a finite, positive number.")
         if not isinstance(observation_probability,(int,float)) or isinstance(observation_probability,bool) or not math.isfinite(observation_probability) or not 0.0<=observation_probability<=1.0:

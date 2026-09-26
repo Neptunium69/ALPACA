@@ -9,9 +9,9 @@ class VAReturn():
 @dataclass
 class VAExecute():
     function: str
-    arguments: dict[str:Any]
+    arguments: dict[str,Any]
 
 @dataclass
 class Function():
     name:str
-    arguments: dict[str:[str,bool]]
+    arguments: dict[str,tuple[str,bool]]

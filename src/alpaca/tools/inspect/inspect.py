@@ -16,7 +16,7 @@ class Inspect(Tool):
         self.scan_tool=scan_tool
         self.specification=ToolSpecification(
             name="Inspect",
-            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[
                 ToolArgument(name="target",required=True,type="str"),
             ],

@@ -14,7 +14,7 @@ class Observe(Tool):
         self.bridge=CvBridge()
         self.specification=ToolSpecification(
             name="Observe",
-            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[],
         )
 

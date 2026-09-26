@@ -89,7 +89,7 @@ class VehicleAdapter(Protocol):
 class UGVAdapter(VehicleAdapter):
     def __init__(self, state: State, worldmodel: wm.WorldModel, risk:risk.RiskCal | None=None, **kwargs) -> None:
         self.state=state
-        self.registry=VARegistry([Function(name="scan",arguments={"yaw_margin":["int",False]})])
+        self.registry=VARegistry([Function(name="scan",arguments={"yaw_margin":("float",False)})])
         self.worldmodel=worldmodel
         self.riskcal=risk
         self.state_lock=Lock()

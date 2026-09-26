@@ -8,7 +8,7 @@ class Query(Tool):
         self.interface=interface
         self.specification=ToolSpecification(
             name="Query",
-            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[
                 ToolArgument(name="object_id",required=False,type="str"),
                 ToolArgument(name="class_name",required=False,type="str"),

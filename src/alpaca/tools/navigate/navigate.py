@@ -17,7 +17,7 @@ class Navigate(Tool):
         self.redirects_left=3
         self.specification=ToolSpecification(
             name="Navigate",
-            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[
                 ToolArgument(name="destination",required=True,type="dict"),
                 ToolArgument(name="orientation",required=True,type="dict"),

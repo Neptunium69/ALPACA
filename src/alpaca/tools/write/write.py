@@ -9,7 +9,7 @@ class Write(Tool):
         self.interface=interface
         self.specification=ToolSpecification(
             name="Write",
-            description=files(__package__).joinpath("specification.md").read_text(encoding="utf-8"),
+            description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[ToolArgument(name="object",required=True,type="dict")],
         )
 
