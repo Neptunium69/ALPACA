@@ -42,7 +42,13 @@ class VLMInterface():
         self.output_image_publisher=rospy.Publisher("vlm_image_output",String,queue_size=1)
         self.completion_publisher=rospy.Publisher("vlm_completion_output",String,queue_size=1,latch=True)
         self.step_result_publisher=rospy.Publisher("vlm_step_result",String,queue_size=10)
+        self.status_publisher=rospy.Publisher("vlm_status",String,queue_size=1,latch=True)
         self.input_subscriber=rospy.Subscriber("user_input",String,queue_size=1)
+
+    def _publish_status(self,status:str,**details)->None:
+        message=json.dumps({"status":status,"step":self.steps,**details},ensure_ascii=False,default=str)
+        rospy.loginfo("VLM status: %s",message)
+        self.status_publisher.publish(String(data=message))
 
     def _load_model(self):
         version=self._request_json("/api/version",method="GET",timeout=5.0)
@@ -119,6 +125,7 @@ class VLMInterface():
 
     def _predict(self,msg:list[dict],max_tok:int,stage:str):
         started=time.monotonic()
+        self._publish_status("thinking" if stage=="planning" else "act")
         rospy.loginfo("Qwen step %d: starting %s inference...",self.steps,stage)
         self._log_dialogue("qwen_request",stage=stage,max_tokens=max_tok,messages=msg)
         payload={
@@ -146,6 +153,7 @@ class VLMInterface():
         self.state=1
         self.steps=0
         if self.toolexe is None: raise ValueError("Tool executor is None.")
+        self._publish_status("mission_started",mission=user_prompt)
         self.history=[{"role":"system","content":[{"type":"text","text":self.system_prompt_master}]},
             {"role":"user","content":[{"type":"text","text":user_prompt}],},
             {"role":"user","content":[{"type":"text","text":f"World-model objects already detected at mission startup (IDs and classes, JSON):\n{self.toolexe.model.getallobjects()}"}]},
@@ -180,12 +188,15 @@ class VLMInterface():
                     commands=self.toolexe.stringtocmd(cmdjson)
                     self._log_dialogue("commands_parsed",commands=[asdict(command) for command in commands])
                     rospy.loginfo("Qwen step %d chose: %s",self.steps,", ".join(f"{command.command_type} ({command.id})" for command in commands))
+                    self._publish_status("executing",commands=[asdict(command) for command in commands])
                     results=self.toolexe.execute(commands)
+                    self._publish_status("processing_results")
                     self._log_dialogue("tool_results",results=[asdict(result) for result in results])
                     rospy.loginfo("Qwen step %d results: %s",self.steps,", ".join(f"{result.command_type}={result.status}" for result in results))
                     step_payload={"step":self.steps,"results":[asdict(result) for result in results]}
                     self.step_result_publisher.publish(String(data=json.dumps(step_payload,ensure_ascii=False,default=str)))
                 except ValueError as error:
+                    self._publish_status("command_rejected",error=str(error))
                     self._log_dialogue("command_rejected",raw_response=cmdjson,error=str(error))
                     self.history.append({"role":"assistant","content":[{"type":"text","text":cmdjson}]})
                     self.history.append({"role":"user","content":[{"type":"text","text":f"Command rejected: {error}. Return corrected raw JSON only."}]})
@@ -219,6 +230,7 @@ class VLMInterface():
             if nukeflag==1:
                 break
         self._log_dialogue("mission_end",history=self.history)
+        self._publish_status("mission_complete")
         return 0
 
     @staticmethod

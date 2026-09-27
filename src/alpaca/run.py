@@ -58,12 +58,12 @@ def main():
     log_dir=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
     log_dir.mkdir(parents=True,exist_ok=True)
     observations=worldmodel.Model()
-    model=worldmodel.WorldModel(observations,["apple","board"])
+    model=worldmodel.WorldModel(observations,["basal_damage","root_damage","tree"])
     initial_state=vehicleadapter.State(battery_level=None,position=worldmodel.Position(0.0,0.0,0.0),orientation=worldmodel.Orientation(0.0,0.0,0.0))
     adapter=vehicleadapter.UGVAdapter(initial_state,model,None)
     rcm=risk.RiskCal(model,adapter)
     adapter.riskcal=rcm
-    detector=yolo.YOLOAdapter(model_path=yolo_path)
+    detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
     vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
     vlm_interface.init_vlm()
     toolexecutor=tools.ToolExecutor(model,adapter,rcm,vlm_interface.output_text_publisher,vlm_interface.output_image_publisher,vlm_interface.input_subscriber,detector,completion_publisher=getattr(vlm_interface,"completion_publisher",None))
@@ -106,7 +106,7 @@ def main():
                 rospy.sleep(0.1)
             if rospy.is_shutdown() or adapter.stopping: return 0
             adapter.require_navigation_ready("start the mission")
-        vlm_interface.run_mission(user_prompt="Find the apple behind a board. After you are done, send me a message that you found it and an image of the apple.")
+        vlm_interface.run_mission(user_prompt="Survey the accessible forest with the UGV and inspect standing trees for basal and root damage. Use the tree class to locate trees, including trees with no visible damage, and inspect their trunk bases and visible roots from safe viewpoints. Look for basal_damage and root_damage near each tree; a tree may have neither, either, or both damage classes. Associate each damage observation with a tree using visual evidence and world-model positions, and flag uncertain associations. Keep clear of trunks, roots, and other obstacles, and avoid repeatedly inspecting the same tree. Send me the IDs and locations of damaged trees, the observed damage classes, and supporting images. Do not treat missing detections as proof that a tree is healthy. When the accessible survey is complete or further inspection is blocked, summarize the findings, identify uninspected or uncertain areas, and finish the mission.")
         rospy.spin()
     except RuntimeError as error:
         rospy.logerr("ALPACA stopped: %s",error)

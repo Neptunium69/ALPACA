@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Protocol,Any
 from collections.abc import Collection
 from ..worldmodel import WorldModel,Object,Position

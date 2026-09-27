@@ -71,7 +71,7 @@ class RiskCal():
         self.adapter=adapter
         self.occupied_confidence_threshold=0.1
         self.occupied_route_threshold=0.20
-        self.information_route_threshold=0.8
+        self.information_route_threshold=0.5
         self.minimum_persistent_occupied_voxels=1
         self.maximum_vantage_candidates=32
         self.maximum_vantage_evaluation_seconds=30.0
@@ -116,7 +116,7 @@ class RiskCal():
         maximum_x=max(abs(vehicle_min[0]),abs(vehicle_max[0]))
         maximum_y=max(abs(vehicle_min[1]),abs(vehicle_max[1]))
         cover_radius=math.hypot(maximum_x,maximum_y)+float(coverage_margin)
-        conservative_min=np.array([-cover_radius,-cover_radius,vehicle_min[2]],dtype=np.float64)
+        conservative_min=np.array([-cover_radius,-cover_radius,vehicle_min[2]+0.03],dtype=np.float64)
         conservative_max=np.array([cover_radius,cover_radius,vehicle_max[2]],dtype=np.float64)
         voxel_size=self.model.get_voxel_size()
         sample_spacing=voxel_size
@@ -188,7 +188,9 @@ class RiskCal():
             if frame_id!=self.adapter.navigation_frame or frame_id!=pose_frame or frame_id!=voxel_frame:
                 return False,f"Navigation frame mismatch: goal={frame_id!r}, adapter={self.adapter.navigation_frame!r}, pose={pose_frame!r}, voxel_map={voxel_frame!r}."
             try:
-                target_voxels=self.model.get_vehicle_voxels_at_pose(destination,orientation,vehicle_min,vehicle_max)
+                occupancy_min=vehicle_min.copy()
+                occupancy_min[2]+=0.03
+                target_voxels=self.model.get_vehicle_voxels_at_pose(destination,orientation,occupancy_min,vehicle_max)
                 target_observations=self.model.get_voxel_states_and_scores(target_voxels)
             except (TypeError,ValueError):
                 return False,"Vehicle collision map is not ready or contains invalid data."
@@ -294,7 +296,9 @@ class RiskCal():
                 vantage_yaw=math.atan2(center_position.y-vantage_position.y,center_position.x-vantage_position.x)
                 vantage_orientation=wm.Orientation(pitch=0.0,yaw=vantage_yaw,roll=0.0)
                 try:
-                    target_voxels=self.model.get_vehicle_voxels_at_pose(vantage_position,vantage_orientation,vehicle_min,vehicle_max)
+                    occupancy_min=vehicle_min.copy()
+                    occupancy_min[2]+=0.03
+                    target_voxels=self.model.get_vehicle_voxels_at_pose(vantage_position,vantage_orientation,occupancy_min,vehicle_max)
                     target_observations=self.model.get_voxel_states_and_scores(target_voxels)
                 except (TypeError,ValueError):
                     candidate_counts["target_footprint_check_failed"]+=1

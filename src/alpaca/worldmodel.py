@@ -11,6 +11,9 @@ import message_filters
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import math
+import logging
+import os
+from pathlib import Path
 from nav_msgs.msg import Odometry
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection,SpatialObservationFrame
 from sklearn.neighbors import KNeighborsClassifier
@@ -89,6 +92,14 @@ class WorldModel:
 
     def initwm(self):
         # Automatic world model updater
+        log_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
+        log_directory.mkdir(parents=True,exist_ok=True)
+        self.confirmation_logger=logging.getLogger(f"alpaca.worldmodel.confirmations.{id(self)}")
+        self.confirmation_logger.setLevel(logging.INFO)
+        self.confirmation_logger.propagate=False
+        handler=logging.FileHandler(log_directory/"world_model.log",encoding="utf-8")
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+        self.confirmation_logger.addHandler(handler)
         self.detection_subscriber=message_filters.Subscriber("detections", ObservationFrame)
         self.depth_subscriber=message_filters.Subscriber("camera_depth", Image)
         self.voxel_subscriber=rospy.Subscriber("voxel_observations",SpatialObservationFrame,callback=self._voxel_callback)
@@ -126,7 +137,7 @@ class WorldModel:
             self.observationstemp.objects[:]=working_temp
             self._last_detection_stamp=stamp
             if detection_list or working_temp:
-                rospy.loginfo("World-model confirmation: %s",json.dumps({"stamp_ns":stamp,"detections":len(detection_list),"confirmed_ids":[obj.id for obj in working_objects],"temporary":[{"id":obj.id,"position":[obj.position.x,obj.position.y,obj.position.z],"history":obj.detection_history} for obj in working_temp]}))
+                self.confirmation_logger.info("World-model confirmation: %s",json.dumps({"stamp_ns":stamp,"detections":len(detection_list),"confirmed_ids":[obj.id for obj in working_objects],"temporary":[{"id":obj.id,"position":[obj.position.x,obj.position.y,obj.position.z],"history":obj.detection_history} for obj in working_temp]}))
 
     def _voxel_callback(self, message: SpatialObservationFrame):
         voxel_size=float(message.voxel_size)
@@ -242,7 +253,7 @@ class WorldModel:
             obj.detection_history=(obj.detection_history+[obj.id in observed_ids])[-5:]
             if sum(obj.detection_history)>=3:
                 objects.append(obj)
-        temp_objects[:]=[obj for obj in temp_objects if sum(obj.detection_history)<3]
+        temp_objects[:]=[obj for obj in temp_objects if sum(obj.detection_history)<3 and obj.detection_history!=[False]*5]
 
         for object in objects:
             if object.attributes.get("VLMFlag")==1:

@@ -113,6 +113,7 @@ class UGVAdapter(VehicleAdapter):
         self.stopped=False
         self.vehicle_min = np.array([-0.15, -0.17, -0.25])
         self.vehicle_max = np.array([0.15, 0.17, 0.0])
+        self.height_margin = 0.05
         self.search_offset = np.array([0.30, 0.30, 0.05])
         self.roi_min = self.vehicle_min - self.search_offset
         self.roi_max = self.vehicle_max + self.search_offset
@@ -250,6 +251,7 @@ class UGVAdapter(VehicleAdapter):
     def _lidar_callback(self,cloud: PointCloud2,vehicle_pose: Odometry)->None:
         points_body=np.asarray(list(pc2.read_points(cloud,field_names=("x","y","z"),skip_nans=True)),dtype=np.float64).reshape(-1,3)
         points_body=points_body[np.isfinite(points_body).all(axis=1)]
+        points_body=points_body[(points_body[:,2]>=self.vehicle_min[2]-self.height_margin)&(points_body[:,2]<=self.vehicle_max[2]+self.height_margin)]
         self.lidar_points_world,self.lidar_origin_world=self._lidar_to_world(points_body,vehicle_pose)
 
         clutter_points=points_body[np.all((points_body>=self.roi_min) & (points_body<self.roi_max),axis=1)]
