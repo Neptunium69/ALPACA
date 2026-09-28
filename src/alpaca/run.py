@@ -25,6 +25,8 @@ prompt_path=Path(__file__).resolve().parents[2]/"system_prompt_master.txt"
 system_prompt_master=prompt_path.read_text(encoding="utf-8").strip()
 system_prompt_think="\nEnter PLANNING MODE. Think of a plan of what you should do next but don't write commands yet."
 system_prompt_act="\nOutput a set of JSON commands following the command format for the next step."
+user_prompt="Move forward 1 meter."
+# user_prompt="Survey the accessible forest with the UGV and inspect standing trees for basal and root damage. Use the tree class to locate trees, including trees with no visible damage, and inspect their trunk bases and visible roots from safe viewpoints. Look for basal_damage and root_damage near each tree; a tree may have neither, either, or both damage classes. Associate each damage observation with a tree using visual evidence and world-model positions, and flag uncertain associations. Keep clear of trunks, roots, and other obstacles, and avoid repeatedly inspecting the same tree. Send me the IDs and locations of damaged trees, the observed damage classes, and supporting images. Do not treat missing detections as proof that a tree is healthy. When the accessible survey is complete or further inspection is blocked, summarize the findings, identify uninspected or uncertain areas, and finish the mission."
 project_root=Path(__file__).resolve().parents[3]
 model_path=str(project_root/"Models"/"Qwen3-VL-4B-Instruct")
 yolo_path="./ALPACA/yolomodel/best.engine"
@@ -106,7 +108,7 @@ def main():
                 rospy.sleep(0.1)
             if rospy.is_shutdown() or adapter.stopping: return 0
             adapter.require_navigation_ready("start the mission")
-        vlm_interface.run_mission(user_prompt="Survey the accessible forest with the UGV and inspect standing trees for basal and root damage. Use the tree class to locate trees, including trees with no visible damage, and inspect their trunk bases and visible roots from safe viewpoints. Look for basal_damage and root_damage near each tree; a tree may have neither, either, or both damage classes. Associate each damage observation with a tree using visual evidence and world-model positions, and flag uncertain associations. Keep clear of trunks, roots, and other obstacles, and avoid repeatedly inspecting the same tree. Send me the IDs and locations of damaged trees, the observed damage classes, and supporting images. Do not treat missing detections as proof that a tree is healthy. When the accessible survey is complete or further inspection is blocked, summarize the findings, identify uninspected or uncertain areas, and finish the mission.")
+        vlm_interface.run_mission(user_prompt=user_prompt)
         rospy.spin()
     except RuntimeError as error:
         rospy.logerr("ALPACA stopped: %s",error)
