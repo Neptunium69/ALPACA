@@ -12,6 +12,7 @@ class RobotState(Tool):
             name="Robot State",
             description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[],
+            tag="query",
         )
 
     def run(self, command: Command) -> Return:

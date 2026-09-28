@@ -21,6 +21,7 @@ class Navigate(Tool):
                 ToolArgument(name="orientation",required=True,type="dict"),
                 ToolArgument(name="frame_id",required=False,type="str"),
             ],
+            tag="action",
         )
 
     def run(self,command:Command)->Return:

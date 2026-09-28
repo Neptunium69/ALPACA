@@ -12,6 +12,7 @@ class Write(Tool):
             name="Write",
             description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[ToolArgument(name="object",required=True,type="dict")],
+            tag="query",
         )
 
     def run(self, command: Command) -> Return:

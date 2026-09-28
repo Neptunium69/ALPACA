@@ -14,6 +14,7 @@ class Query(Tool):
                 ToolArgument(name="object_id",required=False,type="str"),
                 ToolArgument(name="class_name",required=False,type="str"),
             ],
+            tag="query",
         )
 
     def run(self, command: Command) -> Return:

@@ -21,6 +21,7 @@ class Inspect(Tool):
             arguments=[
                 ToolArgument(name="target",required=True,type="str"),
             ],
+            tag="action",
         )
 
     def run(self,command:Command)->Return:        

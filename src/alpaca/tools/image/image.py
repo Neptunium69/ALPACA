@@ -14,7 +14,7 @@ class Image(Tool):
         self.vainterface=vainterface
         self.risk=risk
         self.observe_tool=observe_tool
-        self.specification=ToolSpecification(name="Image",description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),arguments=[ToolArgument(name="target",required=True,type="str")])
+        self.specification=ToolSpecification(name="Image",description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),arguments=[ToolArgument(name="target",required=True,type="str")],tag="action")
 
     def run(self,command:Command)->Return:
         try:

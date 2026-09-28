@@ -18,6 +18,7 @@ class Scan(Tool):
             name="Scan",
             description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[],
+            tag="action",
         )
 
     def run(self, command: Command) -> Return:

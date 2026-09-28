@@ -27,6 +27,7 @@ class ToolSpecification:
     name:str
     description:str
     arguments: list[ToolArgument]
+    tag:str
 
 class Tool(Protocol):
     specification: ToolSpecification
