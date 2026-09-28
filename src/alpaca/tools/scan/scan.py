@@ -3,8 +3,9 @@ from importlib.resources import files
 import numpy as np
 import rospy
 
+from ...dataclasses import FCExecute
 from ...risk import RiskCal
-from ...vatools import VAExecute,VAInterface
+from ...vatools import VAInterface
 from ...wmtools.wminterface import WorldModelInterface
 from ..toolshared import Command,Return,Tool,ToolSpecification
 
@@ -25,10 +26,10 @@ class Scan(Tool):
             risk_result=self.risk.checkcmd(command)
             if risk_result.get("Safe") is False:
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
-            self.wminterface.record()
+            self.wminterface.execute(FCExecute(function="record",arguments={}))
             recording_started=True
-            _=self.vainterface.execute(VAExecute(function="scan",arguments={"yaw_margin":float(np.deg2rad(45))}))
-            changes=self.wminterface.stop_record()
+            _=self.vainterface.execute(FCExecute(function="scan",arguments={"yaw_margin":float(np.deg2rad(45))}))
+            changes=self.wminterface.execute(FCExecute(function="stop_record",arguments={})).data
             recording_started=False
         except rospy.ROSInterruptException as error:
             return Return(
@@ -47,7 +48,7 @@ class Scan(Tool):
         finally:
             if recording_started:
                 try:
-                    self.wminterface.stop_record()
+                    self.wminterface.execute(FCExecute(function="stop_record",arguments={}))
                 except RuntimeError:
                     pass
 

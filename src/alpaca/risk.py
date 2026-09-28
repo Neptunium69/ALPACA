@@ -66,7 +66,7 @@ class VantagePoint:
     straight_line_distance: float
 
 class RiskCal():
-    def __init__(self,model:wm.WorldModel,adapter:va.VehicleAdapter)->None:
+    def __init__(self,model:wm.ObjectWorldModel,adapter:va.VehicleAdapter)->None:
         self.model=model
         self.adapter=adapter
         self.occupied_confidence_threshold=0.1

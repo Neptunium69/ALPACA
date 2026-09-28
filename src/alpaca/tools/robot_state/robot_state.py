@@ -1,11 +1,12 @@
 from dataclasses import fields
 from importlib.resources import files
 
-from ...wmtools.wminterface import WorldModelInterface
+from ...dataclasses import FCExecute
+from ...vatools import VAInterface
 from ..toolshared import Command,Return,Tool,ToolSpecification
 
 class RobotState(Tool):
-    def __init__(self,interface:WorldModelInterface):
+    def __init__(self,interface:VAInterface):
         self.interface=interface
         self.specification=ToolSpecification(
             name="Robot State",
@@ -14,7 +15,7 @@ class RobotState(Tool):
         )
 
     def run(self, command: Command) -> Return:
-        state=self.interface.robot_state()
+        state=self.interface.execute(FCExecute(function="get_state",arguments={})).data
         rv=Return(id=command.id, command_type=command.command_type, status="Success", results={})
         for field in fields(state):
             rv.results[field.name] = getattr(state, field.name)

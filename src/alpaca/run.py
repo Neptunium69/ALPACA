@@ -29,7 +29,7 @@ project_root=Path(__file__).resolve().parents[3]
 model_path=str(project_root/"Models"/"Qwen3-VL-4B-Instruct")
 yolo_path="./ALPACA/yolomodel/best.engine"
 
-def start_world_model_logging(model:worldmodel.WorldModel,log_dir:Path):
+def start_world_model_logging(model:worldmodel.ObjectWorldModel,log_dir:Path):
     log_path=log_dir/"world_model_objects.jsonl"
     def log_objects(_event):
         try:
@@ -58,7 +58,7 @@ def main():
     log_dir=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
     log_dir.mkdir(parents=True,exist_ok=True)
     observations=worldmodel.Model()
-    model=worldmodel.WorldModel(observations,["apple","board"])
+    model=worldmodel.ObjectWorldModel(observations,["apple","board"])
     initial_state=vehicleadapter.State(battery_level=None,position=worldmodel.Position(0.0,0.0,0.0),orientation=worldmodel.Orientation(0.0,0.0,0.0))
     adapter=vehicleadapter.UGVAdapter(initial_state,model,None)
     rcm=risk.RiskCal(model,adapter)

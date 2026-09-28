@@ -3,8 +3,9 @@ from importlib.resources import files
 
 import numpy as np
 
+from ...dataclasses import FCExecute
 from ...risk import RiskCal
-from ...vatools import VAExecute,VAInterface
+from ...vatools import VAInterface
 from ..toolshared import Command,Return,Tool,ToolArgument,ToolSpecification
 
 
@@ -17,10 +18,10 @@ class Image(Tool):
 
     def run(self,command:Command)->Return:
         try:
-            state=self.vainterface.execute(VAExecute(function="get_state",arguments={})).data
+            state=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data
             target_obj=command.arguments.get("target")
             if target_obj is not None and state is not None:
-                target=self.vainterface.execute(VAExecute(function="hiddenpoint",arguments={"object_id":target_obj,"state":state})).data
+                target=self.vainterface.execute(FCExecute(function="hiddenpoint",arguments={"object_id":target_obj,"state":state})).data
                 positionvector=np.array([state.position.x,state.position.y,state.position.z])
                 if target is not None:
                     directionvector=np.array([target.x,target.y,target.z])-positionvector
@@ -35,7 +36,7 @@ class Image(Tool):
                         risk_result=self.risk.checkcmd(command)
                         if risk_result.get("Safe") is False:
                             return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
-                        self.vainterface.execute(VAExecute(function="image",arguments={"targpos":target}))
+                        self.vainterface.execute(FCExecute(function="image",arguments={"targpos":target}))
                     except Exception as error:
                         return Return(id=command.id, command_type=command.command_type, status="Failed",results={"error":str(error)})
                 result=self.observe_tool.run(Command(id=f"{command.id}",command_type=command.command_type,arguments={}))
