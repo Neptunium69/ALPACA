@@ -14,7 +14,7 @@ class Finish(Tool):
         self.output_text_publisher=output_text_publisher
         self.output_image_publisher=output_image_publisher
         self.completion_publisher=completion_publisher
-        self.specification=ToolSpecification(name="Finish",description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),arguments=[ToolArgument(name="completion_text_message",required=False,type="str"),ToolArgument(name="completion_image_message",required=False,type="str")])
+        self.specification=ToolSpecification(name="Finish",description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),arguments=[ToolArgument(name="completion_text_message",required=False,type="str"),ToolArgument(name="completion_image_message",required=False,type="str")],tag="action")
 
     def run(self,command:Command)->Return:
         if self.output_text_publisher is None or self.output_image_publisher is None:

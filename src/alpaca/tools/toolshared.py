@@ -29,6 +29,12 @@ class ToolSpecification:
     name:str
     description:str
     arguments: list[ToolArgument]
+    tag:str
+
+@dataclass(frozen=True)
+class ExecutionRule:
+    tag:str
+    maximum:int
 
 class Tool(Protocol):
     specification: ToolSpecification
@@ -75,8 +81,9 @@ class ToolList():
         return [spec.name for spec in self.getallspec()]
 
 class ToolExecutor():
-    def __init__(self,toolist:ToolList):
+    def __init__(self,toolist:ToolList,rules:list[ExecutionRule]|None=None):
         self.toolist=toolist
+        self.rules=rules if rules is not None else [ExecutionRule(tag="action",maximum=1)]
 
     def read(self,cmds:str)->list[Command]:
         envelope=json.loads(cmds)
@@ -188,6 +195,7 @@ class ToolExecutor():
 
         returns=[]
         command_ids=set()
+        tag_counts:dict[str,int]={}
 
         for command in commands:
             if not isinstance(command.id,str) or not command.id.strip():
@@ -255,6 +263,29 @@ class ToolExecutor():
                     results={"Error":validation_error},
                 ))
                 continue
+
+            violated_rule=next(
+                (
+                    rule
+                    for rule in self.rules
+                    if rule.tag==tool.specification.tag
+                    and tag_counts.get(rule.tag,0)>=rule.maximum
+                ),
+                None,
+            )
+            if violated_rule is not None:
+                returns.append(Return(
+                    id=command.id,
+                    command_type=command.command_type,
+                    status="Failed",
+                    results={"Error":(
+                        f"Execution rule permits at most {violated_rule.maximum} "
+                        f"tool(s) tagged {violated_rule.tag}."
+                    )},
+                ))
+                continue
+
+            tag_counts[tool.specification.tag]=tag_counts.get(tool.specification.tag,0)+1
 
             try:
                 result=tool.run(command)

@@ -2,6 +2,7 @@ import math
 from importlib.resources import files
 
 from ... import vehicleadapter as va
+from ...dataclasses import FCExecute
 from ...vatools import VAInterface
 from ...wmtools.wminterface import WorldModelInterface
 from ..toolshared import Command,Return,Tool,ToolArgument,ToolSpecification
@@ -20,13 +21,14 @@ class Inspect(Tool):
             arguments=[
                 ToolArgument(name="target",required=True,type="str"),
             ],
+            tag="action",
         )
 
     def run(self,command:Command)->Return:        
         try:
             state=self.adapter.get_state()
             targets=self.adapter.hiddenpoints(object_id=command.arguments["target"],state=state,distance_behind=1)
-            targetobjects=self.wminterface.read_wm({"object_id":command.arguments["target"],"class_name":None})
+            targetobjects=self.wminterface.execute(FCExecute(function="query_world",arguments={"object_id":command.arguments["target"],"class_name":None})).data
             if len(targetobjects)!=1:
                 raise KeyError(f"Object {command.arguments['target']!r} does not uniquely exist in the current world model.")
             targetobject=targetobjects[0]

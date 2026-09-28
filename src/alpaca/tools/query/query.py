@@ -1,5 +1,6 @@
 from importlib.resources import files
 
+from ...dataclasses import FCExecute
 from ...wmtools.wminterface import WorldModelInterface
 from ..toolshared import Command,Return,Tool,ToolArgument,ToolSpecification
 
@@ -13,6 +14,7 @@ class Query(Tool):
                 ToolArgument(name="object_id",required=False,type="str"),
                 ToolArgument(name="class_name",required=False,type="str"),
             ],
+            tag="query",
         )
 
     def run(self, command: Command) -> Return:
@@ -30,7 +32,7 @@ class Query(Tool):
                 },
             )
         else:
-            objects = self.interface.read_wm({"object_id":object_id, "class_name": class_name})
+            objects = self.interface.execute(FCExecute(function="query_world",arguments={"object_id":object_id,"class_name":class_name})).data
 
         if len(objects) == 0:
             return Return(

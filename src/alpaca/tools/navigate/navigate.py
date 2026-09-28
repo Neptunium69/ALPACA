@@ -4,13 +4,11 @@ from importlib.resources import files
 from ... import vehicleadapter as va
 from ...risk import RiskCal
 from ...vatools import VAInterface
-from ...wmtools.wminterface import WorldModelInterface
 from ..toolshared import Command,Return,Tool,ToolArgument,ToolSpecification
 
 
 class Navigate(Tool):
-    def __init__(self,wminterface:WorldModelInterface,vainterface:VAInterface,risk:RiskCal):
-        self.wminterface=wminterface
+    def __init__(self,vainterface:VAInterface,risk:RiskCal):
         self.vainterface=vainterface
         self.adapter=vainterface.vehicle_adapter
         self.risk=risk
@@ -23,6 +21,7 @@ class Navigate(Tool):
                 ToolArgument(name="orientation",required=True,type="dict"),
                 ToolArgument(name="frame_id",required=False,type="str"),
             ],
+            tag="action",
         )
 
     def run(self,command:Command)->Return:

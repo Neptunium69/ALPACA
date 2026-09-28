@@ -8,6 +8,8 @@ import rospy
 import numpy as np
 from scipy.spatial.transform import Rotation
 import message_filters
+from .dataclasses import Function
+from .wmtools.wmregistry import WMRegistry
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import math
@@ -75,8 +77,16 @@ class VoxelModel:
     grid_origin: Position | None = None
     frame_id: str | None = None
 
-class WorldModel:
+class ObjectWorldModel:
     def __init__(self, observations: Model, detection_classes):
+        self.registry=WMRegistry([
+            Function(name="query_world",arguments={"object_id":("str",False),"class_name":("str",False)}),
+            Function(name="write",arguments={"world_object":("Object",True)}),
+            Function(name="bounding_box_to_world",arguments={"bounding_box":("list",True)}),
+            Function(name="get_detection_classes",arguments={}),
+            Function(name="record",arguments={}),
+            Function(name="stop_record",arguments={}),
+        ])
         self.observations = observations
         self.observationstemp=Model()
         self._last_detection_stamp=None
@@ -703,6 +713,9 @@ class WorldModel:
                 result = self.observations.objects
 
             return deepcopy(result)
+
+    def get_detection_classes(self)->tuple[str,...]:
+        return self.detection_classes
 
     def getallobjects(self)->str:
         listofobjects=[]

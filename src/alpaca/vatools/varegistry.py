@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from .dataclasses import Function
+from ..dataclasses import Function
 
 class VARegistry():
     def __init__(self,functions:list[Function]):

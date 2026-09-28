@@ -10,7 +10,7 @@ class AskUser(Tool):
     def __init__(self,output_text_publisher:rospy.Publisher,output_image_publisher:rospy.Publisher):
         self.output_text_publisher=output_text_publisher
         self.output_image_publisher=output_image_publisher
-        self.specification=ToolSpecification(name="ask_user",description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),arguments=[ToolArgument(name="text_message",required=True,type="str"),ToolArgument(name="image_message",required=False,type="str")])
+        self.specification=ToolSpecification(name="ask_user",description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),arguments=[ToolArgument(name="text_message",required=True,type="str"),ToolArgument(name="image_message",required=False,type="str")],tag="action")
 
     def run(self,command:Command)->Return:
         if self.output_text_publisher is None or self.output_image_publisher is None:

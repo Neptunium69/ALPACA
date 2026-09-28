@@ -4,14 +4,14 @@ from dataclasses import dataclass
 from typing import Any
 
 @dataclass
-class VAReturn():
+class FCReturn():
     function: str
     data: Any | None
 
 @dataclass
-class VAExecute():
+class FCExecute():
     function: str
-    arguments: dict[str,Any]
+    arguments: dict[str:Any]
 
 @dataclass
 class Function():

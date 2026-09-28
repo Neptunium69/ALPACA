@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .dataclasses import VAReturn,VAExecute
+from ..dataclasses import FCReturn,FCExecute
 
 if TYPE_CHECKING:
     from ..vehicleadapter import VehicleAdapter
@@ -22,7 +22,7 @@ class VAInterface():
         }
         return expected_type in actual_type_names
 
-    def execute(self,cmd:VAExecute)->VAReturn:
+    def execute(self,cmd:FCExecute)->FCReturn:
         if not isinstance(cmd.arguments,dict):
             raise ValueError("Vehicle adapter command arguments must be a dictionary.")
 
@@ -54,4 +54,4 @@ class VAInterface():
             raise ValueError(f"Registered function {cmd.function!r} is not callable on vehicle adapter {self.vaname}.")
 
         returned_data=function(**cmd.arguments)
-        return VAReturn(function=cmd.function,data=returned_data)
+        return FCReturn(function=cmd.function,data=returned_data)

@@ -92,7 +92,7 @@ class ToolList():
         return [spec.name for spec in self.getallspec()]
 
 class ToolExecutor:
-    def __init__(self, model: wm.WorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, output_text_publisher:rospy.Publisher, output_image_publisher:rospy.Publisher, input_subscriber:rospy.Subscriber, detector:YOLOAdapter | None=None, completion_publisher:rospy.Publisher | None=None) -> None:
+    def __init__(self, model: wm.ObjectWorldModel, adapter: va.UGVAdapter, riskcalibration:rcm.RiskCal, output_text_publisher:rospy.Publisher, output_image_publisher:rospy.Publisher, input_subscriber:rospy.Subscriber, detector:YOLOAdapter | None=None, completion_publisher:rospy.Publisher | None=None) -> None:
         self.model = model
         self.output_text_publisher=output_text_publisher
         self.output_image_publisher=output_image_publisher

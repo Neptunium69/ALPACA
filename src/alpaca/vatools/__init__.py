@@ -2,6 +2,6 @@
 
 from .vainterface import VAInterface
 from .varegistry import VARegistry
-from .dataclasses import VAExecute,VAReturn,Function
+from ..dataclasses import FCExecute,FCReturn,Function
 
-__all__ = ["VAInterface", "VARegistry","VAExecute","VAReturn","Function"]
+__all__ = ["VAInterface", "VARegistry","FCExecute","FCReturn","Function"]
