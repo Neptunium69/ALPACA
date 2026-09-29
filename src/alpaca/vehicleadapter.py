@@ -62,7 +62,20 @@ class VehicleAdapter(Protocol):
 
 class UGVAdapter(VehicleAdapter):
     def __init__(self, worldmodel: wm.ObjectWorldModel, risk:risk.RiskCal | None=None, **kwargs) -> None:
-        self.registry=VARegistry([Function(name="scan",arguments={"yaw_margin":("float",False)}),Function(name="get_state",arguments={}),Function(name="hiddenpoint",arguments={"object_id":("str",True),"state":("State",True),"distance_behind":("float",False)}),Function(name="image",arguments={"targpos":("Position",True),"yaw_margin":("float",False)})])
+        self.registry=VARegistry([
+            Function(name="init_sensordata",arguments={}),
+            Function(name="get_navigation_frame",arguments={}),
+            Function(name="get_state",arguments={}),
+            Function(name="require_navigation_ready",arguments={"action_name":("str",True)}),
+            Function(name="get_collision_geometry",arguments={}),
+            Function(name="plan_path",arguments={"destination":("Position",True),"orientation":("Orientation",True),"frame_id":("str",False),"tolerance":("float",False)}),
+            Function(name="navigate",arguments={"destination":("Position",True),"orientation":("Orientation",True),"frame_id":("str",False)}),
+            Function(name="scan",arguments={"yaw_margin":("float",False)}),
+            Function(name="vantagepoint",arguments={"pathvoxel":("PathVoxelAssessment",True),"max_updates":("int",False)}),
+            Function(name="hiddenpoints",arguments={"object_id":("str",True),"state":("State",True),"distance_behind":("float",False)}),
+            Function(name="hiddenpoint",arguments={"object_id":("str",True),"state":("State",True),"distance_behind":("float",False)}),
+            Function(name="image",arguments={"targpos":("Position",True),"yaw_margin":("float",False)}),
+        ])
         self.worldmodel=worldmodel
         self.riskcal=risk
         self.state_lock=Lock()
@@ -106,6 +119,9 @@ class UGVAdapter(VehicleAdapter):
     @property
     def navigation_frame(self)->str:
         return self._navigation_frame
+
+    def get_navigation_frame(self)->str:
+        return self.navigation_frame
 
     def init_sensordata(self) -> None:
         with self.state_lock:

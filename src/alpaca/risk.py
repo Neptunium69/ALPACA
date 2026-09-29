@@ -9,7 +9,8 @@ import rospy
 from std_msgs.msg import Float64
 from dataclasses import dataclass
 from . import worldmodel as wm
-from . import vehicleadapter as va
+from .dataclasses import FCExecute
+from .vatools import VAInterface
 from .worldmodel import Voxel
 
 class Command(Protocol):
@@ -66,9 +67,9 @@ class VantagePoint:
     straight_line_distance: float
 
 class RiskCal():
-    def __init__(self,model:wm.ObjectWorldModel,adapter:va.VehicleAdapter)->None:
+    def __init__(self,model:wm.ObjectWorldModel,vainterface:VAInterface)->None:
         self.model=model
-        self.adapter=adapter
+        self.vainterface=vainterface
         self.occupied_confidence_threshold=0.1
         self.occupied_route_threshold=0.20
         self.information_route_threshold=0.5
@@ -76,7 +77,7 @@ class RiskCal():
         self.maximum_vantage_candidates=32
         self.maximum_vantage_evaluation_seconds=30.0
     def checkcmd(self,command:Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:
-        state=self.adapter.get_state()
+        state=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data
         safe,reason=self._hardsafetyfilter(command,state,destination,orientation,frame_id)
         if not safe:
             return {"Safe":False,"Reason":reason}
@@ -90,7 +91,7 @@ class RiskCal():
         if command.command_type=="inspect":
             if frame_id is None:
                 return {"Safe":False,"Reason":"Missing navigation frame."}
-            hiddenpoint=self.adapter.hiddenpoint(command.arguments["target"],state=state,distance_behind=0.7)
+            hiddenpoint=self.vainterface.execute(FCExecute(function="hiddenpoint",arguments={"object_id":command.arguments["target"],"state":state,"distance_behind":0.7})).data
             orient=state.data["orientation"]
             navresult=self.navigate(command=command, destination=hiddenpoint,orientation=orient,frame_id=frame_id)
             return navresult
@@ -103,9 +104,9 @@ class RiskCal():
             raise ValueError("Navigation destination, orientation, and frame are required.")
         if not isinstance(coverage_margin,(int,float)) or isinstance(coverage_margin,bool) or not math.isfinite(coverage_margin) or coverage_margin<0:
             raise ValueError("Coverage margin must be a finite, non-negative number.")
-        path=self.adapter.plan_path(destination,orientation,frame_id,tolerance=0.10)
+        path=self.vainterface.execute(FCExecute(function="plan_path",arguments={"destination":destination,"orientation":orientation,"frame_id":frame_id,"tolerance":0.10})).data
         positions=self._path_positions(path)
-        vehicle_pose,vehicle_min,vehicle_max=self.adapter.get_collision_geometry()
+        vehicle_pose,vehicle_min,vehicle_max=self.vainterface.execute(FCExecute(function="get_collision_geometry",arguments={})).data
         if vehicle_pose is None:
             raise RuntimeError("Vehicle localization is not ready.")
         vehicle_min=np.asarray(vehicle_min,dtype=np.float64)
@@ -176,8 +177,8 @@ class RiskCal():
             if destination is None or orientation is None or frame_id is None:
                 return False,"Navigation goal has not been validated."
             try:
-                vehicle_pose,vehicle_min,vehicle_max=self.adapter.get_collision_geometry()
-            except (AttributeError,NotImplementedError):
+                vehicle_pose,vehicle_min,vehicle_max=self.vainterface.execute(FCExecute(function="get_collision_geometry",arguments={})).data
+            except (AttributeError,NotImplementedError,ValueError):
                 return False,"Vehicle adapter does not provide collision geometry."
             if vehicle_pose is None:
                 return False,"Vehicle localization is not ready."
@@ -185,8 +186,9 @@ class RiskCal():
             voxel_frame=self.model.get_voxel_map_frame()
             if not pose_frame or voxel_frame is None:
                 return False,"Vehicle localization or voxel map is not ready."
-            if frame_id!=self.adapter.navigation_frame or frame_id!=pose_frame or frame_id!=voxel_frame:
-                return False,f"Navigation frame mismatch: goal={frame_id!r}, adapter={self.adapter.navigation_frame!r}, pose={pose_frame!r}, voxel_map={voxel_frame!r}."
+            navigation_frame=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
+            if frame_id!=navigation_frame or frame_id!=pose_frame or frame_id!=voxel_frame:
+                return False,f"Navigation frame mismatch: goal={frame_id!r}, adapter={navigation_frame!r}, pose={pose_frame!r}, voxel_map={voxel_frame!r}."
             try:
                 occupancy_min=vehicle_min.copy()
                 occupancy_min[2]+=0.03
@@ -242,7 +244,7 @@ class RiskCal():
             return {"Safe":False,"Reason":"Path contains excessive obstacles."}
 
         if (len(occupied_voxels)+len(unknown_voxels))/pathvoxel.total_count>self.information_route_threshold and pathvoxel.occupied_score<self.occupied_route_threshold:
-            vp=self.adapter.vantagepoint(pathvoxel)
+            vp=self.vainterface.execute(FCExecute(function="vantagepoint",arguments={"pathvoxel":pathvoxel})).data
             center_position=self.model.voxel_to_position(self.center(pathvoxel))
             total_unknown_value=float(len(unknown_voxels))
             reference_distance=max(prediction.distance,1.0)
@@ -264,7 +266,8 @@ class RiskCal():
                 "evaluation_seconds":0.0,
             }
 
-            robot_position=self.adapter.get_state().data["position"]
+            vehicle_state=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data
+            robot_position=vehicle_state.data["position"]
             known_free_candidates=[]
             for vantage_voxel in vp:
                 vantage_state=self.model.get_voxel_states([vantage_voxel])[0]
@@ -278,7 +281,7 @@ class RiskCal():
             candidate_counts["known_free"]=len(known_free_candidates)
             candidate_counts["not_evaluated_due_to_limit"]=max(0,len(known_free_candidates)-self.maximum_vantage_candidates)
             candidates_to_evaluate=known_free_candidates[:self.maximum_vantage_candidates]
-            vehicle_pose,vehicle_min,vehicle_max=self.adapter.get_collision_geometry()
+            vehicle_pose,vehicle_min,vehicle_max=self.vainterface.execute(FCExecute(function="get_collision_geometry",arguments={})).data
             if vehicle_pose is None:
                 return {"Safe":False,"Reason":"Vehicle localization is not ready.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts}
             evaluation_started=time.monotonic()

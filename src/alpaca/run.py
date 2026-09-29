@@ -15,7 +15,7 @@ from .tools.query import Query
 from .tools.robot_state import RobotState
 from .tools.scan import Scan
 from .tools.write import Write
-from .vatools import VAInterface
+from .vatools import FCExecute,VAInterface
 from .wmtools import WorldModelInterface
 
 import rospy
@@ -74,13 +74,13 @@ def main():
     observations=worldmodel.Model()
     model=worldmodel.ObjectWorldModel(observations,["apple","board"])
     adapter=vehicleadapter.UGVAdapter(model,None)
-    rcm=risk.RiskCal(model,adapter)
+    vainterface=VAInterface(adapter,"primary")
+    rcm=risk.RiskCal(model,vainterface)
     adapter.riskcal=rcm
     detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
     vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
     vlm_interface.init_vlm()
     wminterface=WorldModelInterface(model,"primary")
-    vainterface=VAInterface(adapter,"primary")
     observe_tool=Observe()
     navigate_tool=Navigate(vainterface,rcm)
     scan_tool=Scan(wminterface,vainterface,rcm)
@@ -106,7 +106,7 @@ def main():
     model.initwm()
     world_model_log_timer=start_world_model_logging(model,log_dir)
     detector.init_yolo()
-    adapter.init_sensordata()
+    vainterface.execute(FCExecute(function="init_sensordata",arguments={}))
     shutdown_lock=RLock()
     adapter.stopping=False
     adapter.stopped=False
@@ -137,7 +137,7 @@ def main():
             while not rospy.is_shutdown() and not adapter.stopping and not rospy.get_param("/alpaca/start_mission",False):
                 rospy.sleep(0.1)
             if rospy.is_shutdown() or adapter.stopping: return 0
-            adapter.require_navigation_ready("start the mission")
+            vainterface.execute(FCExecute(function="require_navigation_ready",arguments={"action_name":"start the mission"}))
         vlm_interface.run_mission(user_prompt=user_prompt)
         rospy.spin()
     except RuntimeError as error:

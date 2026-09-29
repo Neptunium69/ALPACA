@@ -2,6 +2,7 @@ import math
 from importlib.resources import files
 
 from ... import vehicleadapter as va
+from ...dataclasses import FCExecute
 from ...risk import RiskCal
 from ...vatools import VAInterface
 from ..toolshared import Command,Return,Tool,ToolArgument,ToolSpecification
@@ -10,7 +11,6 @@ from ..toolshared import Command,Return,Tool,ToolArgument,ToolSpecification
 class Navigate(Tool):
     def __init__(self,vainterface:VAInterface,risk:RiskCal):
         self.vainterface=vainterface
-        self.adapter=vainterface.vehicle_adapter
         self.risk=risk
         self.redirects_left=3
         self.specification=ToolSpecification(
@@ -36,12 +36,14 @@ class Navigate(Tool):
             goal_values=[destination_data["x"],destination_data["y"],destination_data["z"],orientation_data["roll"],orientation_data["pitch"],orientation_data["yaw"]]
             if any(not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) for value in goal_values):
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Destination and orientation values must be finite numbers."})
-            frame_id=command.arguments.get("frame_id",self.adapter.navigation_frame)
+            frame_id=command.arguments.get("frame_id")
+            if frame_id is None:
+                frame_id=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
             if not isinstance(frame_id,str) or not frame_id.strip():
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"frame_id must be a non-empty string."})
             destination=va.Position(x=float(destination_data["x"]),y=float(destination_data["y"]),z=float(destination_data["z"]))
             orientation=va.Orientation(pitch=float(orientation_data["pitch"]),yaw=float(orientation_data["yaw"]),roll=float(orientation_data["roll"]))
-            self.adapter.require_navigation_ready("navigate")
+            self.vainterface.execute(FCExecute(function="require_navigation_ready",arguments={"action_name":"navigate"}))
             risk_result=self.risk.checkcmd(command,destination,orientation,frame_id)
             if risk_result.get("Safe") is not True:
                 reason=risk_result.get("Reason","Command failed the safety check.")
@@ -71,7 +73,7 @@ class Navigate(Tool):
                     return self.run(command)
                 finally:
                     self.redirects_left+=1
-            self.adapter.navigate(destination,orientation,frame_id)
+            self.vainterface.execute(FCExecute(function="navigate",arguments={"destination":destination,"orientation":orientation,"frame_id":frame_id}))
         except va.NavigationReadinessError as error:
             return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error),"Category":"navigation_not_ready","Retryable":False})
         except Exception as error:

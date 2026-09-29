@@ -12,7 +12,6 @@ class Inspect(Tool):
     def __init__(self,wminterface:WorldModelInterface,vainterface:VAInterface,navigate_tool:Tool,scan_tool:Tool):
         self.wminterface=wminterface
         self.vainterface=vainterface
-        self.adapter=vainterface.vehicle_adapter
         self.navigate_tool=navigate_tool
         self.scan_tool=scan_tool
         self.specification=ToolSpecification(
@@ -26,8 +25,9 @@ class Inspect(Tool):
 
     def run(self,command:Command)->Return:        
         try:
-            state=self.adapter.get_state()
-            targets=self.adapter.hiddenpoints(object_id=command.arguments["target"],state=state,distance_behind=1)
+            state=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data
+            targets=self.vainterface.execute(FCExecute(function="hiddenpoints",arguments={"object_id":command.arguments["target"],"state":state,"distance_behind":1.0})).data
+            navigation_frame=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
             targetobjects=self.wminterface.execute(FCExecute(function="query_world",arguments={"object_id":command.arguments["target"],"class_name":None})).data
             if len(targetobjects)!=1:
                 raise KeyError(f"Object {command.arguments['target']!r} does not uniquely exist in the current world model.")
@@ -39,7 +39,7 @@ class Inspect(Tool):
                 targetpose=va.Orientation(pitch=0.0,yaw=math.atan2(targetobject.position.y-target.y,targetobject.position.x-target.x),roll=0.0)
                 cmd=Command(id=f"{command.id}_navigate_{target_index}",command_type="navigate", arguments={"destination":{"x":target.x,"y":target.y,"z":target.z},
                     "orientation":{"pitch":targetpose.pitch,"yaw":targetpose.yaw,"roll":targetpose.roll},
-                    "frame_id":self.adapter.navigation_frame,})
+                    "frame_id":navigation_frame,})
                 result=self.navigate_tool.run(cmd)
                 if result is not None and result.status=="Success":
                     break
