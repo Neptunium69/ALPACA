@@ -1,10 +1,22 @@
 from . import vlminterface
 from . import worldmodel
-from . import tools
 from . import userinterface
 from . import vehicleadapter
 from . import risk
 from . import yolo
+from .tools import ToolExecutor,ToolList
+from .tools.ask_user import AskUser
+from .tools.finish import Finish
+from .tools.image import Image
+from .tools.inspect import Inspect
+from .tools.navigate import Navigate
+from .tools.observe import Observe
+from .tools.query import Query
+from .tools.robot_state import RobotState
+from .tools.scan import Scan
+from .tools.write import Write
+from .vatools import VAInterface
+from .wmtools import WorldModelInterface
 
 import rospy
 from pathlib import Path
@@ -68,7 +80,26 @@ def main():
     detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
     vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
     vlm_interface.init_vlm()
-    toolexecutor=tools.ToolExecutor(model,adapter,rcm,vlm_interface.output_text_publisher,vlm_interface.output_image_publisher,vlm_interface.input_subscriber,detector,completion_publisher=getattr(vlm_interface,"completion_publisher",None))
+    wminterface=WorldModelInterface(model,"primary")
+    vainterface=VAInterface(adapter,"primary")
+    observe_tool=Observe()
+    navigate_tool=Navigate(vainterface,rcm)
+    scan_tool=Scan(wminterface,vainterface,rcm)
+    tool_list=ToolList()
+    for tool in (
+        Query(wminterface),
+        RobotState(vainterface),
+        Write(wminterface),
+        observe_tool,
+        scan_tool,
+        navigate_tool,
+        Inspect(wminterface,vainterface,navigate_tool,scan_tool),
+        Image(vainterface,rcm,observe_tool),
+        AskUser(vlm_interface.output_text_publisher,vlm_interface.output_image_publisher),
+        Finish(vlm_interface.output_text_publisher,vlm_interface.output_image_publisher,completion_publisher=getattr(vlm_interface,"completion_publisher",None)),
+    ):
+        tool_list.add(tool)
+    toolexecutor=ToolExecutor(tool_list)
     vlm_interface.toolexe=toolexecutor
     ui=userinterface.UI()
 

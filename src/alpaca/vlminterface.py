@@ -4,7 +4,7 @@ from __future__ import annotations
 import rospy
 from pathlib import Path
 import base64
-from . import tools
+from .tools import Return,ToolExecutor
 from std_msgs.msg import String
 from threading import Event
 import json
@@ -16,7 +16,7 @@ from urllib import request as urllib_request
 
 
 class VLMInterface():
-    def __init__(self,system_prompt_think:str,system_prompt_act:str,model_path:str,toolexe:tools.ToolExecutor | None=None, system_prompt_master:str|None=None,max_tok:int=512) -> None:
+    def __init__(self,system_prompt_think:str,system_prompt_act:str,model_path:str,toolexe:ToolExecutor | None=None, system_prompt_master:str|None=None,max_tok:int=512) -> None:
         self.system_prompt_act=system_prompt_act
         self.system_prompt_think=system_prompt_think
         self.model_path=Path(model_path)
@@ -154,9 +154,14 @@ class VLMInterface():
         self.steps=0
         if self.toolexe is None: raise ValueError("Tool executor is None.")
         self._publish_status("mission_started",mission=user_prompt)
+        startup_results=self.toolexe.run(json.dumps({"commands":[{
+            "id":"mission_startup_query",
+            "command_type":"query",
+            "arguments":{},
+        }]}))
         self.history=[{"role":"system","content":[{"type":"text","text":self.system_prompt_master}]},
             {"role":"user","content":[{"type":"text","text":user_prompt}],},
-            {"role":"user","content":[{"type":"text","text":f"World-model objects already detected at mission startup (IDs and classes, JSON):\n{self.toolexe.model.getallobjects()}"}]},
+            {"role":"user","content":[{"type":"text","text":f"World-model query at mission startup:\n{self._dump(startup_results)}"}]},
         ]
         self._log_dialogue("mission_start",user_prompt=user_prompt,history=self.history)
 
@@ -185,11 +190,13 @@ class VLMInterface():
             if self.toolexe is not None:
                 results=[]
                 try:
-                    commands=self.toolexe.stringtocmd(cmdjson)
+                    commands=self.toolexe.read(cmdjson)
+                    if not commands:
+                        raise ValueError("commands must be a non-empty list.")
                     self._log_dialogue("commands_parsed",commands=[asdict(command) for command in commands])
                     rospy.loginfo("Qwen step %d chose: %s",self.steps,", ".join(f"{command.command_type} ({command.id})" for command in commands))
                     self._publish_status("executing",commands=[asdict(command) for command in commands])
-                    results=self.toolexe.execute(commands)
+                    results=self.toolexe.run(cmdjson)
                     self._publish_status("processing_results")
                     self._log_dialogue("tool_results",results=[asdict(result) for result in results])
                     rospy.loginfo("Qwen step %d results: %s",self.steps,", ".join(f"{result.command_type}={result.status}" for result in results))
@@ -210,7 +217,7 @@ class VLMInterface():
             imagflag=0
             imag=None
             for i in range(len(results)):
-                if results[i].command_type in ("image","observe") and results[i].status=="Success":
+                if results[i].command_type.casefold() in ("image","observe") and results[i].status=="Success":
                     imag=results[i].results.get("image_path")
                     imagflag=1
             if imagflag==1:
@@ -223,7 +230,7 @@ class VLMInterface():
                     })
 
             for result in results:
-                if result.command_type=="finish" and result.status=="Success":
+                if result.command_type.casefold()=="finish" and result.status=="Success":
                     nukeflag=1
                     break
 
@@ -234,5 +241,5 @@ class VLMInterface():
         return 0
 
     @staticmethod
-    def _dump(results:list[tools.Return])->str:
+    def _dump(results:list[Return])->str:
         return json.dumps([asdict(result) for result in results], ensure_ascii=False)

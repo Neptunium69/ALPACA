@@ -9,7 +9,7 @@ class RobotState(Tool):
     def __init__(self,interface:VAInterface):
         self.interface=interface
         self.specification=ToolSpecification(
-            name="Robot State",
+            name="robot_state",
             description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
             arguments=[],
             tag="query",
