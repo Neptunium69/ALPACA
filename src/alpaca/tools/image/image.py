@@ -22,7 +22,7 @@ class Image(Tool):
             target_obj=command.arguments.get("target")
             if target_obj is not None and state is not None:
                 target=self.vainterface.execute(FCExecute(function="hiddenpoint",arguments={"object_id":target_obj,"state":state})).data
-                positionvector=np.array([state.position.x,state.position.y,state.position.z])
+                positionvector=np.array([state.data["position"].x,state.data["position"].y,state.data["position"].z])
                 if target is not None:
                     directionvector=np.array([target.x,target.y,target.z])-positionvector
                 else:
@@ -30,7 +30,7 @@ class Image(Tool):
                 if math.hypot(directionvector[0], directionvector[1]) < 1e-6:
                     raise ValueError("Vehicle position is equal to target position. Thus, position is undefined.")
                 yaw=math.atan2(directionvector[1],directionvector[0])
-                yaw_error=(yaw-state.orientation.yaw+math.pi)%(2*math.pi)-math.pi
+                yaw_error=(yaw-state.data["orientation"].yaw+math.pi)%(2*math.pi)-math.pi
                 if abs(yaw_error)>0.1:
                     try:
                         risk_result=self.risk.checkcmd(command)

@@ -91,7 +91,7 @@ class RiskCal():
             if frame_id is None:
                 return {"Safe":False,"Reason":"Missing navigation frame."}
             hiddenpoint=self.adapter.hiddenpoint(command.arguments["target"],state=state,distance_behind=0.7)
-            orient=state.orientation
+            orient=state.data["orientation"]
             navresult=self.navigate(command=command, destination=hiddenpoint,orientation=orient,frame_id=frame_id)
             return navresult
         
@@ -156,10 +156,10 @@ class RiskCal():
         # Battery enforcement is temporarily disabled because this UGV's MAVROS
         # percentage estimate is intermittent and has rejected otherwise safe commands.
         if cmd.command_type in {"scan","navigate","inspect"}:
-            if not state.armed:
+            if not state.data["armed"]:
                 return False,"Vehicle is not armed."
-            if state.mode!="OFFBOARD":
-                return False,f"Vehicle is in {state.mode or 'an unknown mode'}, not OFFBOARD."
+            if state.data["mode"]!="OFFBOARD":
+                return False,f"Vehicle is in {state.data['mode'] or 'an unknown mode'}, not OFFBOARD."
         if(cmd.command_type=="scan" or cmd.command_type=="image"):
             try:
                 clutter=rospy.wait_for_message("clutter_level",Float64,timeout=5)
@@ -264,7 +264,7 @@ class RiskCal():
                 "evaluation_seconds":0.0,
             }
 
-            robot_position=self.adapter.get_state().position
+            robot_position=self.adapter.get_state().data["position"]
             known_free_candidates=[]
             for vantage_voxel in vp:
                 vantage_state=self.model.get_voxel_states([vantage_voxel])[0]

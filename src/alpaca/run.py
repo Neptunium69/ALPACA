@@ -73,8 +73,7 @@ def main():
     log_dir.mkdir(parents=True,exist_ok=True)
     observations=worldmodel.Model()
     model=worldmodel.ObjectWorldModel(observations,["apple","board"])
-    initial_state=vehicleadapter.State(battery_level=None,position=worldmodel.Position(0.0,0.0,0.0),orientation=worldmodel.Orientation(0.0,0.0,0.0))
-    adapter=vehicleadapter.UGVAdapter(initial_state,model,None)
+    adapter=vehicleadapter.UGVAdapter(model,None)
     rcm=risk.RiskCal(model,adapter)
     adapter.riskcal=rcm
     detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
