@@ -6,12 +6,12 @@ from typing import Any
 @dataclass
 class FCReturn():
     function: str
-    data: Any | None
+    data: Any
 
 @dataclass
 class FCExecute():
     function: str
-    arguments: dict[str:Any]
+    arguments: dict[str,Any]
 
 @dataclass
 class Function():
