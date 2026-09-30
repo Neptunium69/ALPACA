@@ -526,6 +526,21 @@ class ObjectWorldModel:
             raise ValueError("Voxel grid has not been initialized.")
         return voxel_size
 
+    def world_position_to_voxel(self,position:Position)->tuple[int,int,int]:
+        """Convert a world-frame position to an index in the active voxel map."""
+        if not isinstance(position,Position):
+            raise TypeError("position must be a Position.")
+        coordinates=np.array([position.x,position.y,position.z],dtype=np.float64)
+        if not np.all(np.isfinite(coordinates)):
+            raise ValueError("World position must contain only finite values.")
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=deepcopy(self.voxelmap.grid_origin)
+        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+            raise ValueError("Voxel map has not been initialized.")
+        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+        return self.position_to_voxel(coordinates,origin,voxel_size)
+
     def voxel_to_position(self,index:tuple[int,int,int])->Position:
         if len(index)!=3 or any(not isinstance(component,int) or isinstance(component,bool) for component in index):
             raise ValueError("Voxel index must contain exactly three integers.")

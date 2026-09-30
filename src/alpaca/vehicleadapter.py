@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 import numpy as np
+from scipy.ndimage import label
+from scipy.spatial import cKDTree
 from typing import Protocol,Any
 from dataclasses import dataclass,field
 from math import pi,isfinite
@@ -94,6 +96,7 @@ class UGVAdapter(VehicleAdapter):
         self.lidar_points_world=None
         self.lidar_origin_world=None
         self.lidar_condition=Condition()
+        self.max_vp_voxels=2000000
         self.pending_lidar=None
         self.stopping=False
         self.stopped=False
@@ -225,26 +228,146 @@ class UGVAdapter(VehicleAdapter):
     def vantagepoint(self,pathvoxel:PathVoxelAssessment,max_updates:int=100)->set[tuple[int,int,int]]:
         if not isinstance(max_updates,int) or isinstance(max_updates,bool) or max_updates<1:
             raise ValueError("max_updates must be a positive integer.")
-        if self.riskcal is not None:
-            center=self.riskcal.center(pathvoxel)
-        else:
-            raise ValueError("Risk calibration module is None.")
-        voxellist:set[tuple[int,int,int]]={center}
-        visited:set[tuple[int,int,int]]={center}
-        for _ in range(max_updates):
-            voxelnew:set[tuple[int,int,int]]=set()
-            for voxel in voxellist:
-                voxelnew.update((voxel[0]+dx,voxel[1]+dy,voxel[2]) for dx in (-1,0,1) for dy in (-1,0,1) if not(dx==0 and dy==0))
-            voxelnew.difference_update(visited)
-            if not voxelnew:
-                return set()
-            voxelstates=self.worldmodel.get_voxel_states(list(voxelnew))
-            known_count=sum(state is not None for state in voxelstates)
-            if known_count/len(voxelnew)>=0.15:
-                return voxelnew
-            visited.update(voxelnew)
-            voxellist=voxelnew
-        raise RuntimeError(f"Could not find a voxel ring with at least 15% known voxels after {max_updates} updates.")
+        if not isinstance(pathvoxel,PathVoxelAssessment):
+            raise TypeError("pathvoxel must be a PathVoxelAssessment.")
+        if not pathvoxel.unknown_voxels:
+            return set()
+
+        voxel_size=self.worldmodel.get_voxel_size()
+        state=self.get_state()
+        position=state.data.get("position")
+        if not isinstance(position,Position):
+            raise RuntimeError("Vehicle position is unavailable.")
+        current_voxel=self.worldmodel.world_position_to_voxel(position)
+        candidate_z=current_voxel[2]
+
+        remaining=set(pathvoxel.unknown_voxels)
+        components:list[set[tuple[int,int,int]]]=[]
+        while remaining:
+            seed=remaining.pop()
+            component={seed}
+            stack=[seed]
+            while stack:
+                x,y,z=stack.pop()
+                neighbours={
+                    (x+dx,y+dy,z+dz)
+                    for dx in (-1,0,1)
+                    for dy in (-1,0,1)
+                    for dz in (-1,0,1)
+                    if dx!=0 or dy!=0 or dz!=0
+                }
+                connected=neighbours & remaining
+                remaining.difference_update(connected)
+                component.update(connected)
+                stack.extend(connected)
+            components.append(component)
+        relevant_unknown=min(
+            components,
+            key=lambda component:min(
+                (x-current_voxel[0])**2+(y-current_voxel[1])**2+(z-current_voxel[2])**2
+                for x,y,z in component
+            ),
+        )
+
+        maximum_x=max(abs(float(self.vehicle_min[0])),abs(float(self.vehicle_max[0])))
+        maximum_y=max(abs(float(self.vehicle_min[1])),abs(float(self.vehicle_max[1])))
+        footprint_radius=float(np.hypot(maximum_x,maximum_y))
+        half_voxel=voxel_size/2.0
+
+        maximum_horizontal_offset=int(np.ceil((footprint_radius+half_voxel)/voxel_size))
+        minimum_vertical_offset=int(np.floor(float(self.vehicle_min[2])/voxel_size-0.5))
+        maximum_vertical_offset=int(np.ceil(float(self.vehicle_max[2])/voxel_size+0.5))
+        footprint_offsets=[]
+        for dx in range(-maximum_horizontal_offset,maximum_horizontal_offset+1):
+            nearest_x=max(abs(dx)*voxel_size-half_voxel,0.0)
+            for dy in range(-maximum_horizontal_offset,maximum_horizontal_offset+1):
+                nearest_y=max(abs(dy)*voxel_size-half_voxel,0.0)
+                if np.hypot(nearest_x,nearest_y)>footprint_radius:
+                    continue
+                for dz in range(minimum_vertical_offset,maximum_vertical_offset+1):
+                    voxel_bottom=(dz-0.5)*voxel_size
+                    voxel_top=(dz+0.5)*voxel_size
+                    if voxel_top>float(self.vehicle_min[2]) and voxel_bottom<float(self.vehicle_max[2]):
+                        footprint_offsets.append((dx,dy,dz))
+        if not footprint_offsets:
+            raise RuntimeError("Vehicle collision geometry produced an empty voxel footprint.")
+
+        unknown_x=[voxel[0] for voxel in relevant_unknown]
+        unknown_y=[voxel[1] for voxel in relevant_unknown]
+        minimum_x=min(min(unknown_x)-max_updates,current_voxel[0]-1)
+        maximum_x_index=max(max(unknown_x)+max_updates,current_voxel[0]+1)
+        minimum_y=min(min(unknown_y)-max_updates,current_voxel[1]-1)
+        maximum_y_index=max(max(unknown_y)+max_updates,current_voxel[1]+1)
+
+        x_count=maximum_x_index-minimum_x+1
+        y_count=maximum_y_index-minimum_y+1
+        minimum_dx=min(offset[0] for offset in footprint_offsets)
+        maximum_dx=max(offset[0] for offset in footprint_offsets)
+        minimum_dy=min(offset[1] for offset in footprint_offsets)
+        maximum_dy=max(offset[1] for offset in footprint_offsets)
+        minimum_dz=min(offset[2] for offset in footprint_offsets)
+        maximum_dz=max(offset[2] for offset in footprint_offsets)
+        query_minimum_x=minimum_x+minimum_dx
+        query_maximum_x=maximum_x_index+maximum_dx
+        query_minimum_y=minimum_y+minimum_dy
+        query_maximum_y=maximum_y_index+maximum_dy
+        query_minimum_z=candidate_z+minimum_dz
+        query_maximum_z=candidate_z+maximum_dz
+        query_x_count=query_maximum_x-query_minimum_x+1
+        query_y_count=query_maximum_y-query_minimum_y+1
+        query_z_count=query_maximum_z-query_minimum_z+1
+        region_cell_count=query_x_count*query_y_count*query_z_count
+        if region_cell_count>self.max_vp_voxels:
+            raise RuntimeError(
+                f"Vantage search region contains {region_cell_count} cells, reduce max_updates or split the unknown path region.")
+
+        region_indices=[
+            (x,y,z)
+            for x in range(query_minimum_x,query_maximum_x+1)
+            for y in range(query_minimum_y,query_maximum_y+1)
+            for z in range(query_minimum_z,query_maximum_z+1)
+        ]
+        region_states=self.worldmodel.get_voxel_states(region_indices)
+        known_free=np.fromiter(
+            (voxel_state==0 for voxel_state in region_states),
+            dtype=bool,
+            count=region_cell_count,
+        ).reshape(query_x_count,query_y_count,query_z_count)
+
+        fits_vehicle=np.ones((x_count,y_count),dtype=bool)
+        for dx,dy,dz in footprint_offsets:
+            x_start=minimum_x+dx-query_minimum_x
+            y_start=minimum_y+dy-query_minimum_y
+            z_index=candidate_z+dz-query_minimum_z
+            fits_vehicle &= known_free[
+                x_start:x_start+x_count,
+                y_start:y_start+y_count,
+                z_index,
+            ]
+
+        current_local=(current_voxel[0]-minimum_x,current_voxel[1]-minimum_y)
+        if not fits_vehicle[current_local]:
+            return set()
+
+        connectivity=np.array([[0,1,0],[1,1,1],[0,1,0]],dtype=np.uint8)
+        connected_regions,_=label(fits_vehicle,structure=connectivity)
+        current_region=connected_regions[current_local]
+        reachable=connected_regions==current_region
+
+        reachable_candidates=np.argwhere(fits_vehicle & reachable)
+        candidate_voxels=np.column_stack((
+            reachable_candidates[:,0]+minimum_x,
+            reachable_candidates[:,1]+minimum_y,
+            np.full(len(reachable_candidates),candidate_z,dtype=np.int64),
+        ))
+        unknown_tree=cKDTree(np.asarray(list(relevant_unknown),dtype=np.float64)*voxel_size)
+        distance_to_unknown,_=unknown_tree.query(candidate_voxels.astype(np.float64)*voxel_size,k=1)
+        observation_radius=max_updates*voxel_size
+        candidates=candidate_voxels[distance_to_unknown<=observation_radius]
+        return {
+            (int(x),int(y),int(z))
+            for x,y,z in candidates
+        }
 
     def _px4_callback(self,msg:PoseStamped):
         self.px4_pose=msg
