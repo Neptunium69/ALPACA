@@ -1,5 +1,8 @@
 from dataclasses import fields
-from importlib.resources import files
+try:
+    from importlib.resources import files
+except ImportError:
+    from importlib_resources import files
 
 from ...dataclasses import FCExecute
 from ...vatools import VAInterface

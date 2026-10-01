@@ -1,4 +1,7 @@
-from importlib.resources import files
+try:
+    from importlib.resources import files
+except ImportError:
+    from importlib_resources import files
 
 import rospy
 from std_msgs.msg import String

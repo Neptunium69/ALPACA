@@ -72,10 +72,20 @@ class RiskCal():
         self.vainterface=vainterface
         self.occupied_confidence_threshold=0.1
         self.occupied_route_threshold=0.20
-        self.information_route_threshold=0.5
+        self.information_route_threshold=0.75
         self.minimum_persistent_occupied_voxels=1
         self.maximum_vantage_candidates=32
         self.maximum_vantage_evaluation_seconds=30.0
+        self.vantage_prediction_speed=0.3
+
+    def _vantage_reward(self,position:Position,observable_voxels:set[tuple[int,int,int]],total_unknown_value:float,path_distance:float,observation_probability:float)->tuple[float,float]:
+        """Range-based visibility, uniform route weights, uncertainty and predicted novelty."""
+        observations=self.model.get_voxel_states_and_scores(list(observable_voxels))
+        uncertainty=sum(1.0 if observation is None else max(0.0,1.0-2.0*abs(observation[1]-0.5)) for observation in observations)
+        novelty=self.model.get_observation_novelty(position,arrival_seconds=path_distance/self.vantage_prediction_speed)
+        reward=observation_probability*novelty*uncertainty/total_unknown_value if total_unknown_value>0 else 0.0
+        return reward,novelty
+
     def checkcmd(self,command:Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->dict[str,Any]:
         state=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data
         safe,reason=self._hardsafetyfilter(command,state,destination,orientation,frame_id)
@@ -331,7 +341,7 @@ class RiskCal():
                     if distance<=sensor_range:
                         observable_voxels.add(unknown_voxel)
 
-                information_reward=observation_probability*(len(observable_voxels)/total_unknown_value)
+                information_reward,novelty=self._vantage_reward(vantage_position,observable_voxels,total_unknown_value,vantage_prediction.distance,observation_probability)
                 path_cost=distance_cost_weight*(vantage_prediction.distance/reference_distance)
                 profit=information_reward-path_cost
                 options.append({
@@ -341,6 +351,8 @@ class RiskCal():
                     "Path Distance":vantage_prediction.distance,
                     "Observable Voxels":observable_voxels,
                     "Information Reward":information_reward,
+                    "Observation Novelty":novelty,
+                    "Observation Correlation":1.0-novelty,
                     "Path Cost":path_cost,
                     "Profit":profit,
                 })

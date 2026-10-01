@@ -232,6 +232,8 @@ class UGVAdapter(VehicleAdapter):
             raise TypeError("pathvoxel must be a PathVoxelAssessment.")
         if not pathvoxel.unknown_voxels:
             return set()
+        if self.riskcal is None:
+            raise RuntimeError("Vantage search requires the destination risk settings.")
 
         voxel_size=self.worldmodel.get_voxel_size()
         state=self.get_state()
@@ -275,7 +277,9 @@ class UGVAdapter(VehicleAdapter):
         half_voxel=voxel_size/2.0
 
         maximum_horizontal_offset=int(np.ceil((footprint_radius+half_voxel)/voxel_size))
-        minimum_vertical_offset=int(np.floor(float(self.vehicle_min[2])/voxel_size-0.5))
+        occupancy_min=self.vehicle_min.copy()
+        occupancy_min[2]+=0.03
+        minimum_vertical_offset=int(np.floor(float(occupancy_min[2])/voxel_size-0.5))
         maximum_vertical_offset=int(np.ceil(float(self.vehicle_max[2])/voxel_size+0.5))
         footprint_offsets=[]
         for dx in range(-maximum_horizontal_offset,maximum_horizontal_offset+1):
@@ -287,7 +291,7 @@ class UGVAdapter(VehicleAdapter):
                 for dz in range(minimum_vertical_offset,maximum_vertical_offset+1):
                     voxel_bottom=(dz-0.5)*voxel_size
                     voxel_top=(dz+0.5)*voxel_size
-                    if voxel_top>float(self.vehicle_min[2]) and voxel_bottom<float(self.vehicle_max[2]):
+                    if voxel_top>float(occupancy_min[2]) and voxel_bottom<float(self.vehicle_max[2]):
                         footprint_offsets.append((dx,dy,dz))
         if not footprint_offsets:
             raise RuntimeError("Vehicle collision geometry produced an empty voxel footprint.")
@@ -327,30 +331,32 @@ class UGVAdapter(VehicleAdapter):
             for y in range(query_minimum_y,query_maximum_y+1)
             for z in range(query_minimum_z,query_maximum_z+1)
         ]
-        region_states=self.worldmodel.get_voxel_states(region_indices)
-        known_free=np.fromiter(
-            (voxel_state==0 for voxel_state in region_states),
+        region_observations=self.worldmodel.get_voxel_states_and_scores(region_indices)
+        persistent_occupied=np.fromiter(
+            (observation is not None and observation[0]==1 and observation[1]>=self.riskcal.occupied_confidence_threshold for observation in region_observations),
             dtype=bool,
             count=region_cell_count,
         ).reshape(query_x_count,query_y_count,query_z_count)
 
-        fits_vehicle=np.ones((x_count,y_count),dtype=bool)
+        occupied_counts=np.zeros((x_count,y_count),dtype=np.int32)
         for dx,dy,dz in footprint_offsets:
             x_start=minimum_x+dx-query_minimum_x
             y_start=minimum_y+dy-query_minimum_y
             z_index=candidate_z+dz-query_minimum_z
-            fits_vehicle &= known_free[
+            occupied_counts += persistent_occupied[
                 x_start:x_start+x_count,
                 y_start:y_start+y_count,
                 z_index,
             ]
 
+        fits_vehicle=occupied_counts<self.riskcal.minimum_persistent_occupied_voxels
         current_local=(current_voxel[0]-minimum_x,current_voxel[1]-minimum_y)
         if not fits_vehicle[current_local]:
             return set()
 
         connectivity=np.array([[0,1,0],[1,1,1],[0,1,0]],dtype=np.uint8)
-        connected_regions,_=label(fits_vehicle,structure=connectivity)
+        connected_regions=np.zeros(fits_vehicle.shape,dtype=np.int32)
+        label(fits_vehicle,structure=connectivity,output=connected_regions)
         current_region=connected_regions[current_local]
         reachable=connected_regions==current_region
 
@@ -412,6 +418,9 @@ class UGVAdapter(VehicleAdapter):
         voxel_frame.grid_origin.x=self.roi_min[0]
         voxel_frame.grid_origin.y=self.roi_min[1]
         voxel_frame.grid_origin.z=self.roi_min[2]
+        voxel_frame.sensor_position.x=float(self.lidar_origin_world[0])
+        voxel_frame.sensor_position.y=float(self.lidar_origin_world[1])
+        voxel_frame.sensor_position.z=float(self.lidar_origin_world[2])
         voxel_frame.source_id="UGV LiDAR"
 
         self.voxel_publisher.publish(voxel_frame)

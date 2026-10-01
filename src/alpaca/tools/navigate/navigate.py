@@ -1,5 +1,8 @@
 import math
-from importlib.resources import files
+try:
+    from importlib.resources import files
+except ImportError:
+    from importlib_resources import files
 
 from ... import vehicleadapter as va
 from ...dataclasses import FCExecute

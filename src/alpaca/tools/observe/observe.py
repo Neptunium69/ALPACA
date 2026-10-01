@@ -1,5 +1,8 @@
 import os
-from importlib.resources import files
+try:
+    from importlib.resources import files
+except ImportError:
+    from importlib_resources import files
 from pathlib import Path
 
 import cv2
