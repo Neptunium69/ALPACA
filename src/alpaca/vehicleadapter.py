@@ -102,6 +102,8 @@ class UGVAdapter(VehicleAdapter):
         self.stopped=False
         self.vehicle_min = np.array([-0.15, -0.17, -0.25])
         self.vehicle_max = np.array([0.15, 0.17, 0.0])
+        self.hiddenpoint_neighbourhood_radius=0.5
+        self.maximum_nearby_occupied_voxels=5
         self.height_margin = 0.05
         self.search_offset = np.array([0.30, 0.30, 0.05])
         self.roi_min = self.vehicle_min - self.search_offset
@@ -910,8 +912,23 @@ class UGVAdapter(VehicleAdapter):
             posnews.append(object_values+vector)
 
         posnewer=[]
-        
+        if self.riskcal is None:
+            raise RuntimeError("Hidden-point filtering requires the destination risk settings.")
+        voxel_size=self.worldmodel.get_voxel_size()
+        radius=self.hiddenpoint_neighbourhood_radius
+        minimum_z=float(position[2]+self.vehicle_min[2]+0.03)
+        maximum_z=float(position[2]+self.vehicle_max[2])
         for pos in posnews:
+            lower=np.array(self.worldmodel.world_position_to_voxel(Position(x=float(pos[0]-radius),y=float(pos[1]-radius),z=minimum_z)),dtype=np.int64)
+            upper=np.array(self.worldmodel.world_position_to_voxel(Position(x=float(pos[0]+radius),y=float(pos[1]+radius),z=maximum_z)),dtype=np.int64)
+            indices=np.indices(tuple(upper-lower+1)).reshape(3,-1).T+lower
+            lower_center=self.worldmodel.voxel_to_position((int(lower[0]),int(lower[1]),int(lower[2])))
+            centers=np.array([lower_center.x,lower_center.y,lower_center.z])+(indices-lower)*voxel_size
+            inside=(np.sum((centers[:,:2]-pos)**2,axis=1)<=radius**2)&(centers[:,2]>=minimum_z)&(centers[:,2]<=maximum_z)
+            observations=self.worldmodel.get_voxel_states_and_scores([(int(x),int(y),int(z)) for x,y,z in indices[inside]])
+            occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.riskcal.occupied_confidence_threshold for observation in observations)
+            if occupied_count>=self.maximum_nearby_occupied_voxels:
+                continue
             posnewer.append(Position(x=float(pos[0]),y=float(pos[1]),z=float(state.data["position"].z)))
 
         return posnewer

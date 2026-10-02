@@ -153,13 +153,18 @@ class VLMInterface():
         self.state=1
         self.steps=0
         if self.toolexe is None: raise ValueError("Tool executor is None.")
+        tool_prompts=[]
+        for specification in self.toolexe.toolist.getallspec():
+            schema={"command_type":specification.name.casefold(),"tag":specification.tag,"arguments":[asdict(argument) for argument in specification.arguments]}
+            tool_prompts.append(f"## Tool: {specification.name}\n\nTool schema (reference only): {json.dumps(schema,ensure_ascii=False)}\n\n{specification.description.strip()}")
+        self.system_prompt_master_full="\n\n".join([(self.system_prompt_master or "").strip(),*tool_prompts]).strip()
         self._publish_status("mission_started",mission=user_prompt)
         startup_results=self.toolexe.run(json.dumps({"commands":[{
             "id":"mission_startup_query",
             "command_type":"query",
             "arguments":{},
         }]}))
-        self.history=[{"role":"system","content":[{"type":"text","text":self.system_prompt_master}]},
+        self.history=[{"role":"system","content":[{"type":"text","text":self.system_prompt_master_full}]},
             {"role":"user","content":[{"type":"text","text":user_prompt}],},
             {"role":"user","content":[{"type":"text","text":f"World-model query at mission startup:\n{self._dump(startup_results)}"}]},
         ]
@@ -183,7 +188,7 @@ class VLMInterface():
                 },
                 *self.history,
                 {"role":"user",
-                "content":[{"type":"text","text":f"Current plan:\n{plan}\n\nReturn the next structured commands."}],
+                "content":[{"type":"text","text":f"Current plan:\n{plan}\n\nReturn the next commands as one raw JSON object. Start with {{ and end with }}. Do not copy formatting from the plan or examples: no Markdown, backticks, code fences, json language label, or text outside the object."}],
                 },
             ]
             cmdjson=self._predict(act_messages,max_tok=self.max_tok,stage="action")
@@ -206,7 +211,7 @@ class VLMInterface():
                     self._publish_status("command_rejected",error=str(error))
                     self._log_dialogue("command_rejected",raw_response=cmdjson,error=str(error))
                     self.history.append({"role":"assistant","content":[{"type":"text","text":cmdjson}]})
-                    self.history.append({"role":"user","content":[{"type":"text","text":f"Command rejected: {error}. Return corrected raw JSON only."}]})
+                    self.history.append({"role":"user","content":[{"type":"text","text":f"Command rejected: {error}. Return a corrected raw JSON object starting with {{ and ending with }}. Remove all surrounding Markdown, backticks, code fences, language labels, and explanatory text. Do not repeat a wrapped response."}]})
                     continue
             else:
                 raise ValueError("Tool executor is None.")

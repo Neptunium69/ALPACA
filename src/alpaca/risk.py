@@ -72,7 +72,7 @@ class RiskCal():
         self.vainterface=vainterface
         self.occupied_confidence_threshold=0.1
         self.occupied_route_threshold=0.20
-        self.information_route_threshold=0.75
+        self.information_route_threshold=0.6
         self.minimum_persistent_occupied_voxels=1
         self.maximum_vantage_candidates=32
         self.maximum_vantage_evaluation_seconds=30.0
