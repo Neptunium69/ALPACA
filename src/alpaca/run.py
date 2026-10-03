@@ -72,10 +72,13 @@ def main():
     log_dir=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
     log_dir.mkdir(parents=True,exist_ok=True)
     observations=worldmodel.Model()
-    model=worldmodel.ObjectWorldModel(observations,["apple","board"])
+    model=worldmodel.WorldModel()
+    object_model=worldmodel.ObjectWorldModel(observations,["apple","board"])
+    voxel_model=worldmodel.LiDARVoxelWorldModel()
+    model.add([object_model,voxel_model])
     adapter=vehicleadapter.UGVAdapter(model,None)
     vainterface=VAInterface(adapter,"primary")
-    rcm=risk.RiskCal(model,vainterface)
+    rcm=risk.RiskCal(voxel_model,vainterface)
     adapter.riskcal=rcm
     detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
     vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
@@ -104,7 +107,7 @@ def main():
 
     # Initialize the stuff that just got initialized
     model.initwm()
-    world_model_log_timer=start_world_model_logging(model,log_dir)
+    world_model_log_timer=start_world_model_logging(object_model,log_dir)
     detector.init_yolo()
     vainterface.execute(FCExecute(function="init_sensordata",arguments={}))
     shutdown_lock=RLock()

@@ -63,7 +63,7 @@ class VehicleAdapter(Protocol):
     registry:VARegistry
 
 class UGVAdapter(VehicleAdapter):
-    def __init__(self, worldmodel: wm.ObjectWorldModel, risk:risk.RiskCal | None=None, **kwargs) -> None:
+    def __init__(self, worldmodel: wm.WorldModel, risk:risk.RiskCal | None=None, **kwargs) -> None:
         self.registry=VARegistry([
             Function(name="init_sensordata",arguments={}),
             Function(name="get_navigation_frame",arguments={}),
@@ -78,7 +78,12 @@ class UGVAdapter(VehicleAdapter):
             Function(name="hiddenpoint",arguments={"object_id":("str",True),"state":("State",True),"distance_behind":("float",False)}),
             Function(name="image",arguments={"targpos":("Position",True),"yaw_margin":("float",False)}),
         ])
-        self.worldmodel=worldmodel
+        objectmodel=worldmodel.get("objects")
+        voxelmodel=worldmodel.get("voxels_master")
+        if not isinstance(objectmodel,wm.ObjectWorldModel) or not isinstance(voxelmodel,wm.VoxelWorldModel):
+            raise TypeError("UGVAdapter requires objects and voxels_master submodels of the appropriate types.")
+        self.objectmodel=objectmodel
+        self.voxelmodel=voxelmodel
         self.riskcal=risk
         self.state_lock=Lock()
         self.client=None
@@ -237,12 +242,12 @@ class UGVAdapter(VehicleAdapter):
         if self.riskcal is None:
             raise RuntimeError("Vantage search requires the destination risk settings.")
 
-        voxel_size=self.worldmodel.get_voxel_size()
+        voxel_size=self.voxelmodel.get_voxel_size()
         state=self.get_state()
         position=state.data.get("position")
         if not isinstance(position,Position):
             raise RuntimeError("Vehicle position is unavailable.")
-        current_voxel=self.worldmodel.world_position_to_voxel(position)
+        current_voxel=self.voxelmodel.world_position_to_voxel(position)
         candidate_z=current_voxel[2]
 
         remaining=set(pathvoxel.unknown_voxels)
@@ -333,7 +338,7 @@ class UGVAdapter(VehicleAdapter):
             for y in range(query_minimum_y,query_maximum_y+1)
             for z in range(query_minimum_z,query_maximum_z+1)
         ]
-        region_observations=self.worldmodel.get_voxel_states_and_scores(region_indices)
+        region_observations=self.voxelmodel.get_voxel_states_and_scores(region_indices)
         persistent_occupied=np.fromiter(
             (observation is not None and observation[0]==1 and observation[1]>=self.riskcal.occupied_confidence_threshold for observation in region_observations),
             dtype=bool,
@@ -887,7 +892,7 @@ class UGVAdapter(VehicleAdapter):
             raise ValueError("distance_behind must be finite and positive.")
         if not np.all(np.isfinite(position)):
             raise ValueError("Vehicle position must contain only finite values.")    
-        matches=self.worldmodel.query_world(object_id)
+        matches=self.objectmodel.query_world(object_id)
         if not matches:
             raise KeyError(f"Object {object_id!r} does not exist in the current world model.")
         if len(matches)>1:
@@ -914,18 +919,18 @@ class UGVAdapter(VehicleAdapter):
         posnewer=[]
         if self.riskcal is None:
             raise RuntimeError("Hidden-point filtering requires the destination risk settings.")
-        voxel_size=self.worldmodel.get_voxel_size()
+        voxel_size=self.voxelmodel.get_voxel_size()
         radius=self.hiddenpoint_neighbourhood_radius
         minimum_z=float(position[2]+self.vehicle_min[2]+0.03)
         maximum_z=float(position[2]+self.vehicle_max[2])
         for pos in posnews:
-            lower=np.array(self.worldmodel.world_position_to_voxel(Position(x=float(pos[0]-radius),y=float(pos[1]-radius),z=minimum_z)),dtype=np.int64)
-            upper=np.array(self.worldmodel.world_position_to_voxel(Position(x=float(pos[0]+radius),y=float(pos[1]+radius),z=maximum_z)),dtype=np.int64)
+            lower=np.array(self.voxelmodel.world_position_to_voxel(Position(x=float(pos[0]-radius),y=float(pos[1]-radius),z=minimum_z)),dtype=np.int64)
+            upper=np.array(self.voxelmodel.world_position_to_voxel(Position(x=float(pos[0]+radius),y=float(pos[1]+radius),z=maximum_z)),dtype=np.int64)
             indices=np.indices(tuple(upper-lower+1)).reshape(3,-1).T+lower
-            lower_center=self.worldmodel.voxel_to_position((int(lower[0]),int(lower[1]),int(lower[2])))
+            lower_center=self.voxelmodel.voxel_to_position((int(lower[0]),int(lower[1]),int(lower[2])))
             centers=np.array([lower_center.x,lower_center.y,lower_center.z])+(indices-lower)*voxel_size
             inside=(np.sum((centers[:,:2]-pos)**2,axis=1)<=radius**2)&(centers[:,2]>=minimum_z)&(centers[:,2]<=maximum_z)
-            observations=self.worldmodel.get_voxel_states_and_scores([(int(x),int(y),int(z)) for x,y,z in indices[inside]])
+            observations=self.voxelmodel.get_voxel_states_and_scores([(int(x),int(y),int(z)) for x,y,z in indices[inside]])
             occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.riskcal.occupied_confidence_threshold for observation in observations)
             if occupied_count>=self.maximum_nearby_occupied_voxels:
                 continue
@@ -942,7 +947,7 @@ class UGVAdapter(VehicleAdapter):
             raise ValueError("distance_behind must be finite and positive.")
         if not np.all(np.isfinite(position)):
             raise ValueError("Vehicle position must contain only finite values.")    
-        matches=self.worldmodel.query_world(object_id)
+        matches=self.objectmodel.query_world(object_id)
         if not matches:
             raise KeyError(f"Object {object_id!r} does not exist in the current world model.")
         if len(matches)>1:

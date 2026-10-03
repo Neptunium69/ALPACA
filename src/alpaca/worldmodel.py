@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 from copy import deepcopy
 from threading import RLock
 import rospy
 import numpy as np
+import warnings
 from scipy.spatial.transform import Rotation
 import message_filters
 from .dataclasses import Function
@@ -83,22 +84,59 @@ class VoxelModel:
     grid_origin: Position | None = None
     frame_id: str | None = None
 
-class ObjectWorldModel:
-    def __init__(self, observations: Model, detection_classes):
+class WorldModel():
+    def __init__(self) -> None:
+        self.submodels:list[Submodel]=[]
+
+    @property
+    def modelnames(self)->list[str]:
+        return [model.name for model in self.submodels]
+
+    def add(self,models:list[Submodel])->None:
+        for model in models:
+            if model.name not in self.modelnames:
+                self.submodels.append(model)
+            else:
+                warnings.warn(f"Submodel {model.name} was not added as another submodel of the same name is already in the World Model.")
+
+    def get(self,name:str)->Submodel:
+        for model in self.submodels:
+            if model.name==name:
+                return model
+        raise KeyError(f"No submodel named {name!r} exists.")
+
+    def remove(self,name:str)->None:
+        self.submodels.remove(self.get(name))
+
+    def initwm(self)->None:
+        for model in self.submodels:
+            model.initwm()
+
+class Submodel(Protocol):
+    name: str
+    registry: WMRegistry
+
+    def initwm(self)->None: ...
+
+class VoxelWorldModel(Submodel):
+    """Sensor-independent voxel storage, spatial queries and observation activity."""
+    def __init__(self,name:str="voxels_master"):
+        self.name=name
         self.registry=WMRegistry([
-            Function(name="query_world",arguments={"object_id":("str",False),"class_name":("str",False)}),
-            Function(name="write",arguments={"world_object":("Object",True)}),
-            Function(name="bounding_box_to_world",arguments={"bounding_box":("list",True)}),
-            Function(name="get_detection_classes",arguments={}),
-            Function(name="record",arguments={}),
-            Function(name="stop_record",arguments={}),
+            Function(name="get_observation_novelty",arguments={"position":("Position",True),"arrival_seconds":("float",False)}),
+            Function(name="get_voxel_map_frame",arguments={}),
+            Function(name="get_voxel_size",arguments={}),
+            Function(name="world_position_to_voxel",arguments={"position":("Position",True)}),
+            Function(name="voxel_to_position",arguments={"index":("tuple",True)}),
+            Function(name="get_voxel_states",arguments={"indices":("list",True)}),
+            Function(name="get_voxel_states_and_scores",arguments={"indices":("list",True)}),
+            Function(name="get_vehicle_voxels",arguments={"vehicle_pose":("Odometry",True),"vehicle_min":("ndarray",True),"vehicle_max":("ndarray",True)}),
+            Function(name="get_vehicle_voxels_at_pose",arguments={"position":("Position",True),"orientation":("Orientation",True),"vehicle_min":("ndarray",True),"vehicle_max":("ndarray",True)}),
+            Function(name="get_unknown_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
+            Function(name="get_filled_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
+            Function(name="get_empty_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
         ])
-        self.observations = observations
-        self.observationstemp=Model()
-        self._last_detection_stamp=None
-        self.detection_classes = tuple(detection_classes)
         self.voxelmap = VoxelModel(voxelsize=float("nan"), voxels=[], grid_origin=None, frame_id=None)
-        self.association_distance=0.3
         self._voxel_lookup: dict[tuple[int,int,int],Voxel]={}
         # Separate, coarser voxel layer: observation origins are not occupancy evidence.
         self._observation_field: dict[tuple[int,int,int],ObservationActivity]={}
@@ -107,64 +145,218 @@ class ObjectWorldModel:
         self.activity_decay_seconds=30.0
         self.activity_increment=0.1
         self.correlation_strength=1.0
-        self.voxel_learning_rate=0.25
-        self.maximum_voxel_rawscore=4.0
-        self.voxel_unknown_margin=0.2
-        self._last_voxel_stamps: dict[str,int]={}
-        self._bridge = CvBridge()
-        self._latest_frame=None
-        self._latest_depth=None
-        self._lock = RLock()
-        self._startstate=None
+        self._lock=RLock()
 
-    def initwm(self):
-        # Automatic world model updater
-        log_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
-        log_directory.mkdir(parents=True,exist_ok=True)
-        self.confirmation_logger=logging.getLogger(f"alpaca.worldmodel.confirmations.{id(self)}")
-        self.confirmation_logger.setLevel(logging.INFO)
-        self.confirmation_logger.propagate=False
-        handler=logging.FileHandler(log_directory/"world_model.log",encoding="utf-8")
-        handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
-        self.confirmation_logger.addHandler(handler)
-        self.detection_subscriber=message_filters.Subscriber("detections", ObservationFrame)
-        self.depth_subscriber=message_filters.Subscriber("camera_depth", Image)
-        self.voxel_subscriber=rospy.Subscriber("voxel_observations",SpatialObservationFrame,callback=self._voxel_callback)
-        self.synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.detection_subscriber], queue_size=60, slop=0.05)
-        self.synchronizer.registerCallback(self._update_callback)
+    def initwm(self)->None:
+        """The base voxel model has no sensor subscriptions."""
+        pass
 
     @staticmethod
     def sigmoid(x):
         return 1/(1+e**-x)
 
-    def _update_callback(self, depth, detections):
-        try:
-            detection_list=detections.detections
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
-            rospy.logerr("Invalid detection message: %s", error)
-            return
+    def _observation_activity(self,position:Position,now:float,deposit:bool=False)->float:
+        """Read decayed activity, optionally depositing one scan afterward. Caller holds _lock."""
+        point=np.array([position.x,position.y,position.z],dtype=np.float64)
+        radius=3.0*self.activity_radius
+        lower=np.floor((point-radius)/self.activity_voxel_size).astype(np.int64)
+        upper=np.floor((point+radius)/self.activity_voxel_size).astype(np.int64)
+        indices=np.indices(tuple(upper-lower+1)).reshape(3,-1).T+lower
+        distances_squared=np.sum(((indices+0.5)*self.activity_voxel_size-point)**2,axis=1)
+        inside=distances_squared<=radius**2
+        indices=indices[inside]
+        weights=np.exp(-distances_squared[inside]/(2.0*self.activity_radius**2))
+        activity=0.0
+        for index,weight in zip(indices,weights):
+            key=(int(index[0]),int(index[1]),int(index[2]))
+            cell=self._observation_field.get(key)
+            decayed=0.0 if cell is None else cell.score*math.exp(-max(0.0,now-cell.last_update)/self.activity_decay_seconds)
+            activity+=float(weight)*decayed
+            if deposit:
+                self._observation_field[key]=ObservationActivity(score=decayed+self.activity_increment*float(weight),last_update=now)
+        return activity/float(weights.sum()) if weights.size else 0.0
+
+    def get_observation_novelty(self,position:Position,arrival_seconds:float=0.0)->float:
+        """Predict novelty without changing the field or its timestamps."""
+        if not all(math.isfinite(value) for value in (position.x,position.y,position.z,arrival_seconds)) or arrival_seconds<0:
+            raise ValueError("Observation position and non-negative arrival time must be finite.")
+        with self._lock:
+            activity=self._observation_activity(position,time.monotonic()+arrival_seconds)
+            return math.exp(-self.correlation_strength*activity)
+
+    def position_to_voxel(self,position: np.ndarray,grid_origin: np.ndarray,voxel_size:float) -> tuple[int,int,int]:
+        index=np.floor((position-grid_origin)/voxel_size).astype(np.int32)
+        return int(index[0]),int(index[1]),int(index[2])
+
+    def get_vehicle_voxels(self,vehicle_pose:Odometry,vehicle_min: np.ndarray,vehicle_max: np.ndarray)->list[tuple[int,int,int]]:
+        """Obtain the current occupied voxels of the vehicle"""
+        if vehicle_pose is None:
+            raise ValueError("Vehicle pose has not been initialized.")
+        pose=vehicle_pose.pose.pose
+        translation=np.array([pose.position.x,pose.position.y,pose.position.z],dtype=np.float64)
+        quaternion=np.array([pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w],dtype=np.float64)
+        if not np.all(np.isfinite(translation)) or not np.all(np.isfinite(quaternion)) or np.linalg.norm(quaternion)==0:
+            raise ValueError("Vehicle pose must contain a finite position and a non-zero finite quaternion.")
+        rotation=Rotation.from_quat(quaternion).as_matrix()
+        return self._get_vehicle_voxels_from_transform(translation,rotation,vehicle_min,vehicle_max)
+
+    def get_vehicle_voxels_at_pose(self,position:Position,orientation:Orientation,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
+        """Obtain the vehicle's occupied voxels at a given pose."""
+        pose_values=np.array([position.x,position.y,position.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
+        if not np.all(np.isfinite(pose_values)):
+            raise ValueError("Target position and orientation must contain only finite values.")
+        translation=pose_values[:3]
+        rotation=Rotation.from_euler("xyz",[orientation.roll,orientation.pitch,orientation.yaw]).as_matrix()
+        return self._get_vehicle_voxels_from_transform(translation,rotation,vehicle_min,vehicle_max)
+
+    def _get_vehicle_voxels_from_transform(self,translation:np.ndarray,rotation:np.ndarray,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
+        """Obtaine the vehicle's occupied voxels after performing a transformation."""
+        vehicle_min=np.asarray(vehicle_min,dtype=np.float64)
+        vehicle_max=np.asarray(vehicle_max,dtype=np.float64)
+        if vehicle_min.shape!=(3,) or vehicle_max.shape!=(3,) or not np.all(np.isfinite(vehicle_min)) or not np.all(np.isfinite(vehicle_max)) or np.any(vehicle_min>=vehicle_max):
+            raise ValueError("Invalid vehicle dimensions.")
+        translation=np.asarray(translation,dtype=np.float64)
+        rotation=np.asarray(rotation,dtype=np.float64)
+        if translation.shape!=(3,) or rotation.shape!=(3,3) or not np.all(np.isfinite(translation)) or not np.all(np.isfinite(rotation)):
+            raise ValueError("Invalid vehicle pose transform.")
 
         with self._lock:
-            stamp=detections.header.stamp.to_nsec()
-            if self._last_detection_stamp is not None and stamp<=self._last_detection_stamp:
-                if detection_list:
-                    rospy.loginfo("World-model rejected old frame: stamp_ns=%d last_stamp_ns=%d",stamp,self._last_detection_stamp)
-                return
-            self._latest_frame=detections
-            self._latest_depth=depth
-            try:
-                working_objects = deepcopy(self.observations.objects)
-                working_temp=deepcopy(self.observationstemp.objects)
-                self._apply_detections(working_objects, detection_list, detections, depth, working_temp)
-            except Exception as error:
-                rospy.logerr("World-model update failed: %s", error)
-                return
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=self.voxelmap.grid_origin
 
-            self.observations.objects[:] = working_objects
-            self.observationstemp.objects[:]=working_temp
-            self._last_detection_stamp=stamp
-            if detection_list or working_temp:
-                self.confirmation_logger.info("World-model confirmation: %s",json.dumps({"stamp_ns":stamp,"detections":len(detection_list),"confirmed_ids":[obj.id for obj in working_objects],"temporary":[{"id":obj.id,"position":[obj.position.x,obj.position.y,obj.position.z],"history":obj.detection_history} for obj in working_temp]}))
+        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+            raise ValueError("Voxel grid has not been initialized.")
+
+        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+
+        body_corners=np.array([[x,y,z] for x in (vehicle_min[0],vehicle_max[0]) for y in (vehicle_min[1],vehicle_max[1]) for z in (vehicle_min[2],vehicle_max[2])],dtype=np.float64)
+        world_corners=body_corners@rotation.T+translation
+        minimum_index=np.floor((world_corners.min(axis=0)-origin)/voxel_size).astype(np.int64)
+        maximum_index=np.ceil((world_corners.max(axis=0)-origin)/voxel_size).astype(np.int64)
+
+        voxel_half_extent=np.full(3,voxel_size/2.0,dtype=np.float64)
+        body_frame_padding=np.abs(rotation.T)@voxel_half_extent
+        indices=[]
+
+        for x in range(int(minimum_index[0]),int(maximum_index[0])):
+            for y in range(int(minimum_index[1]),int(maximum_index[1])):
+                for z in range(int(minimum_index[2]),int(maximum_index[2])):
+                    index=(x,y,z)
+                    voxel_center_world=origin+(np.asarray(index,dtype=np.float64)+0.5)*voxel_size
+                    voxel_center_body=rotation.T@(voxel_center_world-translation)
+                    overlaps=np.all(voxel_center_body+body_frame_padding>vehicle_min) and np.all(voxel_center_body-body_frame_padding<vehicle_max)
+                    if overlaps:
+                        indices.append(index)
+
+        return indices
+
+    def get_voxel_map_frame(self)->str | None:
+        with self._lock:
+            return self.voxelmap.frame_id
+
+    def get_voxel_size(self)->float:
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+        if not math.isfinite(voxel_size) or voxel_size<=0:
+            raise ValueError("Voxel grid has not been initialized.")
+        return voxel_size
+
+    def world_position_to_voxel(self,position:Position)->tuple[int,int,int]:
+        """Convert a world-frame position to an index in the active voxel map."""
+        if not isinstance(position,Position):
+            raise TypeError("position must be a Position.")
+        coordinates=np.array([position.x,position.y,position.z],dtype=np.float64)
+        if not np.all(np.isfinite(coordinates)):
+            raise ValueError("World position must contain only finite values.")
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=deepcopy(self.voxelmap.grid_origin)
+        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+            raise ValueError("Voxel map has not been initialized.")
+        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+        return self.position_to_voxel(coordinates,origin,voxel_size)
+
+    def voxel_to_position(self,index:tuple[int,int,int])->Position:
+        if len(index)!=3 or any(not isinstance(component,int) or isinstance(component,bool) for component in index):
+            raise ValueError("Voxel index must contain exactly three integers.")
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=deepcopy(self.voxelmap.grid_origin)
+        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+            raise ValueError("Voxel map has not been initialized.")
+        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+        center=origin+(np.asarray(index,dtype=np.float64)+0.5)*voxel_size
+        return Position(x=float(center[0]),y=float(center[1]),z=float(center[2]))
+
+    def get_voxel_states(self,indices:list[tuple[int,int,int]])->list[int | None]:
+        with self._lock:
+            states=[]
+            for index in indices:
+                voxel=self._voxel_lookup.get(index)
+                states.append(None if voxel is None else voxel.state)
+            return states
+
+    def get_voxel_states_and_scores(self,indices:list[tuple[int,int,int]])->list[tuple[int | None,float] | None]:
+        """Return atomic occupancy state/confidence snapshots for the requested voxels."""
+        with self._lock:
+            return [None if (voxel:=self._voxel_lookup.get(index)) is None else (voxel.state,voxel.score) for index in indices]
+
+    def _get_voxel_regions(self,minimum: Position,maximum: Position)->list[int]:
+        """Return [filled, empty, unknown] voxel counts within a world-frame bounding box."""
+        coordinates=np.array([minimum.x,minimum.y,minimum.z,maximum.x,maximum.y,maximum.z],dtype=np.float64)
+        if not np.all(np.isfinite(coordinates)):
+            raise ValueError("Bounding-box coordinates must be finite.")
+        minimum_array=coordinates[:3]
+        maximum_array=coordinates[3:]
+        if np.any(minimum_array>=maximum_array):
+            raise ValueError("Bounding-box minimum must be smaller than its maximum.")
+
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=self.voxelmap.grid_origin
+            if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+                raise ValueError("Voxel-grid size and origin have not been initialized.")
+
+            origin_array=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+            minimum_index=np.floor((minimum_array-origin_array)/voxel_size).astype(np.int64)
+            maximum_index=np.ceil((maximum_array-origin_array)/voxel_size).astype(np.int64)
+            region_shape=maximum_index-minimum_index
+            total_voxels=int(np.prod(region_shape,dtype=np.int64))
+            known_voxels=[voxel for index,voxel in self._voxel_lookup.items() if minimum_index[0]<=index[0]<maximum_index[0] and minimum_index[1]<=index[1]<maximum_index[1] and minimum_index[2]<=index[2]<maximum_index[2]]
+            filled=sum(voxel.state==1 for voxel in known_voxels)
+            empty=sum(voxel.state==0 for voxel in known_voxels)
+            unknown=total_voxels-filled-empty
+            return [filled,empty,unknown]
+
+    def get_unknown_score(self,minimum:Position,maximum:Position)->float:
+        voxel_regions=self._get_voxel_regions(minimum,maximum)
+        score=voxel_regions[2]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
+        return score
+
+    def get_filled_score(self,minimum:Position,maximum:Position)->float:
+        voxel_regions=self._get_voxel_regions(minimum,maximum)
+        score=voxel_regions[0]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
+        return score
+
+    def get_empty_score(self,minimum:Position,maximum:Position)->float:
+        voxel_regions=self._get_voxel_regions(minimum,maximum)
+        score=voxel_regions[1]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
+        return score
+
+class LiDARVoxelWorldModel(VoxelWorldModel):
+    """Populate a voxel model from the adapter's LiDAR observations."""
+    def __init__(self,name:str="voxels_master",observation_topic:str | None="voxel_observations"):
+        super().__init__(name=name)
+        self.observation_topic=observation_topic
+        self.voxel_subscriber=None
+        self.voxel_learning_rate=0.25
+        self.maximum_voxel_rawscore=4.0
+        self.voxel_unknown_margin=0.2
+        self._last_voxel_stamps: dict[str,int]={}
+
+    def initwm(self)->None:
+        if self.observation_topic is not None and self.voxel_subscriber is None:
+            self.voxel_subscriber=rospy.Subscriber(self.observation_topic,SpatialObservationFrame,callback=self._voxel_callback)
 
     def _voxel_callback(self, message: SpatialObservationFrame):
         voxel_size=float(message.voxel_size)
@@ -234,34 +426,109 @@ class ObjectWorldModel:
                 self._observation_activity(sensor_position,now,deposit=True)
                 self._last_voxel_stamps[message.source_id]=stamp
 
-    def _observation_activity(self,position:Position,now:float,deposit:bool=False)->float:
-        """Read decayed activity, optionally depositing one scan afterward. Caller holds _lock."""
-        point=np.array([position.x,position.y,position.z],dtype=np.float64)
-        radius=3.0*self.activity_radius
-        lower=np.floor((point-radius)/self.activity_voxel_size).astype(np.int64)
-        upper=np.floor((point+radius)/self.activity_voxel_size).astype(np.int64)
-        indices=np.indices(tuple(upper-lower+1)).reshape(3,-1).T+lower
-        distances_squared=np.sum(((indices+0.5)*self.activity_voxel_size-point)**2,axis=1)
-        inside=distances_squared<=radius**2
-        indices=indices[inside]
-        weights=np.exp(-distances_squared[inside]/(2.0*self.activity_radius**2))
-        activity=0.0
-        for index,weight in zip(indices,weights):
-            key=(int(index[0]),int(index[1]),int(index[2]))
-            cell=self._observation_field.get(key)
-            decayed=0.0 if cell is None else cell.score*math.exp(-max(0.0,now-cell.last_update)/self.activity_decay_seconds)
-            activity+=float(weight)*decayed
-            if deposit:
-                self._observation_field[key]=ObservationActivity(score=decayed+self.activity_increment*float(weight),last_update=now)
-        return activity/float(weights.sum()) if weights.size else 0.0
+    def _lidar_transform(self,observation: ObservationFrame,flag: int=0)->np.ndarray:
+        """Return the body-to-world transform or its inverse for body-frame LiDAR points."""
+        pose=observation.vehicle_pose.pose.pose
+        q_WB=pose.orientation
 
-    def get_observation_novelty(self,position:Position,arrival_seconds:float=0.0)->float:
-        """Predict novelty without changing the field or its timestamps."""
-        if not all(math.isfinite(value) for value in (position.x,position.y,position.z,arrival_seconds)) or arrival_seconds<0:
-            raise ValueError("Observation position and non-negative arrival time must be finite.")
+        T_WB=np.eye(4,dtype=float)
+        T_WB[:3,:3]=Rotation.from_quat([q_WB.x,q_WB.y,q_WB.z,q_WB.w]).as_matrix()
+        T_WB[:3,3]=[pose.position.x,pose.position.y,pose.position.z]
+
+        if flag==0:
+            return T_WB
+        if flag==1:
+            return np.linalg.inv(T_WB)
+
+        raise ValueError("flag must be 0 for body-to-world or 1 for world-to-body")
+
+    def w2l(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
+        """Convert a world-frame point to the LiDAR cloud's body frame."""
+        position=np.append(np.asarray(position,dtype=float),1.0)
+        transform=self._lidar_transform(frame,1)
+        newpos=transform@position
+        return newpos[:3]
+
+    def l2w(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
+        """Convert a body-frame LiDAR cloud point to the world frame."""
+        position=np.append(np.asarray(position,dtype=float),1.0)
+        transform=self._lidar_transform(frame,0)
+        newpos=transform@position
+        return newpos[:3]
+
+class ObjectWorldModel(Submodel):
+    def __init__(self, observations: Model, detection_classes, name:str="objects"):
+        self.name=name
+        self.registry=WMRegistry([
+            Function(name="query_world",arguments={"object_id":("str",False),"class_name":("str",False)}),
+            Function(name="write",arguments={"world_object":("Object",True)}),
+            Function(name="bounding_box_to_world",arguments={"bounding_box":("list",True)}),
+            Function(name="get_detection_classes",arguments={}),
+            Function(name="record",arguments={}),
+            Function(name="stop_record",arguments={}),
+        ])
+        self.observations = observations
+        self.observationstemp=Model()
+        self._last_detection_stamp=None
+        self.detection_classes = tuple(detection_classes)
+        self.association_distance=0.3
+        self._bridge = CvBridge()
+        self._latest_frame=None
+        self._latest_depth=None
+        self._lock = RLock()
+        self._startstate=None
+
+
+    def initwm(self):
+        # Automatic world model updater
+        log_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
+        log_directory.mkdir(parents=True,exist_ok=True)
+        self.confirmation_logger=logging.getLogger(f"alpaca.worldmodel.confirmations.{id(self)}")
+        self.confirmation_logger.setLevel(logging.INFO)
+        self.confirmation_logger.propagate=False
+        handler=logging.FileHandler(log_directory/"world_model.log",encoding="utf-8")
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+        self.confirmation_logger.addHandler(handler)
+        self.detection_subscriber=message_filters.Subscriber("detections", ObservationFrame)
+        self.depth_subscriber=message_filters.Subscriber("camera_depth", Image)
+        self.synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.detection_subscriber], queue_size=60, slop=0.05)
+        self.synchronizer.registerCallback(self._update_callback)
+
+
+    @staticmethod
+    def sigmoid(x):
+        return 1/(1+e**-x)
+
+
+    def _update_callback(self, depth, detections):
+        try:
+            detection_list=detections.detections
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+            rospy.logerr("Invalid detection message: %s", error)
+            return
+
         with self._lock:
-            activity=self._observation_activity(position,time.monotonic()+arrival_seconds)
-            return math.exp(-self.correlation_strength*activity)
+            stamp=detections.header.stamp.to_nsec()
+            if self._last_detection_stamp is not None and stamp<=self._last_detection_stamp:
+                if detection_list:
+                    rospy.loginfo("World-model rejected old frame: stamp_ns=%d last_stamp_ns=%d",stamp,self._last_detection_stamp)
+                return
+            self._latest_frame=detections
+            self._latest_depth=depth
+            try:
+                working_objects = deepcopy(self.observations.objects)
+                working_temp=deepcopy(self.observationstemp.objects)
+                self._apply_detections(working_objects, detection_list, detections, depth, working_temp)
+            except Exception as error:
+                rospy.logerr("World-model update failed: %s", error)
+                return
+
+            self.observations.objects[:] = working_objects
+            self.observationstemp.objects[:]=working_temp
+            self._last_detection_stamp=stamp
+            if detection_list or working_temp:
+                self.confirmation_logger.info("World-model confirmation: %s",json.dumps({"stamp_ns":stamp,"detections":len(detection_list),"confirmed_ids":[obj.id for obj in working_objects],"temporary":[{"id":obj.id,"position":[obj.position.x,obj.position.y,obj.position.z],"history":obj.detection_history} for obj in working_temp]}))
+
 
     def _apply_detections(self, objects: list[Object], detection_list: list[ObjectDetection], frame: ObservationFrame, depthmap: Image, temp_objects:list[Object]) -> None:
         observed_list=[]
@@ -451,7 +718,8 @@ class ObjectWorldModel:
             object.confidence_scores["existence_score"]=self.sigmoid(object.confidence_scores["existence_rawscore"])
 
         objects[:]=[object for object in objects if object.confidence_scores["existence_score"]>=0.08]
-        
+
+
     def _camera_transform(self,observation: ObservationFrame,flag: int=0)->np.ndarray:
         pose=observation.vehicle_pose.pose.pose
         q_WB=pose.orientation
@@ -476,205 +744,20 @@ class ObjectWorldModel:
 
         raise ValueError("flag must be 0 for camera-to-world or 1 for world-to-camera")
 
-    def _lidar_transform(self,observation: ObservationFrame,flag: int=0)->np.ndarray:
-        """Return the body-to-world transform or its inverse for body-frame LiDAR points."""
-        pose=observation.vehicle_pose.pose.pose
-        q_WB=pose.orientation
-
-        T_WB=np.eye(4,dtype=float)
-        T_WB[:3,:3]=Rotation.from_quat([q_WB.x,q_WB.y,q_WB.z,q_WB.w]).as_matrix()
-        T_WB[:3,3]=[pose.position.x,pose.position.y,pose.position.z]
-
-        if flag==0:
-            return T_WB
-        if flag==1:
-            return np.linalg.inv(T_WB)
-
-        raise ValueError("flag must be 0 for body-to-world or 1 for world-to-body")
 
     def w2c(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
         position=np.append(np.asarray(position,dtype=float),1.0)
         transform=self._camera_transform(frame,1)
         newpos=transform@position
         return newpos[:3]
-    
+
+
     def c2w(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
         position=np.append(np.asarray(position,dtype=float),1.0)
         transform=self._camera_transform(frame,0)
         newpos=transform@position
         return newpos[:3]
 
-    def w2l(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
-        """Convert a world-frame point to the LiDAR cloud's body frame."""
-        position=np.append(np.asarray(position,dtype=float),1.0)
-        transform=self._lidar_transform(frame,1)
-        newpos=transform@position
-        return newpos[:3]
-
-    def l2w(self,frame, position:np.ndarray | list[float] | tuple[float,float,float])->np.ndarray:
-        """Convert a body-frame LiDAR cloud point to the world frame."""
-        position=np.append(np.asarray(position,dtype=float),1.0)
-        transform=self._lidar_transform(frame,0)
-        newpos=transform@position
-        return newpos[:3]
-
-    def position_to_voxel(self,position: np.ndarray,grid_origin: np.ndarray,voxel_size:float) -> tuple[int,int,int]:
-        index=np.floor((position-grid_origin)/voxel_size).astype(np.int32)
-        return int(index[0]),int(index[1]),int(index[2])
-
-    def get_vehicle_voxels(self,vehicle_pose:Odometry,vehicle_min: np.ndarray,vehicle_max: np.ndarray)->list[tuple[int,int,int]]:
-        """Obtain the current occupied voxels of the vehicle"""
-        if vehicle_pose is None:
-            raise ValueError("Vehicle pose has not been initialized.")
-        pose=vehicle_pose.pose.pose
-        translation=np.array([pose.position.x,pose.position.y,pose.position.z],dtype=np.float64)
-        quaternion=np.array([pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w],dtype=np.float64)
-        if not np.all(np.isfinite(translation)) or not np.all(np.isfinite(quaternion)) or np.linalg.norm(quaternion)==0:
-            raise ValueError("Vehicle pose must contain a finite position and a non-zero finite quaternion.")
-        rotation=Rotation.from_quat(quaternion).as_matrix()
-        return self._get_vehicle_voxels_from_transform(translation,rotation,vehicle_min,vehicle_max)
-
-    def get_vehicle_voxels_at_pose(self,position:Position,orientation:Orientation,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
-        """Obtain the vehicle's occupied voxels at a given pose."""
-        pose_values=np.array([position.x,position.y,position.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
-        if not np.all(np.isfinite(pose_values)):
-            raise ValueError("Target position and orientation must contain only finite values.")
-        translation=pose_values[:3]
-        rotation=Rotation.from_euler("xyz",[orientation.roll,orientation.pitch,orientation.yaw]).as_matrix()
-        return self._get_vehicle_voxels_from_transform(translation,rotation,vehicle_min,vehicle_max)
-
-    def _get_vehicle_voxels_from_transform(self,translation:np.ndarray,rotation:np.ndarray,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
-        """Obtaine the vehicle's occupied voxels after performing a transformation."""
-        vehicle_min=np.asarray(vehicle_min,dtype=np.float64)
-        vehicle_max=np.asarray(vehicle_max,dtype=np.float64)
-        if vehicle_min.shape!=(3,) or vehicle_max.shape!=(3,) or not np.all(np.isfinite(vehicle_min)) or not np.all(np.isfinite(vehicle_max)) or np.any(vehicle_min>=vehicle_max):
-            raise ValueError("Invalid vehicle dimensions.")
-        translation=np.asarray(translation,dtype=np.float64)
-        rotation=np.asarray(rotation,dtype=np.float64)
-        if translation.shape!=(3,) or rotation.shape!=(3,3) or not np.all(np.isfinite(translation)) or not np.all(np.isfinite(rotation)):
-            raise ValueError("Invalid vehicle pose transform.")
-
-        with self._lock:
-            voxel_size=self.voxelmap.voxelsize
-            grid_origin=self.voxelmap.grid_origin
-
-        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
-            raise ValueError("Voxel grid has not been initialized.")
-
-        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
-
-        body_corners=np.array([[x,y,z] for x in (vehicle_min[0],vehicle_max[0]) for y in (vehicle_min[1],vehicle_max[1]) for z in (vehicle_min[2],vehicle_max[2])],dtype=np.float64)
-        world_corners=body_corners@rotation.T+translation
-        minimum_index=np.floor((world_corners.min(axis=0)-origin)/voxel_size).astype(np.int64)
-        maximum_index=np.ceil((world_corners.max(axis=0)-origin)/voxel_size).astype(np.int64)
-
-        voxel_half_extent=np.full(3,voxel_size/2.0,dtype=np.float64)
-        body_frame_padding=np.abs(rotation.T)@voxel_half_extent
-        indices=[]
-
-        for x in range(int(minimum_index[0]),int(maximum_index[0])):
-            for y in range(int(minimum_index[1]),int(maximum_index[1])):
-                for z in range(int(minimum_index[2]),int(maximum_index[2])):
-                    index=(x,y,z)
-                    voxel_center_world=origin+(np.asarray(index,dtype=np.float64)+0.5)*voxel_size
-                    voxel_center_body=rotation.T@(voxel_center_world-translation)
-                    overlaps=np.all(voxel_center_body+body_frame_padding>vehicle_min) and np.all(voxel_center_body-body_frame_padding<vehicle_max)
-                    if overlaps:
-                        indices.append(index)
-
-        return indices
-
-    def get_voxel_map_frame(self)->str | None:
-        with self._lock:
-            return self.voxelmap.frame_id
-
-    def get_voxel_size(self)->float:
-        with self._lock:
-            voxel_size=self.voxelmap.voxelsize
-        if not math.isfinite(voxel_size) or voxel_size<=0:
-            raise ValueError("Voxel grid has not been initialized.")
-        return voxel_size
-
-    def world_position_to_voxel(self,position:Position)->tuple[int,int,int]:
-        """Convert a world-frame position to an index in the active voxel map."""
-        if not isinstance(position,Position):
-            raise TypeError("position must be a Position.")
-        coordinates=np.array([position.x,position.y,position.z],dtype=np.float64)
-        if not np.all(np.isfinite(coordinates)):
-            raise ValueError("World position must contain only finite values.")
-        with self._lock:
-            voxel_size=self.voxelmap.voxelsize
-            grid_origin=deepcopy(self.voxelmap.grid_origin)
-        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
-            raise ValueError("Voxel map has not been initialized.")
-        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
-        return self.position_to_voxel(coordinates,origin,voxel_size)
-
-    def voxel_to_position(self,index:tuple[int,int,int])->Position:
-        if len(index)!=3 or any(not isinstance(component,int) or isinstance(component,bool) for component in index):
-            raise ValueError("Voxel index must contain exactly three integers.")
-        with self._lock:
-            voxel_size=self.voxelmap.voxelsize
-            grid_origin=deepcopy(self.voxelmap.grid_origin)
-        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
-            raise ValueError("Voxel map has not been initialized.")
-        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
-        center=origin+(np.asarray(index,dtype=np.float64)+0.5)*voxel_size
-        return Position(x=float(center[0]),y=float(center[1]),z=float(center[2]))
-
-    def get_voxel_states(self,indices:list[tuple[int,int,int]])->list[int | None]:
-        with self._lock:
-            states=[]
-            for index in indices:
-                voxel=self._voxel_lookup.get(index)
-                states.append(None if voxel is None else voxel.state)
-            return states
-
-    def get_voxel_states_and_scores(self,indices:list[tuple[int,int,int]])->list[tuple[int | None,float] | None]:
-        """Return atomic occupancy state/confidence snapshots for the requested voxels."""
-        with self._lock:
-            return [None if (voxel:=self._voxel_lookup.get(index)) is None else (voxel.state,voxel.score) for index in indices]
-
-    def _get_voxel_regions(self,minimum: Position,maximum: Position)->list[int]:
-        """Return [filled, empty, unknown] voxel counts within a world-frame bounding box."""
-        coordinates=np.array([minimum.x,minimum.y,minimum.z,maximum.x,maximum.y,maximum.z],dtype=np.float64)
-        if not np.all(np.isfinite(coordinates)):
-            raise ValueError("Bounding-box coordinates must be finite.")
-        minimum_array=coordinates[:3]
-        maximum_array=coordinates[3:]
-        if np.any(minimum_array>=maximum_array):
-            raise ValueError("Bounding-box minimum must be smaller than its maximum.")
-
-        with self._lock:
-            voxel_size=self.voxelmap.voxelsize
-            grid_origin=self.voxelmap.grid_origin
-            if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
-                raise ValueError("Voxel-grid size and origin have not been initialized.")
-
-            origin_array=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
-            minimum_index=np.floor((minimum_array-origin_array)/voxel_size).astype(np.int64)
-            maximum_index=np.ceil((maximum_array-origin_array)/voxel_size).astype(np.int64)
-            region_shape=maximum_index-minimum_index
-            total_voxels=int(np.prod(region_shape,dtype=np.int64))
-            known_voxels=[voxel for index,voxel in self._voxel_lookup.items() if minimum_index[0]<=index[0]<maximum_index[0] and minimum_index[1]<=index[1]<maximum_index[1] and minimum_index[2]<=index[2]<maximum_index[2]]
-            filled=sum(voxel.state==1 for voxel in known_voxels)
-            empty=sum(voxel.state==0 for voxel in known_voxels)
-            unknown=total_voxels-filled-empty
-            return [filled,empty,unknown]
-
-    def get_unknown_score(self,minimum:Position,maximum:Position)->float:
-        voxel_regions=self._get_voxel_regions(minimum,maximum)
-        score=voxel_regions[2]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
-        return score
-
-    def get_filled_score(self,minimum:Position,maximum:Position)->float:
-        voxel_regions=self._get_voxel_regions(minimum,maximum)
-        score=voxel_regions[0]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
-        return score
-    def get_empty_score(self,minimum:Position,maximum:Position)->float:
-        voxel_regions=self._get_voxel_regions(minimum,maximum)
-        score=voxel_regions[1]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
-        return score
 
     def bounding_box_to_world(self,bounding_box)->Position:
         with self._lock:
@@ -737,10 +820,13 @@ class ObjectWorldModel:
             world_position=self.c2w(self._latest_frame,camera_position)
             return Position(float(world_position[0]),float(world_position[1]),float(world_position[2]))
 
+
     def record(self)->None:
         """Used by tools to record world model updates."""
         with self._lock:
             self._startstate=deepcopy(self.observations)
+
+
     def stop_record(self)->dict:
         """Used by tools to stop recording world model updates."""
         with self._lock:
@@ -778,6 +864,7 @@ class ObjectWorldModel:
 
             return largest_number
 
+
     def query_world(self,object_id: str | None = None,class_name: str | None = None,) -> list[Object]:
         """Return objects matching an ID, a class, or all objects."""
         with self._lock:
@@ -798,8 +885,10 @@ class ObjectWorldModel:
 
             return deepcopy(result)
 
+
     def get_detection_classes(self)->tuple[str,...]:
         return self.detection_classes
+
 
     def getallobjects(self)->str:
         listofobjects=[]
@@ -808,12 +897,14 @@ class ObjectWorldModel:
         stringofobjects=json.dumps(listofobjects)
         return stringofobjects
 
+
     def _add_object(self, world_object: Object) -> None:
         with self._lock:
             if any(existing_object.id == world_object.id for existing_object in self.observations.objects):
                 raise ValueError(f"An object with ID {world_object.id!r} already exists.")
 
             self.observations.objects.append(world_object)
+
 
     def _remove_object(self, object_id: str) -> Object:
         with self._lock:
@@ -822,6 +913,7 @@ class ObjectWorldModel:
                     return self.observations.objects.pop(index)
 
             raise KeyError(f"No object with ID {object_id!r} exists.")
+
 
     def write(self,world_object: Object) -> None:
         candidate = deepcopy(world_object)

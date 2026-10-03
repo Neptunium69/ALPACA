@@ -31,7 +31,7 @@ class Inspect(Tool):
             state=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data
             targets=self.vainterface.execute(FCExecute(function="hiddenpoints",arguments={"object_id":command.arguments["target"],"state":state,"distance_behind":1.0})).data
             navigation_frame=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
-            targetobjects=self.wminterface.execute(FCExecute(function="query_world",arguments={"object_id":command.arguments["target"],"class_name":None})).data
+            targetobjects=self.wminterface.execute(FCExecute(function="query_world",arguments={"object_id":command.arguments["target"],"class_name":None}),submodel="objects").data
             if len(targetobjects)!=1:
                 raise KeyError(f"Object {command.arguments['target']!r} does not uniquely exist in the current world model.")
             targetobject=targetobjects[0]

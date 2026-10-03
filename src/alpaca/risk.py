@@ -67,7 +67,7 @@ class VantagePoint:
     straight_line_distance: float
 
 class RiskCal():
-    def __init__(self,model:wm.ObjectWorldModel,vainterface:VAInterface)->None:
+    def __init__(self,model:wm.VoxelWorldModel,vainterface:VAInterface)->None:
         self.model=model
         self.vainterface=vainterface
         self.occupied_confidence_threshold=0.1
