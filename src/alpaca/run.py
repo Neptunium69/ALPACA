@@ -1,10 +1,22 @@
 from . import vlminterface
 from . import worldmodel
-from . import tools
 from . import userinterface
 from . import vehicleadapter
 from . import risk
 from . import yolo
+from .tools import ToolExecutor,ToolList
+from .tools.ask_user import AskUser
+from .tools.finish import Finish
+from .tools.image import Image
+from .tools.inspect import Inspect
+from .tools.navigate import Navigate
+from .tools.observe import Observe
+from .tools.query import Query
+from .tools.robot_state import RobotState
+from .tools.scan import Scan
+from .tools.write import Write
+from .vatools import FCExecute,VAInterface
+from .wmtools import WorldModelInterface
 
 import rospy
 from pathlib import Path
@@ -21,15 +33,17 @@ from ...deploy.px4_shutdown import run_shutdown
 from alpaca_msgs.msg import ObservationFrame,SpatialObservationFrame
 
 # Prompts and stuff
-prompt_path=Path(__file__).resolve().parents[2]/"system_prompt_master.txt"
+prompt_path=Path(__file__).resolve().parents[2]/"system_prompt_master.md"
 system_prompt_master=prompt_path.read_text(encoding="utf-8").strip()
 system_prompt_think="\nEnter PLANNING MODE. Think of a plan of what you should do next but don't write commands yet."
-system_prompt_act="\nOutput a set of JSON commands following the command format for the next step."
+system_prompt_act="\nEnter ACTION MODE. Return exactly one raw JSON object following the command format for the next step. Your first character must be { and your last character must be }. Never wrap the JSON in Markdown, backticks, or code fences; never add a json language label, explanation, or other text outside the object. ALPACA parses the entire response as JSON and rejects wrappers. Check the response boundaries before sending."
+# user_prompt="Find the apple behind the board."
+user_prompt="Survey the accessible forest with the UGV and inspect standing trees for basal and root damage. Use the tree class to locate trees, including trees with no visible damage, and inspect their trunk bases and visible roots from safe viewpoints. Look for basal_damage and root_damage near each tree; a tree may have neither, either, or both damage classes. Associate each damage observation with a tree using visual evidence and world-model positions, and flag uncertain associations. Keep clear of trunks, roots, and other obstacles, and avoid repeatedly inspecting the same tree. Send me the IDs and locations of damaged trees, the observed damage classes, and supporting images. Do not treat missing detections as proof that a tree is healthy. When the accessible survey is complete or further inspection is blocked, summarize the findings, identify uninspected or uncertain areas, and finish the mission."
 project_root=Path(__file__).resolve().parents[3]
 model_path=str(project_root/"Models"/"Qwen3-VL-4B-Instruct")
 yolo_path="./ALPACA/yolomodel/best.engine"
 
-def start_world_model_logging(model:worldmodel.WorldModel,log_dir:Path):
+def start_world_model_logging(model:worldmodel.ObjectWorldModel,log_dir:Path):
     log_path=log_dir/"world_model_objects.jsonl"
     def log_objects(_event):
         try:
@@ -58,15 +72,33 @@ def main():
     log_dir=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
     log_dir.mkdir(parents=True,exist_ok=True)
     observations=worldmodel.Model()
-    model=worldmodel.WorldModel(observations,["apple","board"])
-    initial_state=vehicleadapter.State(battery_level=None,position=worldmodel.Position(0.0,0.0,0.0),orientation=worldmodel.Orientation(0.0,0.0,0.0))
-    adapter=vehicleadapter.UGVAdapter(initial_state,model,None)
-    rcm=risk.RiskCal(model,adapter)
+    model=worldmodel.ObjectWorldModel(observations,["apple","board"])
+    adapter=vehicleadapter.UGVAdapter(model,None)
+    vainterface=VAInterface(adapter,"primary")
+    rcm=risk.RiskCal(model,vainterface)
     adapter.riskcal=rcm
-    detector=yolo.YOLOAdapter(model_path=yolo_path)
+    detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
     vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
     vlm_interface.init_vlm()
-    toolexecutor=tools.ToolExecutor(model,adapter,rcm,vlm_interface.output_text_publisher,vlm_interface.output_image_publisher,vlm_interface.input_subscriber,detector,completion_publisher=getattr(vlm_interface,"completion_publisher",None))
+    wminterface=WorldModelInterface(model,"primary")
+    observe_tool=Observe()
+    navigate_tool=Navigate(vainterface,rcm)
+    scan_tool=Scan(wminterface,vainterface,rcm)
+    tool_list=ToolList()
+    for tool in (
+        Query(wminterface),
+        RobotState(vainterface),
+        Write(wminterface),
+        observe_tool,
+        scan_tool,
+        navigate_tool,
+        Inspect(wminterface,vainterface,navigate_tool,scan_tool),
+        Image(vainterface,rcm,observe_tool),
+        AskUser(vlm_interface.output_text_publisher,vlm_interface.output_image_publisher),
+        Finish(vlm_interface.output_text_publisher,vlm_interface.output_image_publisher,completion_publisher=getattr(vlm_interface,"completion_publisher",None)),
+    ):
+        tool_list.add(tool)
+    toolexecutor=ToolExecutor(tool_list)
     vlm_interface.toolexe=toolexecutor
     ui=userinterface.UI()
 
@@ -74,7 +106,7 @@ def main():
     model.initwm()
     world_model_log_timer=start_world_model_logging(model,log_dir)
     detector.init_yolo()
-    adapter.init_sensordata()
+    vainterface.execute(FCExecute(function="init_sensordata",arguments={}))
     shutdown_lock=RLock()
     adapter.stopping=False
     adapter.stopped=False
@@ -105,8 +137,8 @@ def main():
             while not rospy.is_shutdown() and not adapter.stopping and not rospy.get_param("/alpaca/start_mission",False):
                 rospy.sleep(0.1)
             if rospy.is_shutdown() or adapter.stopping: return 0
-            adapter.require_navigation_ready("start the mission")
-        vlm_interface.run_mission(user_prompt="Find the apple behind a board. After you are done, send me a message that you found it and an image of the apple.")
+            vainterface.execute(FCExecute(function="require_navigation_ready",arguments={"action_name":"start the mission"}))
+        vlm_interface.run_mission(user_prompt=user_prompt)
         rospy.spin()
     except RuntimeError as error:
         rospy.logerr("ALPACA stopped: %s",error)

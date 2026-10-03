@@ -6,6 +6,7 @@ tmp
 pyrightconfig.json
 yolomodel
 system_prompt_master.txt
+system_prompt_master.md
 deploy
 sitl
 .pytest_cache

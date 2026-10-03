@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from sensor_msgs.msg import Image,CameraInfo
 from nav_msgs.msg import Odometry
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection
-from typing import Any
+from typing import Any, Sequence
 from threading import Lock
 from copy import deepcopy
 import time
@@ -24,7 +24,7 @@ import rospy
 import json
 
 class YOLOAdapter():
-    def __init__(self, model_path: str, cammountpos: tuple=(0.15, 0.0, 0.0), cammountrot: tuple=(0.0, 0.0, 0.0)):
+    def __init__(self, model_path: str, sitl:bool=False, cammountpos: tuple=(0.15, 0.0, 0.0), cammountrot: tuple=(0.0, 0.0, 0.0)):
         self.model_path = model_path
         self.model = self._load_model(model_path)
         self.cammountpos=np.asarray(cammountpos,dtype=float).reshape(3)
@@ -36,6 +36,7 @@ class YOLOAdapter():
         self.latest_pose_monotonic:float | None=None
         self.max_pose_age=0.5
         self.last_detection_image_time=float("-inf")
+        self.sitl=sitl
     def init_yolo(self):
         self.rate = rospy.Rate(15)
         self.publisher = rospy.Publisher("detections",ObservationFrame,queue_size=1)
@@ -127,7 +128,10 @@ class YOLOAdapter():
         )
 
     def _run_model(self, image: np.ndarray) -> Results:
-        result=next(iter(self.model(image,conf=0.5,verbose=False)))
+        if self.sitl==False:
+            result=next(iter(self.model(image,conf=0.5,verbose=False)))
+        else:
+            result=__import__('alpaca_forest_sim.oracle',fromlist=['predict']).predict(image)
         if not isinstance(result,Results):
             raise TypeError(f"YOLO returned an unexpected result type: {type(result).__name__}")
         return result
@@ -162,7 +166,8 @@ class YOLOAdapter():
 
             results=self._run_model(frame)
             output=ObservationFrame()
-            output_detections=output.detections
+            output_detections:list[ObjectDetection]=[]
+            output.detections=output_detections
             if output_detections is None:
                 output_detections=[]
                 output.detections=output_detections

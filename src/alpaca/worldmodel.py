@@ -8,14 +8,20 @@ import rospy
 import numpy as np
 from scipy.spatial.transform import Rotation
 import message_filters
+from .dataclasses import Function
+from .wmtools.wmregistry import WMRegistry
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import math
+import logging
+import os
+from pathlib import Path
 from nav_msgs.msg import Odometry
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection,SpatialObservationFrame
 from sklearn.neighbors import KNeighborsClassifier
 from math import e
 import json
+import time
 
 @dataclass
 class Position:
@@ -57,9 +63,14 @@ class Object:
 @dataclass
 class Voxel:
     position: Position
-    state: int
+    state: int | None
     rawscore: float = 0
     score: float = 0.5
+
+@dataclass
+class ObservationActivity:
+    score: float = 0.0
+    last_update: float = 0.0
 
 @dataclass
 class Model:
@@ -72,8 +83,16 @@ class VoxelModel:
     grid_origin: Position | None = None
     frame_id: str | None = None
 
-class WorldModel:
+class ObjectWorldModel:
     def __init__(self, observations: Model, detection_classes):
+        self.registry=WMRegistry([
+            Function(name="query_world",arguments={"object_id":("str",False),"class_name":("str",False)}),
+            Function(name="write",arguments={"world_object":("Object",True)}),
+            Function(name="bounding_box_to_world",arguments={"bounding_box":("list",True)}),
+            Function(name="get_detection_classes",arguments={}),
+            Function(name="record",arguments={}),
+            Function(name="stop_record",arguments={}),
+        ])
         self.observations = observations
         self.observationstemp=Model()
         self._last_detection_stamp=None
@@ -81,6 +100,17 @@ class WorldModel:
         self.voxelmap = VoxelModel(voxelsize=float("nan"), voxels=[], grid_origin=None, frame_id=None)
         self.association_distance=0.3
         self._voxel_lookup: dict[tuple[int,int,int],Voxel]={}
+        # Separate, coarser voxel layer: observation origins are not occupancy evidence.
+        self._observation_field: dict[tuple[int,int,int],ObservationActivity]={}
+        self.activity_voxel_size=0.25
+        self.activity_radius=0.5
+        self.activity_decay_seconds=30.0
+        self.activity_increment=0.1
+        self.correlation_strength=1.0
+        self.voxel_learning_rate=0.25
+        self.maximum_voxel_rawscore=4.0
+        self.voxel_unknown_margin=0.2
+        self._last_voxel_stamps: dict[str,int]={}
         self._bridge = CvBridge()
         self._latest_frame=None
         self._latest_depth=None
@@ -89,6 +119,14 @@ class WorldModel:
 
     def initwm(self):
         # Automatic world model updater
+        log_directory=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
+        log_directory.mkdir(parents=True,exist_ok=True)
+        self.confirmation_logger=logging.getLogger(f"alpaca.worldmodel.confirmations.{id(self)}")
+        self.confirmation_logger.setLevel(logging.INFO)
+        self.confirmation_logger.propagate=False
+        handler=logging.FileHandler(log_directory/"world_model.log",encoding="utf-8")
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
+        self.confirmation_logger.addHandler(handler)
         self.detection_subscriber=message_filters.Subscriber("detections", ObservationFrame)
         self.depth_subscriber=message_filters.Subscriber("camera_depth", Image)
         self.voxel_subscriber=rospy.Subscriber("voxel_observations",SpatialObservationFrame,callback=self._voxel_callback)
@@ -126,7 +164,7 @@ class WorldModel:
             self.observationstemp.objects[:]=working_temp
             self._last_detection_stamp=stamp
             if detection_list or working_temp:
-                rospy.loginfo("World-model confirmation: %s",json.dumps({"stamp_ns":stamp,"detections":len(detection_list),"confirmed_ids":[obj.id for obj in working_objects],"temporary":[{"id":obj.id,"position":[obj.position.x,obj.position.y,obj.position.z],"history":obj.detection_history} for obj in working_temp]}))
+                self.confirmation_logger.info("World-model confirmation: %s",json.dumps({"stamp_ns":stamp,"detections":len(detection_list),"confirmed_ids":[obj.id for obj in working_objects],"temporary":[{"id":obj.id,"position":[obj.position.x,obj.position.y,obj.position.z],"history":obj.detection_history} for obj in working_temp]}))
 
     def _voxel_callback(self, message: SpatialObservationFrame):
         voxel_size=float(message.voxel_size)
@@ -138,8 +176,18 @@ class WorldModel:
         if not frame_id:
             rospy.logerr("Received voxel map with an empty frame ID.")
             return
+        sensor_position=getattr(message,"sensor_position",None)
+        if sensor_position is None or not all(math.isfinite(value) for value in (sensor_position.x,sensor_position.y,sensor_position.z)):
+            rospy.logerr("Voxel observations require a finite sensor_position; rebuild alpaca_msgs and restart both nodes.")
+            return
+        stamp=message.header.stamp.to_nsec()
+        if stamp<=0:
+            rospy.logwarn("Rejected voxel observations without a valid scan timestamp.")
+            return
 
         with self._lock:
+            if stamp<=self._last_voxel_stamps.get(message.source_id,-1):
+                return
             if self.voxelmap.grid_origin is None:
                 self.voxelmap.voxelsize=voxel_size
                 self.voxelmap.grid_origin=Position(x=float(origin_array[0]),y=float(origin_array[1]),z=float(origin_array[2]))
@@ -154,24 +202,66 @@ class WorldModel:
                 rospy.logwarn("Received empty voxel map message.")
                 return
 
+            now=time.monotonic()
+            activity=self._observation_activity(sensor_position,now)
+            novelty=math.exp(-self.correlation_strength*activity)
+            updated=False
             for observation in message.voxels:
                 index=(int(observation.x),int(observation.y),int(observation.z))
                 occupied=int(observation.occupied_observations)
                 free=int(observation.free_observations)
-                if occupied==0 and free==0:
+                if occupied<0 or free<0 or occupied+free==0:
                     continue
-                rawscore_delta=0.2 if 2*occupied>=free else -0.2
+                evidence=(2.0*occupied-free)/(2.0*occupied+free)
                 voxel=self._voxel_lookup.get(index)
+                new_voxel=voxel is None
                 if voxel is None:
                     position_array=origin_array+np.asarray(index,dtype=np.float64)*voxel_size
-                    score=self.sigmoid(rawscore_delta)
-                    voxel=Voxel(position=Position(x=float(position_array[0]),y=float(position_array[1]),z=float(position_array[2])),state=int(score>=0.5),rawscore=rawscore_delta,score=score)
+                    voxel=Voxel(position=Position(x=float(position_array[0]),y=float(position_array[1]),z=float(position_array[2])),state=None)
                     self._voxel_lookup[index]=voxel
                     self.voxelmap.voxels.append(voxel)
-                else:
-                    voxel.rawscore+=rawscore_delta
-                    voxel.score=self.sigmoid(voxel.rawscore)
-                    voxel.state=int(voxel.score>=0.5)
+                new_obstacle=evidence>0 and voxel.state==0
+                if new_obstacle:
+                    # Repeated viewing must not leave newly blocked space classified as free.
+                    voxel.rawscore=0.0
+                alpha=self.voxel_learning_rate*(1.0 if new_voxel or new_obstacle else novelty)
+                voxel.rawscore+=alpha*(self.maximum_voxel_rawscore*evidence-voxel.rawscore)
+                voxel.rawscore=max(-self.maximum_voxel_rawscore,min(self.maximum_voxel_rawscore,voxel.rawscore))
+                voxel.score=self.sigmoid(voxel.rawscore)
+                voxel.state=None if abs(voxel.score-0.5)<=self.voxel_unknown_margin else int(voxel.score>0.5)
+                updated=True
+            if updated:
+                self._observation_activity(sensor_position,now,deposit=True)
+                self._last_voxel_stamps[message.source_id]=stamp
+
+    def _observation_activity(self,position:Position,now:float,deposit:bool=False)->float:
+        """Read decayed activity, optionally depositing one scan afterward. Caller holds _lock."""
+        point=np.array([position.x,position.y,position.z],dtype=np.float64)
+        radius=3.0*self.activity_radius
+        lower=np.floor((point-radius)/self.activity_voxel_size).astype(np.int64)
+        upper=np.floor((point+radius)/self.activity_voxel_size).astype(np.int64)
+        indices=np.indices(tuple(upper-lower+1)).reshape(3,-1).T+lower
+        distances_squared=np.sum(((indices+0.5)*self.activity_voxel_size-point)**2,axis=1)
+        inside=distances_squared<=radius**2
+        indices=indices[inside]
+        weights=np.exp(-distances_squared[inside]/(2.0*self.activity_radius**2))
+        activity=0.0
+        for index,weight in zip(indices,weights):
+            key=(int(index[0]),int(index[1]),int(index[2]))
+            cell=self._observation_field.get(key)
+            decayed=0.0 if cell is None else cell.score*math.exp(-max(0.0,now-cell.last_update)/self.activity_decay_seconds)
+            activity+=float(weight)*decayed
+            if deposit:
+                self._observation_field[key]=ObservationActivity(score=decayed+self.activity_increment*float(weight),last_update=now)
+        return activity/float(weights.sum()) if weights.size else 0.0
+
+    def get_observation_novelty(self,position:Position,arrival_seconds:float=0.0)->float:
+        """Predict novelty without changing the field or its timestamps."""
+        if not all(math.isfinite(value) for value in (position.x,position.y,position.z,arrival_seconds)) or arrival_seconds<0:
+            raise ValueError("Observation position and non-negative arrival time must be finite.")
+        with self._lock:
+            activity=self._observation_activity(position,time.monotonic()+arrival_seconds)
+            return math.exp(-self.correlation_strength*activity)
 
     def _apply_detections(self, objects: list[Object], detection_list: list[ObjectDetection], frame: ObservationFrame, depthmap: Image, temp_objects:list[Object]) -> None:
         observed_list=[]
@@ -242,7 +332,7 @@ class WorldModel:
             obj.detection_history=(obj.detection_history+[obj.id in observed_ids])[-5:]
             if sum(obj.detection_history)>=3:
                 objects.append(obj)
-        temp_objects[:]=[obj for obj in temp_objects if sum(obj.detection_history)<3]
+        temp_objects[:]=[obj for obj in temp_objects if sum(obj.detection_history)<3 and obj.detection_history!=[False]*5]
 
         for object in objects:
             if object.attributes.get("VLMFlag")==1:
@@ -505,6 +595,21 @@ class WorldModel:
             raise ValueError("Voxel grid has not been initialized.")
         return voxel_size
 
+    def world_position_to_voxel(self,position:Position)->tuple[int,int,int]:
+        """Convert a world-frame position to an index in the active voxel map."""
+        if not isinstance(position,Position):
+            raise TypeError("position must be a Position.")
+        coordinates=np.array([position.x,position.y,position.z],dtype=np.float64)
+        if not np.all(np.isfinite(coordinates)):
+            raise ValueError("World position must contain only finite values.")
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=deepcopy(self.voxelmap.grid_origin)
+        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+            raise ValueError("Voxel map has not been initialized.")
+        origin=np.array([grid_origin.x,grid_origin.y,grid_origin.z],dtype=np.float64)
+        return self.position_to_voxel(coordinates,origin,voxel_size)
+
     def voxel_to_position(self,index:tuple[int,int,int])->Position:
         if len(index)!=3 or any(not isinstance(component,int) or isinstance(component,bool) for component in index):
             raise ValueError("Voxel index must contain exactly three integers.")
@@ -525,7 +630,7 @@ class WorldModel:
                 states.append(None if voxel is None else voxel.state)
             return states
 
-    def get_voxel_states_and_scores(self,indices:list[tuple[int,int,int]])->list[tuple[int,float] | None]:
+    def get_voxel_states_and_scores(self,indices:list[tuple[int,int,int]])->list[tuple[int | None,float] | None]:
         """Return atomic occupancy state/confidence snapshots for the requested voxels."""
         with self._lock:
             return [None if (voxel:=self._voxel_lookup.get(index)) is None else (voxel.state,voxel.score) for index in indices]
@@ -554,7 +659,7 @@ class WorldModel:
             known_voxels=[voxel for index,voxel in self._voxel_lookup.items() if minimum_index[0]<=index[0]<maximum_index[0] and minimum_index[1]<=index[1]<maximum_index[1] and minimum_index[2]<=index[2]<maximum_index[2]]
             filled=sum(voxel.state==1 for voxel in known_voxels)
             empty=sum(voxel.state==0 for voxel in known_voxels)
-            unknown=total_voxels-len(known_voxels)
+            unknown=total_voxels-filled-empty
             return [filled,empty,unknown]
 
     def get_unknown_score(self,minimum:Position,maximum:Position)->float:
@@ -692,6 +797,9 @@ class WorldModel:
                 result = self.observations.objects
 
             return deepcopy(result)
+
+    def get_detection_classes(self)->tuple[str,...]:
+        return self.detection_classes
 
     def getallobjects(self)->str:
         listofobjects=[]
