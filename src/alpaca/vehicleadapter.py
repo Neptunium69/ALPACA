@@ -469,11 +469,14 @@ class UGVAdapter(VehicleAdapter):
         if len(selected)>300:
             selected = random.sample(selected, 300)
 
+        ground_z=vehicle_pose.pose.pose.position.z+float(self.vehicle_min[2])
         for point in selected:
             free_voxels,occupied_voxel=self._raycast_voxels(self.lidar_origin_world,point,self.roi_min,self.voxel_size)
             for free_voxel in free_voxels:
                 counts=voxel_counts.setdefault(free_voxel,[0,0])
                 counts[0]+=1
+            if abs(point[2]-ground_z)<=0.005:
+                continue
             counts=voxel_counts.setdefault(occupied_voxel,[0,0])
             counts[1]+=1
         voxel_messages=[VoxelObservationMsg(x=voxel[0],y=voxel[1],z=voxel[2],free_observations=counts[0],occupied_observations=counts[1]) for voxel,counts in voxel_counts.items()]
