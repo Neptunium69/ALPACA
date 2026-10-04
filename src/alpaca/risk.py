@@ -80,7 +80,7 @@ class RiskCal():
 
     def _vantage_reward(self,position:Position,observable_voxels:set[tuple[int,int,int]],total_unknown_value:float,path_distance:float,observation_probability:float)->tuple[float,float]:
         """Range-based visibility, uniform route weights, uncertainty and predicted novelty."""
-        observations=self.model.get_voxel_states_and_scores(list(observable_voxels))
+        observations=self.model.states_scores(list(observable_voxels))
         uncertainty=sum(1.0 if observation is None else max(0.0,1.0-2.0*abs(observation[1]-0.5)) for observation in observations)
         novelty=self.model.get_observation_novelty(position,arrival_seconds=path_distance/self.vantage_prediction_speed)
         reward=observation_probability*novelty*uncertainty/total_unknown_value if total_unknown_value>0 else 0.0
@@ -136,7 +136,7 @@ class RiskCal():
         distance=0.0
 
         if len(positions)==1:
-            potential_voxels.update(self.model.get_vehicle_voxels_at_pose(positions[0],zero_orientation,conservative_min,conservative_max))
+            potential_voxels.update(self.model.footprint_at(positions[0],zero_orientation,conservative_min,conservative_max))
         for start,end in zip(positions,positions[1:]):
             start_array=np.array([start.x,start.y,start.z],dtype=np.float64)
             end_array=np.array([end.x,end.y,end.z],dtype=np.float64)
@@ -148,7 +148,7 @@ class RiskCal():
                 fraction=sample_index/sample_count
                 sample=start_array+fraction*delta
                 sample_position=wm.Position(x=float(sample[0]),y=float(sample[1]),z=float(sample[2]))
-                potential_voxels.update(self.model.get_vehicle_voxels_at_pose(sample_position,zero_orientation,conservative_min,conservative_max))
+                potential_voxels.update(self.model.footprint_at(sample_position,zero_orientation,conservative_min,conservative_max))
 
         return ActionPrediction(cmd=command,potential_voxels=potential_voxels,distance=distance,terminal_position=positions[-1],terminal_orientation=orientation,frame_id=frame_id)
 
@@ -202,8 +202,8 @@ class RiskCal():
             try:
                 occupancy_min=vehicle_min.copy()
                 occupancy_min[2]+=0.03
-                target_voxels=self.model.get_vehicle_voxels_at_pose(destination,orientation,occupancy_min,vehicle_max)
-                target_observations=self.model.get_voxel_states_and_scores(target_voxels)
+                target_voxels=self.model.footprint_at(destination,orientation,occupancy_min,vehicle_max)
+                target_observations=self.model.states_scores(target_voxels)
             except (TypeError,ValueError):
                 return False,"Vehicle collision map is not ready or contains invalid data."
             occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.occupied_confidence_threshold for observation in target_observations)
@@ -311,8 +311,8 @@ class RiskCal():
                 try:
                     occupancy_min=vehicle_min.copy()
                     occupancy_min[2]+=0.03
-                    target_voxels=self.model.get_vehicle_voxels_at_pose(vantage_position,vantage_orientation,occupancy_min,vehicle_max)
-                    target_observations=self.model.get_voxel_states_and_scores(target_voxels)
+                    target_voxels=self.model.footprint_at(vantage_position,vantage_orientation,occupancy_min,vehicle_max)
+                    target_observations=self.model.states_scores(target_voxels)
                 except (TypeError,ValueError):
                     candidate_counts["target_footprint_check_failed"]+=1
                     continue

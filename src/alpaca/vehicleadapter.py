@@ -21,6 +21,7 @@ from nav_msgs.srv import GetPlan,GetPlanRequest
 from geometry_msgs.msg import PoseStamped,TwistStamped,Quaternion
 from alpaca_msgs.msg import SpatialObservationFrame, VoxelObservation as VoxelObservationMsg, ObservationFrame
 from sensor_msgs.msg import Image, BatteryState,CameraInfo, PointCloud2
+from cv_bridge import CvBridge
 from mavros_msgs.msg import State as MavrosState
 from tf.transformations import euler_from_quaternion,quaternion_from_euler,quaternion_matrix
 from . import worldmodel as wm
@@ -30,6 +31,7 @@ from sensor_msgs.msg import Imu
 from .risk import PathVoxelAssessment, VantagePoint
 import random
 from .vatools import VARegistry,Function
+from .depth import depth_points
 
 @dataclass
 class State():
@@ -103,6 +105,12 @@ class UGVAdapter(VehicleAdapter):
         self.lidar_condition=Condition()
         self.max_vp_voxels=2000000
         self.pending_lidar=None
+        self.camera_bridge=CvBridge()
+        self.camera_to_body_translation=np.asarray(kwargs.get("cammountpos",(0.15,0.0,0.0)),dtype=np.float64)
+        camera_angles=np.asarray(kwargs.get("cammountrot",(0.0,0.0,0.0)),dtype=np.float64)
+        if self.camera_to_body_translation.shape!=(3,) or camera_angles.shape!=(3,) or not np.all(np.isfinite(self.camera_to_body_translation)) or not np.all(np.isfinite(camera_angles)):
+            raise ValueError("Camera mount position and rotation must contain three finite values.")
+        self.camera_to_body_rotation=quaternion_matrix(quaternion_from_euler(*camera_angles))[:3,:3]@np.array([[0,0,1],[-1,0,0],[0,-1,0]],dtype=np.float64)
         self.stopping=False
         self.stopped=False
         self.vehicle_min = np.array([-0.15, -0.17, -0.25])
@@ -155,6 +163,7 @@ class UGVAdapter(VehicleAdapter):
         self.client=actionlib.SimpleActionClient("/move_base",MoveBaseAction)
 
         self.voxel_publisher = rospy.Publisher("voxel_observations",SpatialObservationFrame,queue_size=1)
+        self.camera_voxel_publisher=rospy.Publisher("camera_voxel_observations",SpatialObservationFrame,queue_size=1)
         self.movement_publisher = rospy.Publisher("/mavros/setpoint_position/local",PoseStamped,queue_size=1)
         self.pose_publisher = rospy.Publisher("vehicle_pose",Odometry,queue_size=1)
         self.camera_info_publisher = rospy.Publisher("camera_info", CameraInfo, queue_size=1)
@@ -184,6 +193,8 @@ class UGVAdapter(VehicleAdapter):
         self.randompx4thing=rospy.Subscriber("/mavros/local_position/pose",PoseStamped,callback=self._px4_callback)
         self.camera_synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         self.camera_synchronizer.registerCallback(self._adapter_callback)
+        self.camera_voxel_synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.camera_info_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.05)
+        self.camera_voxel_synchronizer.registerCallback(self._camera_callback)
         self.lidar_synchronizer = message_filters.ApproximateTimeSynchronizer([self.lidar_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.03)
         self.lidar_worker=Thread(target=self._process_lidar,daemon=True)
         self.lidar_worker.start()
@@ -338,7 +349,7 @@ class UGVAdapter(VehicleAdapter):
             for y in range(query_minimum_y,query_maximum_y+1)
             for z in range(query_minimum_z,query_maximum_z+1)
         ]
-        region_observations=self.voxelmodel.get_voxel_states_and_scores(region_indices)
+        region_observations=self.voxelmodel.states_scores(region_indices)
         persistent_occupied=np.fromiter(
             (observation is not None and observation[0]==1 and observation[1]>=self.riskcal.occupied_confidence_threshold for observation in region_observations),
             dtype=bool,
@@ -381,6 +392,53 @@ class UGVAdapter(VehicleAdapter):
             (int(x),int(y),int(z))
             for x,y,z in candidates
         }
+
+    def _camera_callback(self,depth_msg:Image,camera_info:CameraInfo,vehicle_pose:Odometry)->None:
+        if rospy.is_shutdown(): return
+        try:
+            if not depth_msg.header.frame_id or depth_msg.header.frame_id!=camera_info.header.frame_id:
+                raise ValueError("CameraInfo and depth image frame IDs do not match.")
+            if vehicle_pose.header.frame_id not in (self.navigation_frame,"camera_init") or vehicle_pose.child_frame_id not in ("base_link","body"):
+                raise ValueError("Camera voxel observations require the navigation and vehicle body frames.")
+            if depth_msg.header.stamp.to_nsec()<=0 or vehicle_pose.header.stamp.to_nsec()<=0 or abs((depth_msg.header.stamp-vehicle_pose.header.stamp).to_sec())>0.05:
+                raise ValueError("Camera depth and vehicle pose timestamps must be valid and within 0.05 seconds.")
+            depth=self.camera_bridge.imgmsg_to_cv2(depth_msg,desired_encoding="passthrough")
+            points=depth_points(depth,depth_msg.encoding,camera_info)
+            points_body=points@self.camera_to_body_rotation.T+self.camera_to_body_translation
+            points_body=points_body[(points_body[:,2]>=self.vehicle_min[2]-self.height_margin)&(points_body[:,2]<=self.vehicle_max[2]+self.height_margin)]
+            if len(points_body)>300:
+                points_body=points_body[random.sample(range(len(points_body)),300)]
+            pose=vehicle_pose.pose.pose
+            translation=np.array([pose.position.x,pose.position.y,pose.position.z],dtype=np.float64)
+            quaternion=np.array([pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w],dtype=np.float64)
+            if not np.all(np.isfinite(translation)) or not np.all(np.isfinite(quaternion)) or np.linalg.norm(quaternion)==0:
+                raise ValueError("Camera voxel observations require a finite pose and non-zero quaternion.")
+            rotation=quaternion_matrix(quaternion)[:3,:3]
+            points_world=points_body@rotation.T+translation
+            camera_origin_world=rotation@self.camera_to_body_translation+translation
+            voxel_counts:dict[tuple[int,int,int],list[int]]={}
+            for point in points_world:
+                free_voxels,occupied_voxel=self._raycast_voxels(camera_origin_world,point,self.roi_min,self.voxel_size)
+                for free_voxel in free_voxels:
+                    counts=voxel_counts.setdefault(free_voxel,[0,0])
+                    counts[0]+=1
+                counts=voxel_counts.setdefault(occupied_voxel,[0,0])
+                counts[1]+=1
+            voxel_frame=SpatialObservationFrame()
+            voxel_frame.header.stamp=depth_msg.header.stamp
+            voxel_frame.header.frame_id=self.navigation_frame
+            voxel_frame.source_id="UGV Camera"
+            voxel_frame.voxel_size=self.voxel_size
+            voxel_frame.grid_origin.x=float(self.roi_min[0])
+            voxel_frame.grid_origin.y=float(self.roi_min[1])
+            voxel_frame.grid_origin.z=float(self.roi_min[2])
+            voxel_frame.sensor_position.x=float(camera_origin_world[0])
+            voxel_frame.sensor_position.y=float(camera_origin_world[1])
+            voxel_frame.sensor_position.z=float(camera_origin_world[2])
+            voxel_frame.voxels=[VoxelObservationMsg(x=voxel[0],y=voxel[1],z=voxel[2],free_observations=counts[0],occupied_observations=counts[1]) for voxel,counts in voxel_counts.items()]
+            self._publish_if_active(self.camera_voxel_publisher,voxel_frame)
+        except Exception as error:
+            rospy.logerr_throttle(5.0,"Camera voxel processing failed: %s",error)
 
     def _px4_callback(self,msg:PoseStamped):
         self.px4_pose=msg
@@ -930,7 +988,7 @@ class UGVAdapter(VehicleAdapter):
             lower_center=self.voxelmodel.voxel_to_position((int(lower[0]),int(lower[1]),int(lower[2])))
             centers=np.array([lower_center.x,lower_center.y,lower_center.z])+(indices-lower)*voxel_size
             inside=(np.sum((centers[:,:2]-pos)**2,axis=1)<=radius**2)&(centers[:,2]>=minimum_z)&(centers[:,2]<=maximum_z)
-            observations=self.voxelmodel.get_voxel_states_and_scores([(int(x),int(y),int(z)) for x,y,z in indices[inside]])
+            observations=self.voxelmodel.states_scores([(int(x),int(y),int(z)) for x,y,z in indices[inside]])
             occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.riskcal.occupied_confidence_threshold for observation in observations)
             if occupied_count>=self.maximum_nearby_occupied_voxels:
                 continue

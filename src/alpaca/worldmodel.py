@@ -129,9 +129,9 @@ class VoxelWorldModel(Submodel):
             Function(name="world_position_to_voxel",arguments={"position":("Position",True)}),
             Function(name="voxel_to_position",arguments={"index":("tuple",True)}),
             Function(name="get_voxel_states",arguments={"indices":("list",True)}),
-            Function(name="get_voxel_states_and_scores",arguments={"indices":("list",True)}),
+            Function(name="states_scores",arguments={"indices":("list",True)}),
             Function(name="get_vehicle_voxels",arguments={"vehicle_pose":("Odometry",True),"vehicle_min":("ndarray",True),"vehicle_max":("ndarray",True)}),
-            Function(name="get_vehicle_voxels_at_pose",arguments={"position":("Position",True),"orientation":("Orientation",True),"vehicle_min":("ndarray",True),"vehicle_max":("ndarray",True)}),
+            Function(name="footprint_at",arguments={"position":("Position",True),"orientation":("Orientation",True),"vehicle_min":("ndarray",True),"vehicle_max":("ndarray",True)}),
             Function(name="get_unknown_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
             Function(name="get_filled_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
             Function(name="get_empty_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
@@ -198,18 +198,18 @@ class VoxelWorldModel(Submodel):
         if not np.all(np.isfinite(translation)) or not np.all(np.isfinite(quaternion)) or np.linalg.norm(quaternion)==0:
             raise ValueError("Vehicle pose must contain a finite position and a non-zero finite quaternion.")
         rotation=Rotation.from_quat(quaternion).as_matrix()
-        return self._get_vehicle_voxels_from_transform(translation,rotation,vehicle_min,vehicle_max)
+        return self._footprint(translation,rotation,vehicle_min,vehicle_max)
 
-    def get_vehicle_voxels_at_pose(self,position:Position,orientation:Orientation,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
+    def footprint_at(self,position:Position,orientation:Orientation,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
         """Obtain the vehicle's occupied voxels at a given pose."""
         pose_values=np.array([position.x,position.y,position.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
         if not np.all(np.isfinite(pose_values)):
             raise ValueError("Target position and orientation must contain only finite values.")
         translation=pose_values[:3]
         rotation=Rotation.from_euler("xyz",[orientation.roll,orientation.pitch,orientation.yaw]).as_matrix()
-        return self._get_vehicle_voxels_from_transform(translation,rotation,vehicle_min,vehicle_max)
+        return self._footprint(translation,rotation,vehicle_min,vehicle_max)
 
-    def _get_vehicle_voxels_from_transform(self,translation:np.ndarray,rotation:np.ndarray,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
+    def _footprint(self,translation:np.ndarray,rotation:np.ndarray,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
         """Obtaine the vehicle's occupied voxels after performing a transformation."""
         vehicle_min=np.asarray(vehicle_min,dtype=np.float64)
         vehicle_max=np.asarray(vehicle_max,dtype=np.float64)
@@ -296,7 +296,7 @@ class VoxelWorldModel(Submodel):
                 states.append(None if voxel is None else voxel.state)
             return states
 
-    def get_voxel_states_and_scores(self,indices:list[tuple[int,int,int]])->list[tuple[int | None,float] | None]:
+    def states_scores(self,indices:list[tuple[int,int,int]])->list[tuple[int | None,float] | None]:
         """Return atomic occupancy state/confidence snapshots for the requested voxels."""
         with self._lock:
             return [None if (voxel:=self._voxel_lookup.get(index)) is None else (voxel.state,voxel.score) for index in indices]
@@ -342,6 +342,89 @@ class VoxelWorldModel(Submodel):
         voxel_regions=self._get_voxel_regions(minimum,maximum)
         score=voxel_regions[1]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
         return score
+
+class CameraVoxelWorldModel(VoxelWorldModel):
+    """Populate a voxel model from the adapter's camera observations."""
+    def __init__(self,name:str="voxels_camera",observation_topic:str | None="camera_voxel_observations"):
+        super().__init__(name=name)
+        self.observation_topic=observation_topic
+        self.voxel_subscriber=None
+        self.voxel_learning_rate=0.25
+        self.maximum_voxel_rawscore=4.0
+        self.voxel_unknown_margin=0.2
+        self._last_voxel_stamps: dict[str,int]={}
+
+    def initwm(self)->None:
+        if self.observation_topic is not None and self.voxel_subscriber is None:
+            self.voxel_subscriber=rospy.Subscriber(self.observation_topic,SpatialObservationFrame,callback=self._voxel_callback)
+
+    def _voxel_callback(self, message: SpatialObservationFrame):
+        voxel_size=float(message.voxel_size)
+        origin_array=np.array([message.grid_origin.x,message.grid_origin.y,message.grid_origin.z],dtype=np.float64)
+        frame_id=message.header.frame_id
+        if not math.isfinite(voxel_size) or voxel_size<=0 or not np.all(np.isfinite(origin_array)):
+            rospy.logerr("Received voxel map with an invalid voxel size or grid origin.")
+            return
+        if not frame_id:
+            rospy.logerr("Received voxel map with an empty frame ID.")
+            return
+        sensor_position=getattr(message,"sensor_position",None)
+        if sensor_position is None or not all(math.isfinite(value) for value in (sensor_position.x,sensor_position.y,sensor_position.z)):
+            rospy.logerr("Voxel observations require a finite sensor_position; rebuild alpaca_msgs and restart both nodes.")
+            return
+        stamp=message.header.stamp.to_nsec()
+        if stamp<=0:
+            rospy.logwarn("Rejected voxel observations without a valid scan timestamp.")
+            return
+
+        with self._lock:
+            if stamp<=self._last_voxel_stamps.get(message.source_id,-1):
+                return
+            if self.voxelmap.grid_origin is None:
+                self.voxelmap.voxelsize=voxel_size
+                self.voxelmap.grid_origin=Position(x=float(origin_array[0]),y=float(origin_array[1]),z=float(origin_array[2]))
+                self.voxelmap.frame_id=frame_id
+            else:
+                stored_origin=np.array([self.voxelmap.grid_origin.x,self.voxelmap.grid_origin.y,self.voxelmap.grid_origin.z],dtype=np.float64)
+                if not math.isclose(self.voxelmap.voxelsize,voxel_size,rel_tol=0.0,abs_tol=1e-9) or not np.allclose(stored_origin,origin_array,rtol=0.0,atol=1e-9) or self.voxelmap.frame_id!=frame_id:
+                    rospy.logerr("Received voxel map whose size, origin, or frame differs from the established grid.")
+                    return
+
+            if not message.voxels:
+                rospy.logwarn("Received empty voxel map message.")
+                return
+
+            now=time.monotonic()
+            activity=self._observation_activity(sensor_position,now)
+            novelty=math.exp(-self.correlation_strength*activity)
+            updated=False
+            for observation in message.voxels:
+                index=(int(observation.x),int(observation.y),int(observation.z))
+                occupied=int(observation.occupied_observations)
+                free=int(observation.free_observations)
+                if occupied<0 or free<0 or occupied+free==0:
+                    continue
+                evidence=(2.0*occupied-free)/(2.0*occupied+free)
+                voxel=self._voxel_lookup.get(index)
+                new_voxel=voxel is None
+                if voxel is None:
+                    position_array=origin_array+np.asarray(index,dtype=np.float64)*voxel_size
+                    voxel=Voxel(position=Position(x=float(position_array[0]),y=float(position_array[1]),z=float(position_array[2])),state=None)
+                    self._voxel_lookup[index]=voxel
+                    self.voxelmap.voxels.append(voxel)
+                new_obstacle=evidence>0 and voxel.state==0
+                if new_obstacle:
+                    # Repeated viewing must not leave newly blocked space classified as free.
+                    voxel.rawscore=0.0
+                alpha=self.voxel_learning_rate*(1.0 if new_voxel or new_obstacle else novelty)
+                voxel.rawscore+=alpha*(self.maximum_voxel_rawscore*evidence-voxel.rawscore)
+                voxel.rawscore=max(-self.maximum_voxel_rawscore,min(self.maximum_voxel_rawscore,voxel.rawscore))
+                voxel.score=self.sigmoid(voxel.rawscore)
+                voxel.state=None if abs(voxel.score-0.5)<=self.voxel_unknown_margin else int(voxel.score>0.5)
+                updated=True
+            if updated:
+                self._observation_activity(sensor_position,now,deposit=True)
+                self._last_voxel_stamps[message.source_id]=stamp
 
 class LiDARVoxelWorldModel(VoxelWorldModel):
     """Populate a voxel model from the adapter's LiDAR observations."""

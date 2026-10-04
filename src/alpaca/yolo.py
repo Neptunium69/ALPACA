@@ -22,6 +22,7 @@ from cv_bridge import CvBridge
 from tf.transformations import euler_from_quaternion, quaternion_from_matrix
 import rospy
 import json
+from .depth import to_meters,pixel_points
 
 class YOLOAdapter():
     def __init__(self, model_path: str, sitl:bool=False, cammountpos: tuple=(0.15, 0.0, 0.0), cammountrot: tuple=(0.0, 0.0, 0.0)):
@@ -81,13 +82,7 @@ class YOLOAdapter():
 
     def _tometer(self, depth_value: np.ndarray, encoding:str) -> np.ndarray:
         """Convert depth value to meters."""
-        encoding = encoding.lower()
-        if encoding == "16uc1":
-            return depth_value.astype(np.float32) / 1000.0  # Assuming depth is in millimeters
-        elif encoding=="32fc1":
-            return depth_value.astype(np.float32)  # Already in meters
-        else:
-            raise ValueError("Unsupported depth image format")
+        return to_meters(depth_value,encoding)
 
     def _get_distance(self, depth: np.ndarray, box: Any,depth_encoding: str) -> tuple[float,int,int] | None:
         """Get depth to the object based on the bounding box and depth image."""
@@ -228,32 +223,7 @@ class YOLOAdapter():
                     if depth_sample is not None:
                         # Find the coordinates of the target.
                         Zc,u,v=depth_sample
-                        cx=camera_info_msg.K[2]
-                        cy=camera_info_msg.K[5]
-                        fx=camera_info_msg.K[0]
-                        fy=camera_info_msg.K[4]
-
-                        if fx==0 or fy==0:
-                            raise ValueError("Invalid fx or fy values")
-
-                        camera_matrix=np.asarray(camera_info_msg.K,dtype=np.float64).reshape(3,3)
-                        distortion=np.asarray(camera_info_msg.D,dtype=np.float64)
-                        pixel=np.asarray([[[u,v]]],dtype=np.float64)
-
-                        if distortion.size > 0 and np.any(np.abs(distortion) > 1e-12):
-                            if camera_info_msg.distortion_model in ["plumb_bob","rational_polynomial"]:
-                                undistorted_pixel=cv2.undistortPoints(pixel,camera_matrix,distortion)
-                            elif camera_info_msg.distortion_model=="equidistant":
-                                undistorted_pixel=cv2.fisheye.undistortPoints(pixel,camera_matrix,distortion[:4].reshape(4,1))
-                            else:
-                                raise ValueError(f"Unsupported distortion model: {camera_info_msg.distortion_model}")
-                            Xc=undistorted_pixel[0,0,0]*Zc
-                            Yc=undistorted_pixel[0,0,1]*Zc
-                        else:
-                            Xc=(u-cx)*Zc/fx
-                            Yc=(v-cy)*Zc/fy
-
-                        pc=np.array([Xc,Yc,Zc])
+                        pc=pixel_points(np.array([[u,v]]),np.array([Zc]),camera_info_msg)[0]
                         pb=body_transform@pc+self.cammountpos
 
                         rx=np.array([[1,0,0],[0,np.cos(roll),-np.sin(roll)],[0,np.sin(roll),np.cos(roll)]])
