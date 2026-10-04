@@ -106,6 +106,8 @@ class UGVAdapter(VehicleAdapter):
         self.lidar_condition=Condition()
         self.max_vp_voxels=2000000
         self.pending_lidar=None
+        self.camera_condition=Condition()
+        self.pending_camera=None
         self.camera_bridge=CvBridge()
         self.camera_to_body_translation=np.asarray(kwargs.get("cammountpos",(0.15,0.0,0.0)),dtype=np.float64)
         camera_angles=np.asarray(kwargs.get("cammountrot",(0.0,0.0,0.0)),dtype=np.float64)
@@ -196,7 +198,9 @@ class UGVAdapter(VehicleAdapter):
         self.camera_synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber], queue_size=10, slop=0.05)
         self.camera_synchronizer.registerCallback(self._adapter_callback)
         self.camera_voxel_synchronizer=message_filters.ApproximateTimeSynchronizer([self.depth_subscriber,self.camera_info_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.05)
-        self.camera_voxel_synchronizer.registerCallback(self._camera_callback)
+        self.camera_worker=Thread(target=self._process_camera,daemon=True)
+        self.camera_worker.start()
+        self.camera_voxel_synchronizer.registerCallback(self._queue_camera)
         self.lidar_synchronizer = message_filters.ApproximateTimeSynchronizer([self.lidar_subscriber,self.gnss_position_subscriber],queue_size=10,slop=0.03)
         self.lidar_worker=Thread(target=self._process_lidar,daemon=True)
         self.lidar_worker.start()
@@ -220,6 +224,24 @@ class UGVAdapter(VehicleAdapter):
                 self._lidar_callback(*pending)
             except Exception as error:
                 rospy.logerr("LiDAR processing failed: %s",error)
+
+    def _queue_camera(self,depth_msg:Image,camera_info:CameraInfo,vehicle_pose:Odometry)->None:
+        with self.camera_condition:
+            self.pending_camera=(depth_msg,camera_info,vehicle_pose)
+            self.camera_condition.notify()
+
+    def _process_camera(self)->None:
+        while not rospy.is_shutdown():
+            with self.camera_condition:
+                self.camera_condition.wait_for(lambda:self.pending_camera is not None or rospy.is_shutdown(),timeout=0.1)
+                if rospy.is_shutdown(): return
+                pending=self.pending_camera
+                self.pending_camera=None
+            if pending is None: continue
+            try:
+                self._camera_callback(*pending)
+            except Exception as error:
+                rospy.logerr("Camera voxel processing failed: %s",error)
 
     def _imu_callback(self,msg:Imu):
         self.current_yawrate=msg.angular_velocity.z
