@@ -154,6 +154,10 @@ class VoxelWorldModel(Submodel):
         """The base voxel model has no sensor subscriptions."""
         pass
 
+    def get_voxels(self):
+        with self._lock:
+            return self._voxel_lookup
+
     @staticmethod
     def sigmoid(x):
         return 1/(1+e**-x)
@@ -345,6 +349,25 @@ class VoxelWorldModel(Submodel):
         voxel_regions=self._get_voxel_regions(minimum,maximum)
         score=voxel_regions[1]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
         return score
+    
+    @staticmethod
+    def cluster_voxels(indices:set[tuple[int,int,int]],voxel_size:float,gap:float,min_samples:int=3):
+        if not indices:
+            return [],set()
+
+        keys=list(indices)
+        points=np.asarray(keys,dtype=np.float64)*voxel_size
+        labels=DBSCAN(eps=gap,min_samples=min_samples).fit_predict(points)
+
+        groups={}
+        unresolved=set()
+        for index,label in zip(keys,labels):
+            if label==-1:
+                unresolved.add(index)
+            else:
+                groups.setdefault(int(label),set()).add(index)
+
+        return list(groups.values()),unresolved
 
 class MasterVoxelWorldModel(VoxelWorldModel):
     """Syncronizes the two world models"""

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from . import worldmodel as wm
 from .dataclasses import FCExecute
 from .vatools import VAInterface
-from .worldmodel import Voxel
+from .worldmodel import Voxel, VoxelWorldModel
 
 class Command(Protocol):
     @property
@@ -34,6 +34,7 @@ class ActionPrediction:
     terminal_position: Position
     terminal_orientation: Orientation
     frame_id: str
+    path: Path
 
 @dataclass
 class PathVoxelAssessment:
@@ -150,7 +151,7 @@ class RiskCal():
                 sample_position=wm.Position(x=float(sample[0]),y=float(sample[1]),z=float(sample[2]))
                 potential_voxels.update(self.model.footprint_at(sample_position,zero_orientation,conservative_min,conservative_max))
 
-        return ActionPrediction(cmd=command,potential_voxels=potential_voxels,distance=distance,terminal_position=positions[-1],terminal_orientation=orientation,frame_id=frame_id)
+        return ActionPrediction(cmd=command,potential_voxels=potential_voxels,distance=distance,terminal_position=positions[-1],terminal_orientation=orientation,frame_id=frame_id,path=path)
 
     @staticmethod
     def _path_positions(path:Path)->list[Position]:
@@ -237,7 +238,12 @@ class RiskCal():
         occupied_voxels:set[tuple[int,int,int]]=set()
         unknown_voxels:set[tuple[int,int,int]]=set()
         potential_voxels=list(prediction.potential_voxels)
-        voxel_states=self.model.get_voxel_states(potential_voxels)
+        route_heights={index[2] for index in potential_voxels}
+        with self.model._lock:
+            map_states={index:voxel.state for index,voxel in self.model.get_voxels().items()}
+            voxel_size=self.model.get_voxel_size()
+        voxel_states=[map_states.get(index) for index in potential_voxels]
+        clusters,unclustered=VoxelWorldModel.cluster_voxels({index for index,state in map_states.items() if state==1 and index[2] in route_heights},voxel_size,0.1)
         for voxel,state in zip(potential_voxels,voxel_states):
             if state==0:
                 free_voxels.add(voxel)
@@ -250,10 +256,13 @@ class RiskCal():
         pathvoxel=PathVoxelAssessment(occupied_voxels=occupied_voxels,unknown_voxels=unknown_voxels,free_voxels=free_voxels)
         if pathvoxel.total_count==0:
             return {"Safe":False,"Reason":"Navigation prediction contains no voxels."}
-        if pathvoxel.occupied_score>self.occupied_route_threshold:
-            return {"Safe":False,"Reason":"Path contains excessive obstacles."}
+        blocking_clusters=[cluster for cluster in clusters if not cluster.isdisjoint(prediction.potential_voxels)]
+        if blocking_clusters:
+            return {"Safe":False,"Reason":"Objects are present within the planned route","Blocked Clusters":blocking_clusters,"Needs Replan":True}
 
-        if (len(occupied_voxels)+len(unknown_voxels))/pathvoxel.total_count>self.information_route_threshold and pathvoxel.occupied_score<self.occupied_route_threshold:
+        unknown_clusters,_=VoxelWorldModel.cluster_voxels({index for index,state in map_states.items() if state is None and index[2] in route_heights} | unknown_voxels,voxel_size,0.1,min_samples=1)
+        unknown_clusters=[cluster for cluster in unknown_clusters if not cluster.isdisjoint(prediction.potential_voxels)]
+        if unknown_clusters:
             vp=self.vainterface.execute(FCExecute(function="vantagepoint",arguments={"pathvoxel":pathvoxel})).data
             center_position=self.model.voxel_to_position(self.center(pathvoxel))
             total_unknown_value=float(len(unknown_voxels))
@@ -293,7 +302,7 @@ class RiskCal():
             candidates_to_evaluate=known_free_candidates[:self.maximum_vantage_candidates]
             vehicle_pose,vehicle_min,vehicle_max=self.vainterface.execute(FCExecute(function="get_collision_geometry",arguments={})).data
             if vehicle_pose is None:
-                return {"Safe":False,"Reason":"Vehicle localization is not ready.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts}
+                return {"Safe":False,"Reason":"Vehicle localization is not ready.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts,"Unknown Clusters":unknown_clusters}
             evaluation_started=time.monotonic()
 
             for candidate_index,(_,vantage_voxel,vantage_position) in enumerate(candidates_to_evaluate):
@@ -361,10 +370,10 @@ class RiskCal():
             candidate_counts["evaluation_seconds"]=round(time.monotonic()-evaluation_started,3)
             rospy.loginfo("Vantage candidates: total=%d, destination_not_free=%d, known_free=%d, evaluated=%d, limited_out=%d, timed_out=%d, target_check_failed=%d, target_unsafe=%d, planning_failed=%d, empty_path=%d, path_over_20_percent_occupied=%d, accepted=%d, time_budget_exhausted=%s, evaluation_seconds=%.3f.",candidate_counts["total"],candidate_counts["destination_not_free"],candidate_counts["known_free"],candidate_counts["evaluated"],candidate_counts["not_evaluated_due_to_limit"],candidate_counts["not_evaluated_due_to_time"],candidate_counts["target_footprint_check_failed"],candidate_counts["target_footprint_unsafe"],candidate_counts["planning_failed"],candidate_counts["empty_path"],candidate_counts["path_over_20_percent_occupied"],candidate_counts["accepted"],candidate_counts["time_budget_exhausted"],candidate_counts["evaluation_seconds"])
             if not options:
-                return {"Safe":False,"Reason":"No vantage points available.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts}
+                return {"Safe":False,"Reason":"No vantage points available.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts,"Unknown Clusters":unknown_clusters}
             best_option=max(options,key=lambda option:option["Profit"])
             if best_option["Profit"]<=0:
-                return {"Safe":False,"Reason":"No vantage points have an expected value greater than cost.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts,"Vantage Options":options}
-            return {"Safe":False,"Reason":"Route requires more information.","Needs Information":True,"Inform User":False,"Candidate Counts":candidate_counts,"Best Vantage Point":best_option,"Vantage Options":options,"Prediction":prediction,"Assessment":pathvoxel}
+                return {"Safe":False,"Reason":"No vantage points have an expected value greater than cost.","Needs Information":True,"Inform User":True,"Candidate Counts":candidate_counts,"Vantage Options":options,"Unknown Clusters":unknown_clusters}
+            return {"Safe":False,"Reason":"Route requires more information.","Needs Information":True,"Inform User":False,"Candidate Counts":candidate_counts,"Best Vantage Point":best_option,"Vantage Options":options,"Prediction":prediction,"Assessment":pathvoxel,"Unknown Clusters":unknown_clusters}
 
         return {"Safe":True,"Reason":"Route accepted.","Prediction":prediction,"Assessment":pathvoxel}

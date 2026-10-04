@@ -10,7 +10,7 @@ from math import pi,isfinite
 import actionlib
 from actionlib_msgs.msg import GoalStatus
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64,Header
 import sensor_msgs.point_cloud2 as pc2
 import rospy
 import message_filters
@@ -73,7 +73,8 @@ class UGVAdapter(VehicleAdapter):
             Function(name="require_navigation_ready",arguments={"action_name":("str",True)}),
             Function(name="get_collision_geometry",arguments={}),
             Function(name="plan_path",arguments={"destination":("Position",True),"orientation":("Orientation",True),"frame_id":("str",False),"tolerance":("float",False)}),
-            Function(name="navigate",arguments={"destination":("Position",True),"orientation":("Orientation",True),"frame_id":("str",False)}),
+            Function(name="navigate",arguments={"destination":("Position",True),"orientation":("Orientation",True),"frame_id":("str",False),"path":("Path",True)}),
+            Function(name="send_occ",arguments={"voxels":("list",True)}),
             Function(name="scan",arguments={"yaw_margin":("float",False)}),
             Function(name="vantagepoint",arguments={"pathvoxel":("PathVoxelAssessment",True),"max_updates":("int",False)}),
             Function(name="hiddenpoints",arguments={"object_id":("str",True),"state":("State",True),"distance_behind":("float",False)}),
@@ -164,6 +165,7 @@ class UGVAdapter(VehicleAdapter):
 
         self.voxel_publisher = rospy.Publisher("voxel_observations",SpatialObservationFrame,queue_size=1)
         self.camera_voxel_publisher=rospy.Publisher("camera_voxel_observations",SpatialObservationFrame,queue_size=1)
+        self.obstacle_publisher=rospy.Publisher("/alpaca/blocked_voxels",PointCloud2,queue_size=1,latch=True)
         self.movement_publisher = rospy.Publisher("/mavros/setpoint_position/local",PoseStamped,queue_size=1)
         self.pose_publisher = rospy.Publisher("vehicle_pose",Odometry,queue_size=1)
         self.camera_info_publisher = rospy.Publisher("camera_info", CameraInfo, queue_size=1)
@@ -535,6 +537,18 @@ class UGVAdapter(VehicleAdapter):
             self.last_pose_monotonic=time.monotonic()
         self._publish_if_active(self.pose_publisher,vehicle_pose)
 
+    def send_occ(self,voxels:list[set[tuple[int,int,int]]])->None:
+        points=[]
+        with self.voxelmodel._lock:
+            frame=self.voxelmodel.get_voxel_map_frame()
+            if not frame:
+                raise ValueError("Voxel map frame is unavailable.")
+            for index in set().union(*voxels):
+                position=self.voxelmodel.voxel_to_position(index)
+                points.append((position.x,position.y,position.z))
+        message=pc2.create_cloud_xyz32(Header(stamp=rospy.Time.now(),frame_id=frame),points)
+        self.obstacle_publisher.publish(message)
+
     @staticmethod
     def _publish_if_active(publisher,message)->None:
         if rospy.is_shutdown():
@@ -890,7 +904,7 @@ class UGVAdapter(VehicleAdapter):
             detection_subscriber.unregister()
             self.moveflag=False
 
-    def navigate(self, destination: Position, orientation: Orientation, frame_id: str | None=None) -> None:
+    def navigate(self, destination: Position, orientation: Orientation, path: Path, frame_id: str | None=None) -> None:
         """Moves the vehicle."""
         if self.client is None:
             raise RuntimeError("Sensor data must be initialized before navigation.")
@@ -900,7 +914,13 @@ class UGVAdapter(VehicleAdapter):
         frame_id=self.navigation_frame if frame_id is None else frame_id
         if not isinstance(frame_id,str) or not frame_id.strip():
             raise ValueError("Navigation frame must be a non-empty string.")
-        path=self.plan_path(destination,orientation,frame_id)
+        self._require_vehicle_ready("navigate")
+        if not isinstance(path,Path) or not path.poses:
+            raise ValueError("An assessed, non-empty path is required for navigation.")
+        if path.header.frame_id and path.header.frame_id!=frame_id:
+            raise ValueError(f"Assessed path uses frame {path.header.frame_id!r}, expected {frame_id!r}.")
+        if any(pose.header.frame_id and pose.header.frame_id!=frame_id for pose in path.poses):
+            raise ValueError("The assessed path contains poses in an unexpected coordinate frame.")
         try:
             try:
                 flag=False
