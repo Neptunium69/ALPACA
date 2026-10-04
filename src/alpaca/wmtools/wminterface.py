@@ -28,7 +28,7 @@ class WorldModelInterface():
             raise ValueError("World model command arguments must be a dictionary.")
 
         model=self.world_model.get(submodel)
-        functions=model.registry.tools
+        functions=self.world_model.registry[submodel].tools
         if cmd.function not in [fcn.name for fcn in functions]:
             raise ValueError(f"{cmd.function} is not valid for submodel {submodel!r} in world model {self.wmname}.")
         functionschema=next(fcn for fcn in functions if fcn.name==cmd.function)

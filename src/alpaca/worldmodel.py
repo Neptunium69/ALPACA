@@ -87,6 +87,7 @@ class VoxelModel:
 class WorldModel():
     def __init__(self) -> None:
         self.submodels:list[Submodel]=[]
+        self.registry:dict[str,WMRegistry]={}
 
     @property
     def modelnames(self)->list[str]:
@@ -96,6 +97,7 @@ class WorldModel():
         for model in models:
             if model.name not in self.modelnames:
                 self.submodels.append(model)
+                self.registry[model.name]=model.registry
             else:
                 warnings.warn(f"Submodel {model.name} was not added as another submodel of the same name is already in the World Model.")
 
@@ -107,6 +109,7 @@ class WorldModel():
 
     def remove(self,name:str)->None:
         self.submodels.remove(self.get(name))
+        del self.registry[name]
 
     def initwm(self)->None:
         for model in self.submodels:
