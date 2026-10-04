@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from copy import deepcopy
-from threading import RLock
+from threading import RLock, Thread
 import rospy
+from sklearn.cluster import DBSCAN
 import numpy as np
 import warnings
 from scipy.spatial.transform import Rotation
@@ -23,7 +24,6 @@ from sklearn.neighbors import KNeighborsClassifier
 from math import e
 import json
 import time
-
 @dataclass
 class Position:
     x: float
@@ -345,6 +345,53 @@ class VoxelWorldModel(Submodel):
         voxel_regions=self._get_voxel_regions(minimum,maximum)
         score=voxel_regions[1]/(voxel_regions[0]+voxel_regions[1]+voxel_regions[2])
         return score
+
+class MasterVoxelWorldModel(VoxelWorldModel):
+    """Syncronizes the two world models"""
+    def __init__(self,wms:list[VoxelWorldModel],frequency:float=5.0,important_wms:tuple[str,str]=("camera_world_model","lidar_world_model")):
+        super().__init__()
+        self.vwms:dict[str,VoxelWorldModel]={}
+        self.period=1/frequency
+        self._locker=RLock()
+        self.lr=0.1
+
+        self.important_wms=important_wms
+        self.thread=Thread(target=self._syncronization_callback,name="voxel-fusion",daemon=True)
+        for wm in wms:
+            if wm.name not in [wmname for wmname in self.vwms]:
+                self.vwms[wm.name]=wm
+            else:
+                raise RuntimeError(f"World model {wm.name} is already added.")
+    def init_syncronize(self):
+        self.thread.start()
+    def _syncronization_callback(self):
+        deadline=time.monotonic()+self.period
+        while True:
+            with self._locker:
+                # 2 world models are used for first prototype. Later versions will generalize the algorithm to any number of voxel world models.
+                camvwm=deepcopy(self.vwms[self.important_wms[0]])
+                lidvwm=deepcopy(self.vwms[self.important_wms[1]])
+
+                voxels=camvwm._voxel_lookup.keys() | lidvwm._voxel_lookup.keys()
+                for voxel in voxels:
+                    voxelcam=camvwm._voxel_lookup.get(voxel)
+                    voxellid=lidvwm._voxel_lookup.get(voxel)
+                    camera_score=0.5 if voxelcam is None else voxelcam.score
+                    lidar_score=0.5 if voxellid is None else voxellid.score
+                    master_voxel=self._voxel_lookup.get(voxel)
+                    master_score=0.5 if master_voxel is None else master_voxel.score
+                    fused_score=master_score+self.lr/2*((1-((camera_score-lidar_score)**2 if voxelcam is not None and voxellid is not None else 0))*((int(voxelcam is not None)+int(voxellid is not None))/2*(camera_score+lidar_score-1)-abs(camera_score+lidar_score-1)*(2*master_score-1))-(1-(1-((camera_score-lidar_score)**2 if voxelcam is not None and voxellid is not None else 0)))*(2*master_score-1))
+                    with self._lock:
+                        if master_voxel is None:
+                            source_voxel=next(source for source in (voxelcam,voxellid) if source is not None)
+                            master_voxel=Voxel(position=deepcopy(source_voxel.position),state=None)
+                            self._voxel_lookup[voxel]=master_voxel
+                            self.voxelmap.voxels.append(master_voxel)
+                        master_voxel.score=fused_score
+
+            deadline+=self.period
+            if deadline<=time.monotonic():
+                deadline=time.monotonic()+self.period
 
 class CameraVoxelWorldModel(VoxelWorldModel):
     """Populate a voxel model from the adapter's camera observations."""
