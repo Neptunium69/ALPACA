@@ -78,6 +78,7 @@ class RiskCal():
         self.maximum_vantage_candidates=32
         self.maximum_vantage_evaluation_seconds=30.0
         self.vantage_prediction_speed=0.3
+        self.cs_occ_ratio=0.05
 
     def _vantage_reward(self,position:Position,observable_voxels:set[tuple[int,int,int]],total_unknown_value:float,path_distance:float,observation_probability:float)->tuple[float,float]:
         """Range-based visibility, uniform route weights, uncertainty and predicted novelty."""
@@ -262,7 +263,20 @@ class RiskCal():
 
         unknown_clusters,_=VoxelWorldModel.cluster_voxels({index for index,state in map_states.items() if state is None and index[2] in route_heights} | unknown_voxels,voxel_size,0.1,min_samples=1)
         unknown_clusters=[cluster for cluster in unknown_clusters if not cluster.isdisjoint(prediction.potential_voxels)]
-        if unknown_clusters:
+        path_sections={}
+        for x,y,z in prediction.potential_voxels:
+            path_sections.setdefault(x,set()).add((y,z))
+
+        areas=[]
+        for unknown_cluster in unknown_clusters:
+            cluster_sections={}
+            for x,y,z in unknown_cluster & prediction.potential_voxels:
+                cluster_sections.setdefault(x,set()).add((y,z))
+            areas.append(max(
+                100.0*len(cells)/len(path_sections[x])
+                for x,cells in cluster_sections.items()
+            ))
+        if max(areas)>self.cs_occ_ratio:
             vp=self.vainterface.execute(FCExecute(function="vantagepoint",arguments={"pathvoxel":pathvoxel})).data
             center_position=self.model.voxel_to_position(self.center(pathvoxel))
             total_unknown_value=float(len(unknown_voxels))

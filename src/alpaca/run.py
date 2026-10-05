@@ -29,7 +29,6 @@ from std_msgs.msg import Float64
 from std_srvs.srv import Trigger,TriggerResponse
 from mavros_msgs.msg import State as MavrosState
 from mavros_msgs.srv import CommandBool
-from ...deploy.px4_shutdown import run_shutdown
 from alpaca_msgs.msg import ObservationFrame,SpatialObservationFrame
 
 # Prompts and stuff
@@ -74,12 +73,16 @@ def main():
     observations=worldmodel.Model()
     model=worldmodel.WorldModel()
     object_model=worldmodel.ObjectWorldModel(observations,["apple","board"])
-    voxel_model=worldmodel.LiDARVoxelWorldModel()
+    voxel_model=worldmodel.LiDARVoxelWorldModel(name="voxels_lidar")
     camera_model=worldmodel.CameraVoxelWorldModel()
-    model.add([object_model,voxel_model,camera_model])
+    master_voxel_model=worldmodel.MasterVoxelWorldModel(
+        [camera_model,voxel_model],
+        important_wms=(camera_model.name,voxel_model.name),
+    )
+    model.add([object_model,voxel_model,camera_model,master_voxel_model])
     adapter=vehicleadapter.UGVAdapter(model,None)
     vainterface=VAInterface(adapter,"primary")
-    rcm=risk.RiskCal(voxel_model,vainterface)
+    rcm=risk.RiskCal(master_voxel_model,vainterface)
     adapter.riskcal=rcm
     detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
     vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
@@ -123,7 +126,16 @@ def main():
             shutdown_hold()
             while not rospy.is_shutdown():
                 try:
-                    if run_shutdown(rospy,MavrosState,CommandBool,Trigger,initialize_node=False)==0:
+                    state=rospy.wait_for_message("/mavros/state",MavrosState,timeout=2.0)
+                    if not state.connected:
+                        raise RuntimeError("MAVROS is disconnected; disarm cannot be confirmed.")
+                    if state.armed:
+                        rospy.wait_for_service("/mavros/cmd/arming",timeout=2.0)
+                        response=rospy.ServiceProxy("/mavros/cmd/arming",CommandBool)(value=False)
+                        if not response.success:
+                            raise RuntimeError("PX4 rejected the disarm request.")
+                        state=rospy.wait_for_message("/mavros/state",MavrosState,timeout=2.0)
+                    if state.connected and not state.armed:
                         adapter.timer.shutdown()
                         adapter.stopped=True
                         return
