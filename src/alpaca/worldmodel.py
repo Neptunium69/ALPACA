@@ -379,7 +379,7 @@ class VoxelWorldModel(Submodel):
 class MasterVoxelWorldModel(VoxelWorldModel):
     """Syncronizes the two world models"""
     def __init__(self,wms:list[VoxelWorldModel],frequency:float=5.0,important_wms:tuple[str,str]=("camera_world_model","lidar_world_model")):
-        super().__init__()
+        super().__init__(name="master_voxel_world_model")
         self.vwms:dict[str,VoxelWorldModel]={}
         self.period=1/frequency
         self._locker=RLock()
@@ -392,8 +392,9 @@ class MasterVoxelWorldModel(VoxelWorldModel):
                 self.vwms[wm.name]=wm
             else:
                 raise RuntimeError(f"World model {wm.name} is already added.")
-    def init_syncronize(self):
-        self.thread.start()
+    def initwm(self):
+        if not self.thread.is_alive():
+            self.thread.start()
     def _syncronization_callback(self):
         deadline=time.monotonic()+self.period
         while True:
