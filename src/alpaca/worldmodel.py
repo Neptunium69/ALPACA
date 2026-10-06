@@ -129,6 +129,8 @@ class VoxelWorldModel(Submodel):
             Function(name="get_observation_novelty",arguments={"position":("Position",True),"arrival_seconds":("float",False)}),
             Function(name="get_voxel_map_frame",arguments={}),
             Function(name="get_voxel_size",arguments={}),
+            Function(name="get_voxel_snapshot",arguments={}),
+            Function(name="cluster_voxels",arguments={"indices":("set",True),"voxel_size":("float",True),"gap":("float",True),"min_samples":("int",False)}),
             Function(name="world_position_to_voxel",arguments={"position":("Position",True)}),
             Function(name="voxel_to_position",arguments={"index":("tuple",True)}),
             Function(name="get_voxel_states",arguments={"indices":("list",True)}),
@@ -157,6 +159,11 @@ class VoxelWorldModel(Submodel):
     def get_voxels(self):
         with self._lock:
             return self._voxel_lookup
+
+    def get_voxel_snapshot(self)->tuple[dict[tuple[int,int,int],int | None],float]:
+        """Copy voxel states and grid size together for a consistent route assessment."""
+        with self._lock:
+            return {index:voxel.state for index,voxel in self._voxel_lookup.items()},self.get_voxel_size()
 
     @staticmethod
     def sigmoid(x):

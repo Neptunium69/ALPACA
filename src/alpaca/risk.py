@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import TYPE_CHECKING,Any,Callable,Protocol
+from typing import TYPE_CHECKING,Any,Protocol
 
 import numpy as np
 import rospy
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from . import worldmodel as wm
 from .dataclasses import FCExecute
 from .vatools import VAInterface
-from .worldmodel import Voxel, VoxelWorldModel
+from .wmtools import WorldModelInterface
 
 class Command(Protocol):
     @property
@@ -68,8 +68,8 @@ class VantagePoint:
     straight_line_distance: float
 
 class RiskCal():
-    def __init__(self,model:wm.VoxelWorldModel,vainterface:VAInterface)->None:
-        self.model=model
+    def __init__(self,wminterface:WorldModelInterface,vainterface:VAInterface)->None:
+        self.wminterface=wminterface
         self.vainterface=vainterface
         self.occupied_confidence_threshold=0.1
         self.occupied_route_threshold=0.20
@@ -82,9 +82,9 @@ class RiskCal():
 
     def _vantage_reward(self,position:Position,observable_voxels:set[tuple[int,int,int]],total_unknown_value:float,path_distance:float,observation_probability:float)->tuple[float,float]:
         """Range-based visibility, uniform route weights, uncertainty and predicted novelty."""
-        observations=self.model.states_scores(list(observable_voxels))
+        observations=self.wminterface.execute(FCExecute(function="states_scores",arguments={"indices":list(observable_voxels)}),submodel="voxels_master").data
         uncertainty=sum(1.0 if observation is None else max(0.0,1.0-2.0*abs(observation[1]-0.5)) for observation in observations)
-        novelty=self.model.get_observation_novelty(position,arrival_seconds=path_distance/self.vantage_prediction_speed)
+        novelty=self.wminterface.execute(FCExecute(function="get_observation_novelty",arguments={"position":position,"arrival_seconds":path_distance/self.vantage_prediction_speed}),submodel="voxels_master").data
         reward=observation_probability*novelty*uncertainty/total_unknown_value if total_unknown_value>0 else 0.0
         return reward,novelty
 
@@ -131,14 +131,14 @@ class RiskCal():
         cover_radius=math.hypot(maximum_x,maximum_y)+float(coverage_margin)
         conservative_min=np.array([-cover_radius,-cover_radius,vehicle_min[2]+0.03],dtype=np.float64)
         conservative_max=np.array([cover_radius,cover_radius,vehicle_max[2]],dtype=np.float64)
-        voxel_size=self.model.get_voxel_size()
+        voxel_size=self.wminterface.execute(FCExecute(function="get_voxel_size",arguments={}),submodel="voxels_master").data
         sample_spacing=voxel_size
         potential_voxels:set[tuple[int,int,int]]=set()
         zero_orientation=wm.Orientation(pitch=0.0,yaw=0.0,roll=0.0)
         distance=0.0
 
         if len(positions)==1:
-            potential_voxels.update(self.model.footprint_at(positions[0],zero_orientation,conservative_min,conservative_max))
+            potential_voxels.update(self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":positions[0],"orientation":zero_orientation,"vehicle_min":conservative_min,"vehicle_max":conservative_max}),submodel="voxels_master").data)
         for start,end in zip(positions,positions[1:]):
             start_array=np.array([start.x,start.y,start.z],dtype=np.float64)
             end_array=np.array([end.x,end.y,end.z],dtype=np.float64)
@@ -150,7 +150,7 @@ class RiskCal():
                 fraction=sample_index/sample_count
                 sample=start_array+fraction*delta
                 sample_position=wm.Position(x=float(sample[0]),y=float(sample[1]),z=float(sample[2]))
-                potential_voxels.update(self.model.footprint_at(sample_position,zero_orientation,conservative_min,conservative_max))
+                potential_voxels.update(self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":sample_position,"orientation":zero_orientation,"vehicle_min":conservative_min,"vehicle_max":conservative_max}),submodel="voxels_master").data)
 
         return ActionPrediction(cmd=command,potential_voxels=potential_voxels,distance=distance,terminal_position=positions[-1],terminal_orientation=orientation,frame_id=frame_id,path=path)
 
@@ -195,7 +195,7 @@ class RiskCal():
             if vehicle_pose is None:
                 return False,"Vehicle localization is not ready."
             pose_frame=vehicle_pose.header.frame_id
-            voxel_frame=self.model.get_voxel_map_frame()
+            voxel_frame=self.wminterface.execute(FCExecute(function="get_voxel_map_frame",arguments={}),submodel="voxels_master").data
             if not pose_frame or voxel_frame is None:
                 return False,"Vehicle localization or voxel map is not ready."
             navigation_frame=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
@@ -204,8 +204,8 @@ class RiskCal():
             try:
                 occupancy_min=vehicle_min.copy()
                 occupancy_min[2]+=0.03
-                target_voxels=self.model.footprint_at(destination,orientation,occupancy_min,vehicle_max)
-                target_observations=self.model.states_scores(target_voxels)
+                target_voxels=self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":destination,"orientation":orientation,"vehicle_min":occupancy_min,"vehicle_max":vehicle_max}),submodel="voxels_master").data
+                target_observations=self.wminterface.execute(FCExecute(function="states_scores",arguments={"indices":target_voxels}),submodel="voxels_master").data
             except (TypeError,ValueError):
                 return False,"Vehicle collision map is not ready or contains invalid data."
             occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.occupied_confidence_threshold for observation in target_observations)
@@ -240,11 +240,9 @@ class RiskCal():
         unknown_voxels:set[tuple[int,int,int]]=set()
         potential_voxels=list(prediction.potential_voxels)
         route_heights={index[2] for index in potential_voxels}
-        with self.model._lock:
-            map_states={index:voxel.state for index,voxel in self.model.get_voxels().items()}
-            voxel_size=self.model.get_voxel_size()
+        map_states,voxel_size=self.wminterface.execute(FCExecute(function="get_voxel_snapshot",arguments={}),submodel="voxels_master").data
         voxel_states=[map_states.get(index) for index in potential_voxels]
-        clusters,unclustered=VoxelWorldModel.cluster_voxels({index for index,state in map_states.items() if state==1 and index[2] in route_heights},voxel_size,0.1)
+        clusters,unclustered=self.wminterface.execute(FCExecute(function="cluster_voxels",arguments={"indices":{index for index,state in map_states.items() if state==1 and index[2] in route_heights},"voxel_size":voxel_size,"gap":0.1}),submodel="voxels_master").data
         for voxel,state in zip(potential_voxels,voxel_states):
             if state==0:
                 free_voxels.add(voxel)
@@ -261,7 +259,7 @@ class RiskCal():
         if blocking_clusters:
             return {"Safe":False,"Reason":"Objects are present within the planned route","Blocked Clusters":blocking_clusters,"Needs Replan":True}
 
-        unknown_clusters,_=VoxelWorldModel.cluster_voxels({index for index,state in map_states.items() if state is None and index[2] in route_heights} | unknown_voxels,voxel_size,0.1,min_samples=1)
+        unknown_clusters,_=self.wminterface.execute(FCExecute(function="cluster_voxels",arguments={"indices":{index for index,state in map_states.items() if state is None and index[2] in route_heights} | unknown_voxels,"voxel_size":voxel_size,"gap":0.1,"min_samples":1}),submodel="voxels_master").data
         unknown_clusters=[cluster for cluster in unknown_clusters if not cluster.isdisjoint(prediction.potential_voxels)]
         path_sections={}
         for x,y,z in prediction.potential_voxels:
@@ -278,7 +276,7 @@ class RiskCal():
             ))
         if max(areas)>self.cs_occ_ratio:
             vp=self.vainterface.execute(FCExecute(function="vantagepoint",arguments={"pathvoxel":pathvoxel})).data
-            center_position=self.model.voxel_to_position(self.center(pathvoxel))
+            center_position=self.wminterface.execute(FCExecute(function="voxel_to_position",arguments={"index":self.center(pathvoxel)}),submodel="voxels_master").data
             total_unknown_value=float(len(unknown_voxels))
             reference_distance=max(prediction.distance,1.0)
             options=[]
@@ -303,11 +301,11 @@ class RiskCal():
             robot_position=vehicle_state.data["position"]
             known_free_candidates=[]
             for vantage_voxel in vp:
-                vantage_state=self.model.get_voxel_states([vantage_voxel])[0]
+                vantage_state=self.wminterface.execute(FCExecute(function="get_voxel_states",arguments={"indices":[vantage_voxel]}),submodel="voxels_master").data[0]
                 if vantage_state!=0:
                     candidate_counts["destination_not_free"]+=1
                     continue
-                vantage_position=self.model.voxel_to_position(vantage_voxel)
+                vantage_position=self.wminterface.execute(FCExecute(function="voxel_to_position",arguments={"index":vantage_voxel}),submodel="voxels_master").data
                 distance_squared=(vantage_position.x-robot_position.x)**2+(vantage_position.y-robot_position.y)**2
                 known_free_candidates.append((distance_squared,vantage_voxel,vantage_position))
             known_free_candidates.sort(key=lambda candidate:(candidate[0],candidate[1]))
@@ -334,8 +332,8 @@ class RiskCal():
                 try:
                     occupancy_min=vehicle_min.copy()
                     occupancy_min[2]+=0.03
-                    target_voxels=self.model.footprint_at(vantage_position,vantage_orientation,occupancy_min,vehicle_max)
-                    target_observations=self.model.states_scores(target_voxels)
+                    target_voxels=self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":vantage_position,"orientation":vantage_orientation,"vehicle_min":occupancy_min,"vehicle_max":vehicle_max}),submodel="voxels_master").data
+                    target_observations=self.wminterface.execute(FCExecute(function="states_scores",arguments={"indices":target_voxels}),submodel="voxels_master").data
                 except (TypeError,ValueError):
                     candidate_counts["target_footprint_check_failed"]+=1
                     continue
@@ -348,7 +346,7 @@ class RiskCal():
                 except (RuntimeError,TypeError,ValueError):
                     candidate_counts["planning_failed"]+=1
                     continue
-                vantage_path_states=self.model.get_voxel_states(list(vantage_prediction.potential_voxels))
+                vantage_path_states=self.wminterface.execute(FCExecute(function="get_voxel_states",arguments={"indices":list(vantage_prediction.potential_voxels)}),submodel="voxels_master").data
                 if not vantage_path_states:
                     candidate_counts["empty_path"]+=1
                     continue
@@ -359,7 +357,7 @@ class RiskCal():
 
                 observable_voxels=set()
                 for unknown_voxel in unknown_voxels:
-                    unknown_position=self.model.voxel_to_position(unknown_voxel)
+                    unknown_position=self.wminterface.execute(FCExecute(function="voxel_to_position",arguments={"index":unknown_voxel}),submodel="voxels_master").data
                     distance=math.sqrt((unknown_position.x-vantage_position.x)**2+(unknown_position.y-vantage_position.y)**2+(unknown_position.z-vantage_position.z)**2)
                     if distance<=sensor_range:
                         observable_voxels.add(unknown_voxel)

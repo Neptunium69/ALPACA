@@ -80,14 +80,14 @@ def main():
         important_wms=(camera_model.name,voxel_model.name),
     )
     model.add([object_model,voxel_model,camera_model,master_voxel_model])
+    wminterface=WorldModelInterface(model,"primary")
     adapter=vehicleadapter.UGVAdapter(model,None)
     vainterface=VAInterface(adapter,"primary")
-    rcm=risk.RiskCal(master_voxel_model,vainterface)
+    rcm=risk.RiskCal(wminterface,vainterface)
     adapter.riskcal=rcm
     detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
     vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
     vlm_interface.init_vlm()
-    wminterface=WorldModelInterface(model,"primary")
     observe_tool=Observe()
     navigate_tool=Navigate(vainterface,rcm)
     scan_tool=Scan(wminterface,vainterface,rcm)
