@@ -76,11 +76,11 @@ class RiskCal():
         self.information_route_threshold=0.6
         self.minimum_persistent_occupied_voxels=1
         self.vantage_prediction_speed=0.3
-        self.k=1
-        self.turn_cost_wgt=0.4
-        self.move_cost_wgt=0.9
-        self.cam_wgt=1
-        self.lid_wgt=1
+        self.k=50
+        self.turn_cost_wgt=0.2
+        self.move_cost_wgt=0.5
+        self.cam_wgt=2
+        self.lid_wgt=2
         self.cs_occ_ratio=0.10 # Fraction of a route cross-section (10%).
 
     
@@ -379,6 +379,10 @@ class RiskCal():
             indices=list(unknown_voxels)
             positions=[self.wminterface.execute(FCExecute(function="voxel_to_position",arguments={"index":index}),submodel="voxels_master").data for index in indices]
             coordinates=np.array([(p.x,p.y,p.z) for p in positions],dtype=float).reshape(-1,3)
+            visibility_states,visibility_size=self.wminterface.execute(FCExecute(function="get_voxel_snapshot",arguments={}),submodel="voxels_master").data
+            visibility_occupied={index for index,state in visibility_states.items() if state==1}
+            grid_center=self.wminterface.execute(FCExecute(function="voxel_to_position",arguments={"index":(0,0,0)}),submodel="voxels_master").data
+            visibility_origin=(grid_center.x-visibility_size/2.0,grid_center.y-visibility_size/2.0,grid_center.z-visibility_size/2.0)
             lidar=self.wminterface.execute(FCExecute(function="states_scores",arguments={"indices":indices}),submodel="voxels_lidar").data
             camera=self.wminterface.execute(FCExecute(function="states_scores",arguments={"indices":indices}),submodel="voxels_camera").data
             lidar_uncertainty=np.array([1.0 if obs is None else max(0.0,1.0-2.0*abs(obs[1]-0.5)) for obs in lidar])
@@ -428,8 +432,10 @@ class RiskCal():
                     candidate_counts["path_unknown_cluster"]+=1
                     continue
 
-                offsets=coordinates-np.array([vantage_position.x,vantage_position.y,vantage_position.z])
-                in_range=np.sum(offsets*offsets,axis=1)<=sensor_range**2
+                ray_origin=(vantage_position.x,vantage_position.y,vantage_position.z)
+                ray_start=(math.floor((ray_origin[0]-visibility_origin[0])/visibility_size),math.floor((ray_origin[1]-visibility_origin[1])/visibility_size),math.floor((ray_origin[2]-visibility_origin[2])/visibility_size))
+                offsets=coordinates-ray_origin
+                in_range=np.array([within and self._raycast_voxeels(ray_origin,point,visibility_origin,visibility_size,visibility_occupied,ray_start) for point,within in zip(coordinates,np.sum(offsets*offsets,axis=1)<=sensor_range**2)],dtype=bool)
                 observable_voxels={indices[i] for i in np.flatnonzero(in_range)}
                 if not observable_voxels:
                     continue
@@ -440,11 +446,11 @@ class RiskCal():
                 cos_theta=np.clip(cos_theta,-1.0,1.0)
                 weights=1.0/(1.0+np.exp(np.clip(-self.k*(cos_theta-fov_boundary),-700.0,700.0)))
                 lidar_reward=self.lid_wgt*float(lidar_uncertainty[in_range].sum())
-                camera_reward=self.cam_wgt*float(np.where(camera_present[camera_mask],camera_uncertainty[camera_mask]*weights,1.0).sum())
+                camera_reward=self.cam_wgt*float((camera_uncertainty[camera_mask]*weights).sum())
                 information_reward=lidar_reward+camera_reward
                 novelty=self.wminterface.execute(FCExecute(function="get_observation_novelty",arguments={"position":vantage_position,"arrival_seconds":vantage_prediction.distance/self.vantage_prediction_speed}),submodel="voxels_master").data
                 path_cost=distance_cost_weight*(vantage_prediction.distance/reference_distance)
-                normlaiz=0.7/((self.lid_wgt+self.cam_wgt)*len(observable_voxels))
+                normlaiz=0.7/((self.lid_wgt+self.cam_wgt)*total_unknown_value)
                 turn_cost=(1.0-math.cos(vantage_orientation.yaw-next((math.atan2(dy,dx) for a,b in zip(vantage_prediction.path.poses[-2::-1],vantage_prediction.path.poses[:0:-1]) for dx,dy in [(b.pose.position.x-a.pose.position.x,b.pose.position.y-a.pose.position.y)] if math.hypot(dx,dy)>1e-9),vehicle_state.data["orientation"].yaw)))/2.0
                 profit=normlaiz*novelty*information_reward-(self.move_cost_wgt*path_cost)-(self.turn_cost_wgt*turn_cost)
                 options.append({
@@ -471,3 +477,37 @@ class RiskCal():
             return {"Safe":False,"Reason":"Route requires more information.","Needs Information":True,"Inform User":False,"Candidate Counts":candidate_counts,"Best Vantage Point":best_option,"Vantage Options":options,"Prediction":prediction,"Assessment":pathvoxel,"Unknown Clusters":unknown_clusters}
 
         return {"Safe":True,"Reason":"Route accepted.","Prediction":prediction,"Assessment":pathvoxel}
+        
+    def _raycast_voxeels(self,origin_world:tuple[float,float,float],endpoint_world:np.ndarray,grid_origin:tuple[float,float,float],voxel_size:float,occupied:set[tuple[int,int,int]],start_voxel:tuple[int,int,int])->bool:
+        """Check a prepared ray, excluding its origin and endpoint cells."""
+        ox,oy,oz=origin_world
+        px,py,pz=(float(value) for value in endpoint_world)
+        gx,gy,gz=grid_origin
+        x,y,z=start_voxel
+        target=(math.floor((px-gx)/voxel_size),math.floor((py-gy)/voxel_size),math.floor((pz-gz)/voxel_size))
+        if start_voxel==target:
+            return True
+        dx,dy,dz=px-ox,py-oy,pz-oz
+        sx,sy,sz=(1 if delta>0 else -1 if delta<0 else 0 for delta in (dx,dy,dz))
+        tx=math.inf if dx==0 else (gx+(x+(sx>0))*voxel_size-ox)/dx
+        ty=math.inf if dy==0 else (gy+(y+(sy>0))*voxel_size-oy)/dy
+        tz=math.inf if dz==0 else (gz+(z+(sz>0))*voxel_size-oz)/dz
+        dtx,dty,dtz=(voxel_size/abs(delta) if delta else math.inf for delta in (dx,dy,dz))
+        for _ in range(abs(target[0]-x)+abs(target[1]-y)+abs(target[2]-z)+3):
+            crossing=min(tx,ty,tz)
+            if abs(tx-crossing)<=1e-12:
+                x+=sx
+                tx+=dtx
+            if abs(ty-crossing)<=1e-12:
+                y+=sy
+                ty+=dty
+            if abs(tz-crossing)<=1e-12:
+                z+=sz
+                tz+=dtz
+            index=(x,y,z)
+            if index==target:
+                return True
+            if index in occupied:
+                return False
+        raise RuntimeError("Voxel ray-casting exceeded its expected step count")
+
