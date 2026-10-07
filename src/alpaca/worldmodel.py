@@ -378,8 +378,8 @@ class VoxelWorldModel(Submodel):
 
 class MasterVoxelWorldModel(VoxelWorldModel):
     """Syncronizes the two world models"""
-    def __init__(self,wms:list[VoxelWorldModel],frequency:float=5.0,important_wms:tuple[str,str]=("camera_world_model","lidar_world_model")):
-        super().__init__(name="master_voxel_world_model")
+    def __init__(self,wms:list[VoxelWorldModel],frequency:float=5.0,important_wms:tuple[str,str]=("voxels_camera","voxels_lidar")):
+        super().__init__(name="voxels_master")
         self.vwms:dict[str,VoxelWorldModel]={}
         self.period=1/frequency
         self._locker=RLock()
@@ -400,13 +400,27 @@ class MasterVoxelWorldModel(VoxelWorldModel):
         while True:
             with self._locker:
                 # 2 world models are used for first prototype. Later versions will generalize the algorithm to any number of voxel world models.
-                camvwm=deepcopy(self.vwms[self.important_wms[0]])
-                lidvwm=deepcopy(self.vwms[self.important_wms[1]])
+                with self.vwms[self.important_wms[0]]._lock:
+                    camvwm=deepcopy(self.vwms[self.important_wms[0]]._voxel_lookup)
+                    grid=self.vwms[self.important_wms[0]].voxelmap
+                    camgrid=deepcopy((grid.frame_id,grid.grid_origin,grid.voxelsize))
+                with self.vwms[self.important_wms[1]]._lock:
+                    lidvwm=deepcopy(self.vwms[self.important_wms[1]]._voxel_lookup)
+                    grid=self.vwms[self.important_wms[1]].voxelmap
+                    lidgrid=deepcopy((grid.frame_id,grid.grid_origin,grid.voxelsize))
 
-                voxels=camvwm._voxel_lookup.keys() | lidvwm._voxel_lookup.keys()
+                if any(not frame or origin is None or not math.isfinite(size) or size<=0 for frame,origin,size in (camgrid,lidgrid)):
+                    time.sleep(self.period)
+                    continue
+                if camgrid!=lidgrid:
+                    raise ValueError("Camera and LiDAR voxel grids have different frames, origins or resolutions.")
+                with self._lock:
+                    self.voxelmap.frame_id,self.voxelmap.grid_origin,self.voxelmap.voxelsize=camgrid
+
+                voxels=camvwm.keys()|lidvwm.keys()
                 for voxel in voxels:
-                    voxelcam=camvwm._voxel_lookup.get(voxel)
-                    voxellid=lidvwm._voxel_lookup.get(voxel)
+                    voxelcam=camvwm.get(voxel)
+                    voxellid=lidvwm.get(voxel)
                     camera_score=0.5 if voxelcam is None else voxelcam.score
                     lidar_score=0.5 if voxellid is None else voxellid.score
                     master_voxel=self._voxel_lookup.get(voxel)
@@ -419,7 +433,9 @@ class MasterVoxelWorldModel(VoxelWorldModel):
                             self._voxel_lookup[voxel]=master_voxel
                             self.voxelmap.voxels.append(master_voxel)
                         master_voxel.score=fused_score
+                        master_voxel.state=None if abs(fused_score-0.5)<=0.2 else int(fused_score>0.5)
 
+            time.sleep(max(0.0,deadline-time.monotonic()))
             deadline+=self.period
             if deadline<=time.monotonic():
                 deadline=time.monotonic()+self.period
@@ -509,7 +525,7 @@ class CameraVoxelWorldModel(VoxelWorldModel):
 
 class LiDARVoxelWorldModel(VoxelWorldModel):
     """Populate a voxel model from the adapter's LiDAR observations."""
-    def __init__(self,name:str="voxels_master",observation_topic:str | None="voxel_observations"):
+    def __init__(self,name:str="voxels_lidar",observation_topic:str | None="voxel_observations"):
         super().__init__(name=name)
         self.observation_topic=observation_topic
         self.voxel_subscriber=None

@@ -11,3 +11,4 @@ deploy
 sitl
 .pytest_cache
 backups
+math.md

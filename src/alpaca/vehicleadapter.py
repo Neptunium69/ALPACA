@@ -73,7 +73,7 @@ class UGVAdapter(VehicleAdapter):
             Function(name="require_navigation_ready",arguments={"action_name":("str",True)}),
             Function(name="get_collision_geometry",arguments={}),
             Function(name="plan_path",arguments={"destination":("Position",True),"orientation":("Orientation",True),"frame_id":("str",False),"tolerance":("float",False)}),
-            Function(name="navigate",arguments={"destination":("Position",True),"orientation":("Orientation",True),"frame_id":("str",False),"path":("Path",True)}),
+            Function(name="navigate",arguments={"destination":("Position",True),"orientation":("Orientation",True),"frame_id":("str",False),"path":("Path",True),"arrival_tolerance":("float",False)}),
             Function(name="send_occ",arguments={"voxels":("list",True)}),
             Function(name="scan",arguments={"yaw_margin":("float",False)}),
             Function(name="vantagepoint",arguments={"pathvoxel":("PathVoxelAssessment",True),"max_updates":("int",False)}),
@@ -488,8 +488,8 @@ class UGVAdapter(VehicleAdapter):
 
         voxel_counts: dict[tuple[int,int,int],list[int]]={}
         selected = self.lidar_points_world.tolist()
-        if len(selected)>300:
-            selected = random.sample(selected, 300)
+        if len(selected)>1000:
+            selected = random.sample(selected, 1000)
 
         ground_z=vehicle_pose.pose.pose.position.z+float(self.vehicle_min[2])
         for point in selected:
@@ -564,11 +564,13 @@ class UGVAdapter(VehicleAdapter):
 
     def send_occ(self,voxels:list[set[tuple[int,int,int]]])->None:
         points=[]
+        padding=1 # Extra horizontal cells for the planner's blocked regions.
+        inflated={(x+dx,y+dy,z) for cluster in voxels for x,y,z in cluster for dx in range(-padding,padding+1) for dy in range(-padding,padding+1)}
         with self.voxelmodel._lock:
             frame=self.voxelmodel.get_voxel_map_frame()
             if not frame:
                 raise ValueError("Voxel map frame is unavailable.")
-            for index in set().union(*voxels):
+            for index in inflated:
                 position=self.voxelmodel.voxel_to_position(index)
                 points.append((position.x,position.y,position.z))
         message=pc2.create_cloud_xyz32(Header(stamp=rospy.Time.now(),frame_id=frame),points)
@@ -929,13 +931,16 @@ class UGVAdapter(VehicleAdapter):
             detection_subscriber.unregister()
             self.moveflag=False
 
-    def navigate(self, destination: Position, orientation: Orientation, path: Path, frame_id: str | None=None) -> None:
-        """Moves the vehicle."""
+    def navigate(self, destination: Position, orientation: Orientation, path: Path, frame_id: str | None=None,arrival_tolerance:float | None=None) -> None:
+        """Move along the assessed path, then turn to the requested yaw."""
         if self.client is None:
             raise RuntimeError("Sensor data must be initialized before navigation.")
         goal_values=np.array([destination.x,destination.y,destination.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
         if not np.all(np.isfinite(goal_values)):
             raise ValueError("Navigation position and orientation must contain only finite values.")
+        arrival_tolerance=self.final_wp_marg if arrival_tolerance is None else arrival_tolerance
+        if not isfinite(arrival_tolerance) or arrival_tolerance<=0:
+            raise ValueError("Arrival tolerance must be finite and positive.")
         frame_id=self.navigation_frame if frame_id is None else frame_id
         if not isinstance(frame_id,str) or not frame_id.strip():
             raise ValueError("Navigation frame must be a non-empty string.")
@@ -972,7 +977,7 @@ class UGVAdapter(VehicleAdapter):
                         dist2nextwp=np.sqrt((state.data["position"].x-target.pose.position.x)**2+(state.data["position"].y-target.pose.position.y)**2)
 
                         if i==len(path.poses)-1:
-                            if distance<=self.final_wp_marg:
+                            if distance<=arrival_tolerance:
                                 flag=True
                         if dist2nextwp<=self.intermediate_wp_marg:
                             i+=1
@@ -983,6 +988,11 @@ class UGVAdapter(VehicleAdapter):
                     raise RuntimeError("Planned path is empty or movement publisher is unavailable.")
             except rospy.exceptions.ROSException as error:
                 raise RuntimeError("Failed to publish the planned path to the movement topic.") from error
+            if not flag or rospy.is_shutdown() or getattr(self,"stopping",False):
+                raise rospy.ROSInterruptException("Navigation interrupted before the final turn.")
+            self.moveflag=False
+            position=self.get_state().data["position"]
+            self.image(targpos=Position(x=position.x+2.0*np.cos(orientation.yaw),y=position.y+2.0*np.sin(orientation.yaw),z=position.z))
         finally:
             self.moveflag=False
 
