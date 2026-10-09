@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import numpy as np
+import torch
 from scipy.ndimage import label
 from scipy.spatial import cKDTree
 from typing import Protocol,Any
@@ -96,6 +97,7 @@ class UGVAdapter(VehicleAdapter):
             raise ValueError("Navigation frame must be a non-empty string.")
         self._navigation_frame:str=navigation_frame
         self.voxel_size = 0.05
+        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.vehicle_pose=None
         self.last_pose_monotonic:float | None=None
         self.max_pose_age=0.5
@@ -430,8 +432,8 @@ class UGVAdapter(VehicleAdapter):
             points=depth_points(depth,depth_msg.encoding,camera_info)
             points_body=points@self.camera_to_body_rotation.T+self.camera_to_body_translation
             points_body=points_body[(points_body[:,2]>=self.vehicle_min[2]-self.height_margin)&(points_body[:,2]<=self.vehicle_max[2]+self.height_margin)]
-            if len(points_body)>300:
-                points_body=points_body[random.sample(range(len(points_body)),300)]
+            # if len(points_body)>300:
+            #     points_body=points_body[random.sample(range(len(points_body)),300)]
             pose=vehicle_pose.pose.pose
             translation=np.array([pose.position.x,pose.position.y,pose.position.z],dtype=np.float64)
             quaternion=np.array([pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w],dtype=np.float64)
@@ -440,14 +442,7 @@ class UGVAdapter(VehicleAdapter):
             rotation=quaternion_matrix(quaternion)[:3,:3]
             points_world=points_body@rotation.T+translation
             camera_origin_world=rotation@self.camera_to_body_translation+translation
-            voxel_counts:dict[tuple[int,int,int],list[int]]={}
-            for point in points_world:
-                free_voxels,occupied_voxel=self._raycast_voxels(camera_origin_world,point,self.roi_min,self.voxel_size)
-                for free_voxel in free_voxels:
-                    counts=voxel_counts.setdefault(free_voxel,[0,0])
-                    counts[0]+=1
-                counts=voxel_counts.setdefault(occupied_voxel,[0,0])
-                counts[1]+=1
+            voxel_counts=self._raycast_voxels(camera_origin_world,points_world,self.roi_min,self.voxel_size)
             voxel_frame=SpatialObservationFrame()
             voxel_frame.header.stamp=depth_msg.header.stamp
             voxel_frame.header.frame_id=self.navigation_frame
@@ -486,21 +481,13 @@ class UGVAdapter(VehicleAdapter):
             return
         clutter_level=float(np.clip((occupied_count-self.N_open)/(self.N_dense-self.N_open),0.0,1.0))
 
-        voxel_counts: dict[tuple[int,int,int],list[int]]={}
         selected = self.lidar_points_world.tolist()
         if len(selected)>1000:
             selected = random.sample(selected, 1000)
 
         ground_z=vehicle_pose.pose.pose.position.z+float(self.vehicle_min[2])
-        for point in selected:
-            free_voxels,occupied_voxel=self._raycast_voxels(self.lidar_origin_world,point,self.roi_min,self.voxel_size)
-            for free_voxel in free_voxels:
-                counts=voxel_counts.setdefault(free_voxel,[0,0])
-                counts[0]+=1
-            if abs(point[2]-ground_z)<=0.005:
-                continue
-            counts=voxel_counts.setdefault(occupied_voxel,[0,0])
-            counts[1]+=1
+        selected=np.asarray(selected,dtype=np.float64).reshape(-1,3)
+        voxel_counts=self._raycast_voxels(self.lidar_origin_world,selected,self.roi_min,self.voxel_size,occupied_mask=np.abs(selected[:,2]-ground_z)>0.005)
         voxel_messages=[VoxelObservationMsg(x=voxel[0],y=voxel[1],z=voxel[2],free_observations=counts[0],occupied_observations=counts[1]) for voxel,counts in voxel_counts.items()]
         voxel_frame=SpatialObservationFrame()
         voxel_frame.header.stamp=cloud.header.stamp
@@ -631,62 +618,77 @@ class UGVAdapter(VehicleAdapter):
         lidar_origin_world=rotation@self.lidar_to_body_translation+translation
         return points_world,lidar_origin_world
 
-    def _raycast_voxels(self,origin_world: np.ndarray,endpoint_world: np.ndarray,grid_origin: np.ndarray,voxel_size: float)->tuple[list[tuple[int,int,int]],tuple[int,int,int]]:
-        """Return free voxels traversed by a ray and its occupied endpoint voxel."""
+    def _raycast_voxels(self,origin_world: np.ndarray,endpoint_world: np.ndarray,grid_origin: np.ndarray,voxel_size: float,occupied_mask:np.ndarray|None=None)->Any:
+        """Trace every endpoint; batches return voxel -> [free, occupied] counts, single rays retain their list/endpoint result."""
         origin=np.asarray(origin_world,dtype=np.float64)
         endpoint=np.asarray(endpoint_world,dtype=np.float64)
         grid_origin=np.asarray(grid_origin,dtype=np.float64)
 
-        if origin.shape!=(3,) or endpoint.shape!=(3,) or grid_origin.shape!=(3,):
-            raise ValueError("origin_world, endpoint_world, and grid_origin must have shape (3,)")
+        single=endpoint.shape==(3,)
+        if origin.shape!=(3,) or grid_origin.shape!=(3,) or not (single or endpoint.ndim==2 and endpoint.shape[1]==3):
+            raise ValueError("Origins must have shape (3,); endpoints must have shape (3,) or (N,3).")
         if not np.all(np.isfinite(origin)) or not np.all(np.isfinite(endpoint)) or not np.all(np.isfinite(grid_origin)):
             raise ValueError("Ray coordinates must be finite")
         if not np.isfinite(voxel_size) or voxel_size<=0:
             raise ValueError("voxel_size must be finite and positive")
 
-        current=np.floor((origin-grid_origin)/voxel_size).astype(np.int64)
-        target=np.floor((endpoint-grid_origin)/voxel_size).astype(np.int64)
-
-        if np.array_equal(current,target):
-            target_index=(int(target[0]),int(target[1]),int(target[2]))
-            return [],target_index
-
-        direction=endpoint-origin
-        step=np.sign(direction).astype(np.int64)
-        t_delta=np.full(3,np.inf,dtype=np.float64)
-        t_max=np.full(3,np.inf,dtype=np.float64)
-
-        for axis in range(3):
-            if direction[axis]==0:
-                continue
-
-            t_delta[axis]=voxel_size/abs(direction[axis])
-
-            if step[axis]>0:
-                boundary=grid_origin[axis]+(current[axis]+1)*voxel_size
-            else:
-                boundary=grid_origin[axis]+current[axis]*voxel_size
-
-            t_max[axis]=(boundary-origin[axis])/direction[axis]
-
-        free_voxels=[]
-        maximum_steps=int(np.abs(target-current).sum())+3
-
-        while not np.array_equal(current,target):
-            free_voxels.append((int(current[0]),int(current[1]),int(current[2])))
-
-            next_crossing=float(np.min(t_max))
-            crossed_axes=np.flatnonzero(np.isclose(t_max,next_crossing,rtol=0.0,atol=1e-12))
-
-            for axis in crossed_axes:
-                current[axis]+=step[axis]
-                t_max[axis]+=t_delta[axis]
-
-            if len(free_voxels)>maximum_steps:
-                raise RuntimeError("Voxel ray-casting exceeded its expected step count")
-
-        target_index=(int(target[0]),int(target[1]),int(target[2]))
-        return free_voxels,target_index
+        endpoint=endpoint.reshape(-1,3)
+        if occupied_mask is None:
+            occupied_mask=np.ones(len(endpoint),dtype=bool)
+        occupied_mask=np.asarray(occupied_mask,dtype=bool)
+        if occupied_mask.shape!=(len(endpoint),):
+            raise ValueError("occupied_mask must have one entry per endpoint.")
+        if not len(endpoint):
+            return {}
+        start=np.floor((origin-grid_origin)/voxel_size).astype(np.int64)
+        targets=np.floor((endpoint-grid_origin)/voxel_size).astype(np.int64)
+        step_bounds=np.abs(targets-start).sum(axis=1)+3
+        # Bound traversal storage, without dropping rays or changing their counts.
+        batch_size=max(1,min(16384,2000000//int(step_bounds.max())))
+        origin_t=torch.as_tensor(origin,dtype=torch.float64,device=self.device)
+        grid_t=torch.as_tensor(grid_origin,dtype=torch.float64,device=self.device)
+        start_t=torch.as_tensor(start,dtype=torch.int64,device=self.device)
+        endpoints_t=torch.as_tensor(endpoint,dtype=torch.float64,device=self.device)
+        targets_t=torch.as_tensor(targets,dtype=torch.int64,device=self.device)
+        occupied_t=torch.as_tensor(occupied_mask,dtype=torch.bool,device=self.device)
+        batches=[]
+        unfinished=torch.zeros((),dtype=torch.bool,device=self.device)
+        for offset in range(0,len(endpoint),batch_size):
+            target=targets_t[offset:offset+batch_size]
+            current=start_t.expand_as(target).clone()
+            direction=endpoints_t[offset:offset+batch_size]-origin_t
+            step=torch.sign(direction).to(torch.int64)
+            t_delta=torch.where(direction!=0,voxel_size/torch.abs(direction),torch.inf)
+            boundary=grid_t+(current+(step>0).to(torch.int64)).to(torch.float64)*voxel_size
+            t_max=torch.where(direction!=0,(boundary-origin_t)/direction,torch.inf)
+            active=torch.any(current!=target,dim=1)
+            maximum_steps=int(step_bounds[offset:offset+batch_size].max())
+            traversed=torch.empty((maximum_steps,len(target),3),dtype=torch.int64,device=self.device)
+            valid=torch.empty((maximum_steps,len(target)),dtype=torch.bool,device=self.device)
+            for index in range(maximum_steps):
+                traversed[index]=current
+                valid[index]=active
+                next_crossing=t_max.amin(dim=1,keepdim=True)
+                crossed=(torch.abs(t_max-next_crossing)<=1e-12)&active[:,None]
+                current=current+crossed.to(torch.int64)*step
+                t_max=torch.where(crossed,t_max+t_delta,t_max)
+                active=active&torch.any(current!=target,dim=1)
+            unfinished=unfinished|active.any()
+            free=traversed[valid]
+            if single:
+                if bool(unfinished):
+                    raise RuntimeError("Voxel ray-casting exceeded its expected step count")
+                return [tuple(voxel) for voxel in free.cpu().tolist()],tuple(target[0].cpu().tolist())
+            free,free_counts=torch.unique(free,dim=0,return_counts=True)
+            occupied,occupied_counts=torch.unique(target[occupied_t[offset:offset+len(target)]],dim=0,return_counts=True)
+            batches.append(torch.cat((torch.cat((free,free_counts[:,None],torch.zeros_like(free_counts[:,None])),dim=1),torch.cat((occupied,torch.zeros_like(occupied_counts[:,None]),occupied_counts[:,None]),dim=1)),dim=0))
+        if bool(unfinished):
+            raise RuntimeError("Voxel ray-casting exceeded its expected step count")
+        observations=torch.cat(batches,dim=0)
+        indices,inverse=torch.unique(observations[:,:3],dim=0,return_inverse=True)
+        counts=torch.zeros((len(indices),2),dtype=torch.int64,device=self.device)
+        counts.index_add_(0,inverse,observations[:,3:])
+        return {(x,y,z):[free,occupied] for x,y,z,free,occupied in torch.cat((indices,counts),dim=1).cpu().tolist()}
 
 
     def get_state(self):

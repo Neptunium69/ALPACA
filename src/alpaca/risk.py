@@ -79,7 +79,7 @@ class RiskCal():
         self.vantage_prediction_speed=0.3
         self.k=50
         self.turn_cost_wgt=0.2
-        self.move_cost_wgt=1
+        self.move_cost_wgt=0.7
         self.cam_wgt=2
         self.lid_wgt=2
         self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
