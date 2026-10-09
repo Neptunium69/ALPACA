@@ -7,6 +7,7 @@ from threading import RLock, Thread
 import rospy
 from sklearn.cluster import DBSCAN
 import numpy as np
+import torch
 import warnings
 from scipy.spatial.transform import Rotation
 import message_filters
@@ -125,6 +126,7 @@ class VoxelWorldModel(Submodel):
     """Sensor-independent voxel storage, spatial queries and observation activity."""
     def __init__(self,name:str="voxels_master"):
         self.name=name
+        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.registry=WMRegistry([
             Function(name="get_observation_novelty",arguments={"position":("Position",True),"arrival_seconds":("float",False)}),
             Function(name="get_voxel_map_frame",arguments={}),
@@ -136,7 +138,7 @@ class VoxelWorldModel(Submodel):
             Function(name="get_voxel_states",arguments={"indices":("list",True)}),
             Function(name="states_scores",arguments={"indices":("list",True)}),
             Function(name="get_vehicle_voxels",arguments={"vehicle_pose":("Odometry",True),"vehicle_min":("ndarray",True),"vehicle_max":("ndarray",True)}),
-            Function(name="footprint_at",arguments={"position":("Position",True),"orientation":("Orientation",True),"vehicle_min":("ndarray",True),"vehicle_max":("ndarray",True)}),
+            Function(name="footprint_at",arguments={"position":("Position",True),"orientation":("Orientation",True),"vehicle_min":("ndarray",True),"vehicle_max":("ndarray",True),"samples":("ndarray",False)}),
             Function(name="get_unknown_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
             Function(name="get_filled_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
             Function(name="get_empty_score",arguments={"minimum":("Position",True),"maximum":("Position",True)}),
@@ -214,17 +216,53 @@ class VoxelWorldModel(Submodel):
         rotation=Rotation.from_quat(quaternion).as_matrix()
         return self._footprint(translation,rotation,vehicle_min,vehicle_max)
 
-    def footprint_at(self,position:Position,orientation:Orientation,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
-        """Obtain the vehicle's occupied voxels at a given pose."""
+    def footprint_at(self,position:Position,orientation:Orientation,vehicle_min:np.ndarray,vehicle_max:np.ndarray,samples:np.ndarray | None=None)->list[tuple[int,int,int]]:
+        """Obtain voxels at one pose or union axis-aligned path samples."""
         pose_values=np.array([position.x,position.y,position.z,orientation.roll,orientation.pitch,orientation.yaw],dtype=np.float64)
         if not np.all(np.isfinite(pose_values)):
             raise ValueError("Target position and orientation must contain only finite values.")
         translation=pose_values[:3]
         rotation=Rotation.from_euler("xyz",[orientation.roll,orientation.pitch,orientation.yaw]).as_matrix()
-        return self._footprint(translation,rotation,vehicle_min,vehicle_max)
+        if samples is None:
+            return self._footprint(translation,rotation,vehicle_min,vehicle_max)
+        if np.any(pose_values[3:]!=0):
+            raise ValueError("Batched path footprints require zero orientation.")
+        samples=np.asarray(samples,dtype=np.float64)
+        vehicle_min=np.asarray(vehicle_min,dtype=np.float64)
+        vehicle_max=np.asarray(vehicle_max,dtype=np.float64)
+        if samples.ndim!=2 or samples.shape[1]!=3 or not np.all(np.isfinite(samples)):
+            raise ValueError("Path samples must contain finite XYZ coordinates.")
+        if vehicle_min.shape!=(3,) or vehicle_max.shape!=(3,) or not np.all(np.isfinite(vehicle_min)) or not np.all(np.isfinite(vehicle_max)) or np.any(vehicle_min>=vehicle_max):
+            raise ValueError("Invalid vehicle dimensions.")
+        with self._lock:
+            voxel_size=self.voxelmap.voxelsize
+            grid_origin=deepcopy(self.voxelmap.grid_origin)
+        if not math.isfinite(voxel_size) or voxel_size<=0 or grid_origin is None:
+            raise ValueError("Voxel grid has not been initialized.")
+        if not len(samples):
+            return []
+        translations=torch.as_tensor(samples,dtype=torch.float64,device=self.device)
+        minimum=torch.as_tensor(vehicle_min,dtype=torch.float64,device=self.device)
+        maximum=torch.as_tensor(vehicle_max,dtype=torch.float64,device=self.device)
+        origin=torch.tensor([grid_origin.x,grid_origin.y,grid_origin.z],dtype=torch.float64,device=self.device)
+        lower=torch.floor((translations+minimum-origin)/voxel_size).long()
+        upper=torch.ceil((translations+maximum-origin)/voxel_size).long()
+        # Preserve _footprint's strict overlap comparisons at floating-point boundaries.
+        lower+=((origin+(lower.to(torch.float64)+0.5)*voxel_size-translations)+voxel_size/2.0<=minimum).long()
+        upper-=((origin+(upper.to(torch.float64)-0.5)*voxel_size-translations)-voxel_size/2.0>=maximum).long()
+        boxes=torch.unique(torch.cat((lower,upper),dim=1),dim=0)
+        boxes=boxes[torch.all(boxes[:,3:]>boxes[:,:3],dim=1)]
+        if not boxes.numel():
+            return []
+        shape=(boxes[:,3:]-boxes[:,:3]).amax(dim=0).cpu().tolist()
+        offsets=torch.cartesian_prod(*[torch.arange(size,device=self.device) for size in shape])
+        grids=boxes[:,None,:3]+offsets[None,:,:]
+        indices=grids[torch.all(grids<boxes[:,None,3:],dim=2)]
+        indices=torch.unique(indices,dim=0)
+        return [(x,y,z) for x,y,z in indices.cpu().tolist()]
 
     def _footprint(self,translation:np.ndarray,rotation:np.ndarray,vehicle_min:np.ndarray,vehicle_max:np.ndarray)->list[tuple[int,int,int]]:
-        """Obtaine the vehicle's occupied voxels after performing a transformation."""
+        """Obtain the vehicle's occupied voxels after performing a transformation."""
         vehicle_min=np.asarray(vehicle_min,dtype=np.float64)
         vehicle_max=np.asarray(vehicle_max,dtype=np.float64)
         if vehicle_min.shape!=(3,) or vehicle_max.shape!=(3,) or not np.all(np.isfinite(vehicle_min)) or not np.all(np.isfinite(vehicle_max)) or np.any(vehicle_min>=vehicle_max):
@@ -250,17 +288,20 @@ class VoxelWorldModel(Submodel):
 
         voxel_half_extent=np.full(3,voxel_size/2.0,dtype=np.float64)
         body_frame_padding=np.abs(rotation.T)@voxel_half_extent
-        indices=[]
+        axes=[torch.arange(int(minimum_index[i]),int(maximum_index[i]),device=self.device) for i in range(3)]
+        grid=torch.cartesian_prod(*axes)
 
-        for x in range(int(minimum_index[0]),int(maximum_index[0])):
-            for y in range(int(minimum_index[1]),int(maximum_index[1])):
-                for z in range(int(minimum_index[2]),int(maximum_index[2])):
-                    index=(x,y,z)
-                    voxel_center_world=origin+(np.asarray(index,dtype=np.float64)+0.5)*voxel_size
-                    voxel_center_body=rotation.T@(voxel_center_world-translation)
-                    overlaps=np.all(voxel_center_body+body_frame_padding>vehicle_min) and np.all(voxel_center_body-body_frame_padding<vehicle_max)
-                    if overlaps:
-                        indices.append(index)
+        origin_t=torch.as_tensor(origin,dtype=torch.float64,device=self.device)
+        translation_t=torch.as_tensor(translation,dtype=torch.float64,device=self.device)
+        rotation_t=torch.as_tensor(rotation,dtype=torch.float64,device=self.device)
+        padding_t=torch.as_tensor(body_frame_padding,dtype=torch.float64,device=self.device)
+        minimum_t=torch.as_tensor(vehicle_min,dtype=torch.float64,device=self.device)
+        maximum_t=torch.as_tensor(vehicle_max,dtype=torch.float64,device=self.device)
+
+        centres_world=origin_t+(grid.to(torch.float64)+0.5)*voxel_size
+        centres_body=(centres_world-translation_t)@rotation_t
+        overlaps=torch.all(centres_body+padding_t>minimum_t,dim=1)&torch.all(centres_body-padding_t<maximum_t,dim=1)
+        indices=[(x,y,z) for x,y,z in grid[overlaps].cpu().tolist()]
 
         return indices
 

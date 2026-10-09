@@ -162,12 +162,11 @@ class RiskCal():
         conservative_max=np.array([cover_radius,cover_radius,vehicle_max[2]],dtype=np.float64)
         voxel_size=self.wminterface.execute(FCExecute(function="get_voxel_size",arguments={}),submodel="voxels_master").data
         sample_spacing=voxel_size
-        potential_voxels:set[tuple[int,int,int]]=set()
-        zero_orientation=wm.Orientation(pitch=0.0,yaw=0.0,roll=0.0)
+        path_samples:list[np.ndarray]=[]
         distance=0.0
 
         if len(positions)==1:
-            potential_voxels.update(self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":positions[0],"orientation":zero_orientation,"vehicle_min":conservative_min,"vehicle_max":conservative_max}),submodel="voxels_master").data)
+            path_samples.append(np.array([positions[0].x,positions[0].y,positions[0].z],dtype=np.float64))
         for segment_index,(start,end) in enumerate(zip(positions,positions[1:])):
             start_array=np.array([start.x,start.y,start.z],dtype=np.float64)
             end_array=np.array([end.x,end.y,end.z],dtype=np.float64)
@@ -178,8 +177,9 @@ class RiskCal():
             for sample_index in range(0 if segment_index==0 else 1,sample_count+1):
                 fraction=sample_index/sample_count
                 sample=start_array+fraction*delta
-                sample_position=wm.Position(x=float(sample[0]),y=float(sample[1]),z=float(sample[2]))
-                potential_voxels.update(self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":sample_position,"orientation":zero_orientation,"vehicle_min":conservative_min,"vehicle_max":conservative_max}),submodel="voxels_master").data)
+                path_samples.append(sample)
+
+        potential_voxels=set(self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":positions[0],"orientation":wm.Orientation(pitch=0.0,yaw=0.0,roll=0.0),"vehicle_min":conservative_min,"vehicle_max":conservative_max,"samples":np.asarray(path_samples,dtype=np.float64).reshape(-1,3)}),submodel="voxels_master").data)
 
         return ActionPrediction(cmd=command,potential_voxels=potential_voxels,distance=distance,terminal_position=positions[-1],terminal_orientation=orientation,frame_id=frame_id,path=path)
 
