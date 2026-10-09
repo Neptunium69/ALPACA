@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from . import worldmodel as wm
 from .dataclasses import FCExecute
 from .vatools import VAInterface
+import torch
 from .wmtools import WorldModelInterface
 
 class Command(Protocol):
@@ -78,9 +79,11 @@ class RiskCal():
         self.vantage_prediction_speed=0.3
         self.k=50
         self.turn_cost_wgt=0.2
-        self.move_cost_wgt=0.5
+        self.move_cost_wgt=1
         self.cam_wgt=2
         self.lid_wgt=2
+        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.optim_iterations=81
         self.cs_occ_ratio=0.10 # Fraction of a route cross-section (10%).
 
     
@@ -352,12 +355,17 @@ class RiskCal():
             vehicle_state=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data
             robot_position=vehicle_state.data["position"]
             known_free_candidates=[]
-            for vantage_voxel in vp:
-                vantage_state=self.wminterface.execute(FCExecute(function="get_voxel_states",arguments={"indices":[vantage_voxel]}),submodel="voxels_master").data[0]
+            candidate_indices=list(vp)
+            candidate_states=self.wminterface.execute(FCExecute(function="get_voxel_states",arguments={"indices":candidate_indices}),submodel="voxels_master").data
+            candidate_size=self.wminterface.execute(FCExecute(function="get_voxel_size",arguments={}),submodel="voxels_master").data
+            candidate_center=self.wminterface.execute(FCExecute(function="voxel_to_position",arguments={"index":(0,0,0)}),submodel="voxels_master").data
+            candidate_origin=np.array([candidate_center.x,candidate_center.y,candidate_center.z],dtype=float)-candidate_size/2.0
+            candidate_positions=candidate_origin+(np.asarray(candidate_indices,dtype=float).reshape(-1,3)+0.5)*candidate_size
+            for vantage_voxel,vantage_state,position in zip(candidate_indices,candidate_states,candidate_positions):
                 if vantage_state!=0:
                     candidate_counts["destination_not_free"]+=1
                     continue
-                vantage_position=self.wminterface.execute(FCExecute(function="voxel_to_position",arguments={"index":vantage_voxel}),submodel="voxels_master").data
+                vantage_position=wm.Position(x=float(position[0]),y=float(position[1]),z=float(position[2]))
                 distance_squared=(vantage_position.x-robot_position.x)**2+(vantage_position.y-robot_position.y)**2
                 known_free_candidates.append((distance_squared,vantage_voxel,vantage_position))
             known_free_candidates.sort(key=lambda candidate:(candidate[0],candidate[1]))
@@ -391,11 +399,51 @@ class RiskCal():
             fov=2.0*math.atan(self.camea_info.width/(2.0*self.camea_info.K[0]))
             fov_boundary=math.cos(fov/2.0)
 
+            candidate_positions=np.array([(p.x,p.y,p.z) for _,_,p in known_free_candidates],dtype=float).reshape(-1,3)
+            offsets=coordinates[None,:,:]-candidate_positions[:,None,:]
+            within_range=np.sum(offsets*offsets,axis=2)<=sensor_range**2
+            candidate_visible=np.zeros(within_range.shape,dtype=bool)
+            for candidate_index,position in enumerate(candidate_positions):
+                ray_origin=(float(position[0]),float(position[1]),float(position[2]))
+                ray_start=tuple(math.floor((ray_origin[i]-visibility_origin[i])/visibility_size) for i in range(3))
+                for voxel_index in np.flatnonzero(within_range[candidate_index]):
+                    candidate_visible[candidate_index,voxel_index]=self._raycast_voxeels(ray_origin,coordinates[voxel_index],visibility_origin,visibility_size,visibility_occupied,ray_start)
+
+            bearings=torch.as_tensor(np.arctan2(offsets[:,:,1],offsets[:,:,0]),dtype=torch.float32,device=self.device)
+            uncertainty=torch.as_tensor(camera_uncertainty,dtype=torch.float32,device=self.device)
+            visible=torch.as_tensor(candidate_visible&(np.sum(offsets[:,:,:2]**2,axis=2)>1e-18),dtype=torch.bool,device=self.device)
+            yaw=torch.tensor(np.arctan2(center_position.y-candidate_positions[:,1],center_position.x-candidate_positions[:,0]),dtype=torch.float32,device=self.device,requires_grad=True)
+            evidence=uncertainty[None,:]*visible
+            scale=evidence.sum(dim=1).clamp_min(1.0)
+            optimizer=torch.optim.Adam([yaw],lr=0.05)
+            best_yaw=yaw.detach().clone()
+            best_reward=torch.full_like(yaw,-torch.inf)
+            with torch.no_grad():
+                for iteration in range(self.optim_iterations):
+                    difference=bearings-yaw[:,None]
+                    weights=torch.sigmoid(self.k*(torch.cos(difference)-fov_boundary))
+                    reward=(evidence*weights).sum(dim=1)
+                    improved=reward>best_reward
+                    best_reward=torch.where(improved,reward,best_reward)
+                    best_yaw=torch.where(improved,yaw,best_yaw)
+                    if iteration==self.optim_iterations-1:
+                        break
+                    gradient=self.k*(evidence*weights*(1.0-weights)*torch.sin(difference)).sum(dim=1)
+                    optimizer.zero_grad(set_to_none=True)
+                    yaw.grad=-gradient/scale
+                    optimizer.step()
+            best_yaw=torch.atan2(torch.sin(best_yaw),torch.cos(best_yaw)).cpu().numpy()
+            camera_rewards=best_reward.cpu().numpy()
+
             for candidate_index,(_,vantage_voxel,vantage_position) in enumerate(known_free_candidates):
                 candidate_counts["evaluated"]+=1
                 if candidate_counts["evaluated"]==1 or candidate_counts["evaluated"]%10==0 or candidate_counts["evaluated"]==len(known_free_candidates):
                     rospy.loginfo("Vantage evaluation progress: evaluating candidate %d/%d; %d accepted so far.",candidate_counts["evaluated"],len(known_free_candidates),candidate_counts["accepted"])
-                vantage_yaw=math.atan2(center_position.y-vantage_position.y,center_position.x-vantage_position.x)
+                in_range=candidate_visible[candidate_index]
+                observable_voxels={indices[i] for i in np.flatnonzero(in_range)}
+                if not observable_voxels:
+                    continue
+                vantage_yaw=float(best_yaw[candidate_index])
                 if any(math.hypot(vantage_position.x-p.x,vantage_position.y-p.y)<0.10 and abs(math.atan2(math.sin(vantage_yaw-yaw),math.cos(vantage_yaw-yaw)))<math.radians(15) for p,yaw in (completed_views or [])):
                     candidate_counts["already_observed"]+=1
                     continue
@@ -432,21 +480,8 @@ class RiskCal():
                     candidate_counts["path_unknown_cluster"]+=1
                     continue
 
-                ray_origin=(vantage_position.x,vantage_position.y,vantage_position.z)
-                ray_start=(math.floor((ray_origin[0]-visibility_origin[0])/visibility_size),math.floor((ray_origin[1]-visibility_origin[1])/visibility_size),math.floor((ray_origin[2]-visibility_origin[2])/visibility_size))
-                offsets=coordinates-ray_origin
-                in_range=np.array([within and self._raycast_voxeels(ray_origin,point,visibility_origin,visibility_size,visibility_occupied,ray_start) for point,within in zip(coordinates,np.sum(offsets*offsets,axis=1)<=sensor_range**2)],dtype=bool)
-                observable_voxels={indices[i] for i in np.flatnonzero(in_range)}
-                if not observable_voxels:
-                    continue
-                horizontal=np.hypot(offsets[:,0],offsets[:,1])
-                camera_mask=in_range&(horizontal>1e-9)
-                heading_cos,heading_sin=math.cos(vantage_orientation.yaw),math.sin(vantage_orientation.yaw)
-                cos_theta=(offsets[camera_mask,0]*heading_cos+offsets[camera_mask,1]*heading_sin)/horizontal[camera_mask]
-                cos_theta=np.clip(cos_theta,-1.0,1.0)
-                weights=1.0/(1.0+np.exp(np.clip(-self.k*(cos_theta-fov_boundary),-700.0,700.0)))
                 lidar_reward=self.lid_wgt*float(lidar_uncertainty[in_range].sum())
-                camera_reward=self.cam_wgt*float((camera_uncertainty[camera_mask]*weights).sum())
+                camera_reward=self.cam_wgt*float(camera_rewards[candidate_index])
                 information_reward=lidar_reward+camera_reward
                 novelty=self.wminterface.execute(FCExecute(function="get_observation_novelty",arguments={"position":vantage_position,"arrival_seconds":vantage_prediction.distance/self.vantage_prediction_speed}),submodel="voxels_master").data
                 path_cost=distance_cost_weight*(vantage_prediction.distance/reference_distance)

@@ -957,6 +957,7 @@ class UGVAdapter(VehicleAdapter):
                 i=0
                 if path.poses is not None and self.movement_publisher is not None:
                     rate = rospy.Rate(20)
+                    tagret=path.poses[-1]
                     while flag==False and not rospy.is_shutdown() and not getattr(self,"stopping",False):
                         state = self.get_state()
                         pose=path.poses[i]
@@ -966,7 +967,7 @@ class UGVAdapter(VehicleAdapter):
                         self.whereitisnt=target
                         self.moveflag=True
 
-                        distance=np.sqrt((state.data["position"].x-destination.x)**2+(state.data["position"].y-destination.y)**2)
+                        distance=np.sqrt((state.data["position"].x-tagret.pose.position.x)**2+(state.data["position"].y-tagret.pose.position.y)**2)
                         yaw_error = (orientation.yaw - self.state.data["orientation"].yaw + pi) % (2*pi) - pi
 
                         q = target.pose.orientation
