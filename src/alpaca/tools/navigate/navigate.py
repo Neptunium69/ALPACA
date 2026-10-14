@@ -18,6 +18,7 @@ class Navigate(Tool):
         self.risk=risk
         self.redirects_left=3
         self.replans=5
+        self.frustration=0
         self.risk_bypass_distance=0.10 # Horizontal metres; 0 disables the bypass.
         self.vantage_tolerance=0.05
         self.specification=ToolSpecification(
@@ -112,6 +113,7 @@ class Navigate(Tool):
                     completed_views.extend([(destination_new,orientation_new.yaw),(arrival["position"],arrival["orientation"].yaw)])
                     fl=True
                     continue
+                self.risk.frustration+=1
                 self.vainterface.execute(FCExecute(function="navigate",arguments={"destination":destination,"orientation":orientation,"frame_id":frame_id,"path":risk_result["Prediction"].path,"arrival_tolerance":arrival_tolerance}))
         except va.NavigationReadinessError as error:
             return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error),"Category":"navigation_not_ready","Retryable":False})

@@ -79,12 +79,14 @@ class RiskCal():
         self.vantage_prediction_speed=0.3
         self.k=50
         self.turn_cost_wgt=0.2
-        self.move_cost_wgt=0.7
+        self.move_cost_wgt=0.3
+        self.frustration=0
+        self.frustration_max=6
         self.cam_wgt=2
         self.lid_wgt=2
         self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.optim_iterations=81
-        self.cs_occ_ratio=0.10 # Fraction of a route cross-section (10%).
+        self.cs_occ_ratio=0.5 # Fraction of a route cross-section (50%).
 
     
     def _actually_smart_vantage_reward(self,observable_voxels)->int:
@@ -326,6 +328,9 @@ class RiskCal():
             return {"Safe":False,"Reason":"Objects are present within the planned route","Blocked Clusters":blocking_clusters,"Needs Replan":True}
         unknown_voxels=pathvoxel.unknown_voxels
         if needs_information:
+            if self.frustration>self.frustration_max:
+                self.frustration=0
+                return {"Safe":False,"Reason":"Observation limit reached; avoiding unresolved space.","Needs Replan":True,"Blocked Clusters":unknown_clusters}
             if allow_scan:
                 missing_camera=self._camera_missing(unknown_voxels,sensor_range)
                 if missing_camera:
