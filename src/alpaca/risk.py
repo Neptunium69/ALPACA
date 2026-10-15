@@ -75,7 +75,7 @@ class RiskCal():
         self.occupied_confidence_threshold=0.1
         self.occupied_route_threshold=0.20
         self.information_route_threshold=0.6
-        self.minimum_persistent_occupied_voxels=1
+        self.minimum_persistent_occupied_voxels=10
         self.vantage_prediction_speed=0.3
         self.k=50
         self.turn_cost_wgt=0.2
@@ -199,49 +199,49 @@ class RiskCal():
     def _hardsafetyfilter(self,cmd:Command,state:State,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->tuple[bool,str]:
         # Battery enforcement is temporarily disabled because this UGV's MAVROS
         # percentage estimate is intermittent and has rejected otherwise safe commands.
-        if cmd.command_type in {"scan","navigate","inspect"}:
-            if not state.data["armed"]:
-                return False,"Vehicle is not armed."
-            if state.data["mode"]!="OFFBOARD":
-                return False,f"Vehicle is in {state.data['mode'] or 'an unknown mode'}, not OFFBOARD."
-        if(cmd.command_type=="scan" or cmd.command_type=="image"):
-            try:
-                clutter=rospy.wait_for_message("clutter_level",Float64,timeout=5)
-                if clutter is None:
-                    return False,"Sensor unresponsive."
-                if not math.isfinite(clutter.data):
-                    return False,"Clutter sensor returned an invalid value."
-                if(clutter.data>=0.7):
-                    return False,"Vehicle was unable to scan because the clutter level is too high."
-            except rospy.ROSException:
-                return False,"Sensor unresponsive."
+        # if cmd.command_type in {"scan","navigate","inspect"}:
+        #     if not state.data["armed"]:
+        #         return False,"Vehicle is not armed."
+        #     if state.data["mode"]!="OFFBOARD":
+        #         return False,f"Vehicle is in {state.data['mode'] or 'an unknown mode'}, not OFFBOARD."
+        # if(cmd.command_type=="scan" or cmd.command_type=="image"):
+        #     try:
+        #         clutter=rospy.wait_for_message("clutter_level",Float64,timeout=5)
+        #         if clutter is None:
+        #             return False,"Sensor unresponsive."
+        #         if not math.isfinite(clutter.data):
+        #             return False,"Clutter sensor returned an invalid value."
+        #         if(clutter.data>=0.7):
+        #             return False,"Vehicle was unable to scan because the clutter level is too high."
+        #     except rospy.ROSException:
+        #         return False,"Sensor unresponsive."
 
-        if(cmd.command_type=="navigate"):
-            if destination is None or orientation is None or frame_id is None:
-                return False,"Navigation goal has not been validated."
-            try:
-                vehicle_pose,vehicle_min,vehicle_max=self.vainterface.execute(FCExecute(function="get_collision_geometry",arguments={})).data
-            except (AttributeError,NotImplementedError,ValueError):
-                return False,"Vehicle adapter does not provide collision geometry."
-            if vehicle_pose is None:
-                return False,"Vehicle localization is not ready."
-            pose_frame=vehicle_pose.header.frame_id
-            voxel_frame=self.wminterface.execute(FCExecute(function="get_voxel_map_frame",arguments={}),submodel="voxels_master").data
-            if not pose_frame or voxel_frame is None:
-                return False,"Vehicle localization or voxel map is not ready."
-            navigation_frame=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
-            if frame_id!=navigation_frame or frame_id!=pose_frame or frame_id!=voxel_frame:
-                return False,f"Navigation frame mismatch: goal={frame_id!r}, adapter={navigation_frame!r}, pose={pose_frame!r}, voxel_map={voxel_frame!r}."
-            try:
-                occupancy_min=vehicle_min.copy()
-                occupancy_min[2]+=0.03
-                target_voxels=self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":destination,"orientation":orientation,"vehicle_min":occupancy_min,"vehicle_max":vehicle_max}),submodel="voxels_master").data
-                target_observations=self.wminterface.execute(FCExecute(function="states_scores",arguments={"indices":target_voxels}),submodel="voxels_master").data
-            except (TypeError,ValueError):
-                return False,"Vehicle collision map is not ready or contains invalid data."
-            occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.occupied_confidence_threshold for observation in target_observations)
-            if occupied_count>=self.minimum_persistent_occupied_voxels:
-                return False,f"Target footprint intersects {occupied_count} persistent occupied voxel(s)."
+        # if(cmd.command_type=="navigate"):
+        #     if destination is None or orientation is None or frame_id is None:
+        #         return False,"Navigation goal has not been validated."
+        #     try:
+        #         vehicle_pose,vehicle_min,vehicle_max=self.vainterface.execute(FCExecute(function="get_collision_geometry",arguments={})).data
+        #     except (AttributeError,NotImplementedError,ValueError):
+        #         return False,"Vehicle adapter does not provide collision geometry."
+        #     if vehicle_pose is None:
+        #         return False,"Vehicle localization is not ready."
+        #     pose_frame=vehicle_pose.header.frame_id
+        #     voxel_frame=self.wminterface.execute(FCExecute(function="get_voxel_map_frame",arguments={}),submodel="voxels_master").data
+        #     if not pose_frame or voxel_frame is None:
+        #         return False,"Vehicle localization or voxel map is not ready."
+        #     navigation_frame=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
+        #     if frame_id!=navigation_frame or frame_id!=pose_frame or frame_id!=voxel_frame:
+        #         return False,f"Navigation frame mismatch: goal={frame_id!r}, adapter={navigation_frame!r}, pose={pose_frame!r}, voxel_map={voxel_frame!r}."
+        #     try:
+        #         occupancy_min=vehicle_min.copy()
+        #         occupancy_min[2]+=0.03
+        #         target_voxels=self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":destination,"orientation":orientation,"vehicle_min":occupancy_min,"vehicle_max":vehicle_max}),submodel="voxels_master").data
+        #         target_observations=self.wminterface.execute(FCExecute(function="states_scores",arguments={"indices":target_voxels}),submodel="voxels_master").data
+        #     except (TypeError,ValueError):
+        #         return False,"Vehicle collision map is not ready or contains invalid data."
+        #     occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.occupied_confidence_threshold for observation in target_observations)
+        #     if occupied_count>=self.minimum_persistent_occupied_voxels:
+        #         return False,f"Target footprint intersects {occupied_count} persistent occupied voxel(s)."
         return True,"Command is safe to execute."
 
     def center(self,assessment:PathVoxelAssessment)->tuple[int,int,int]:

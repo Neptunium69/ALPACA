@@ -480,6 +480,7 @@ class UGVAdapter(VehicleAdapter):
             rospy.logerr("N_dense must be greater than N_open.")
             return
         clutter_level=float(np.clip((occupied_count-self.N_open)/(self.N_dense-self.N_open),0.0,1.0))
+        self.clutter_publisher.publish(Float64(data=clutter_level))
 
         selected = self.lidar_points_world.tolist()
         if len(selected)>1000:
@@ -503,7 +504,6 @@ class UGVAdapter(VehicleAdapter):
         voxel_frame.source_id="UGV LiDAR"
 
         self.voxel_publisher.publish(voxel_frame)
-        self.clutter_publisher.publish(Float64(data=clutter_level))
 
     def _battery_callback(self,battery_msg):
         if rospy.is_shutdown():
