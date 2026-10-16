@@ -442,13 +442,14 @@ class MasterVoxelWorldModel(VoxelWorldModel):
             with self._locker:
                 # 2 world models are used for first prototype. Later versions will generalize the algorithm to any number of voxel world models.
                 with self.vwms[self.important_wms[0]]._lock:
-                    camvwm=deepcopy(self.vwms[self.important_wms[0]]._voxel_lookup)
-                    grid=self.vwms[self.important_wms[0]].voxelmap
-                    camgrid=deepcopy((grid.frame_id,grid.grid_origin,grid.voxelsize))
+                    # Snapshot immutable scores; retain every voxel without copying its objects.
+                    camera_scores={index:voxel.score for index,voxel in self.vwms[self.important_wms[0]]._voxel_lookup.items()}
+                    grid: VoxelModel=self.vwms[self.important_wms[0]].voxelmap
+                    camgrid: tuple[str | None, Position | None, float]=deepcopy((grid.frame_id,grid.grid_origin,grid.voxelsize))
                 with self.vwms[self.important_wms[1]]._lock:
-                    lidvwm=deepcopy(self.vwms[self.important_wms[1]]._voxel_lookup)
+                    lidar_scores={index:voxel.score for index,voxel in self.vwms[self.important_wms[1]]._voxel_lookup.items()}
                     grid=self.vwms[self.important_wms[1]].voxelmap
-                    lidgrid=deepcopy((grid.frame_id,grid.grid_origin,grid.voxelsize))
+                    lidgrid: tuple[str | None, Position | None, float]=deepcopy((grid.frame_id,grid.grid_origin,grid.voxelsize))
 
                 if any(not frame or origin is None or not math.isfinite(size) or size<=0 for frame,origin,size in (camgrid,lidgrid)):
                     time.sleep(self.period)
@@ -458,19 +459,22 @@ class MasterVoxelWorldModel(VoxelWorldModel):
                 with self._lock:
                     self.voxelmap.frame_id,self.voxelmap.grid_origin,self.voxelmap.voxelsize=camgrid
 
-                voxels=camvwm.keys()|lidvwm.keys()
+                _,grid_origin,voxel_size=camgrid
+                # The grid validation above guarantees an initialized origin.
+                assert grid_origin is not None
+                voxels=camera_scores.keys()|lidar_scores.keys()
                 for voxel in voxels:
-                    voxelcam=camvwm.get(voxel)
-                    voxellid=lidvwm.get(voxel)
-                    camera_score=0.5 if voxelcam is None else voxelcam.score
-                    lidar_score=0.5 if voxellid is None else voxellid.score
+                    camera_present=voxel in camera_scores
+                    lidar_present=voxel in lidar_scores
+                    camera_score=camera_scores.get(voxel,0.5)
+                    lidar_score=lidar_scores.get(voxel,0.5)
                     master_voxel=self._voxel_lookup.get(voxel)
                     master_score=0.5 if master_voxel is None else master_voxel.score
-                    fused_score=master_score+self.lr/2*((1-((camera_score-lidar_score)**2 if voxelcam is not None and voxellid is not None else 0))*((int(voxelcam is not None)+int(voxellid is not None))/2*(camera_score+lidar_score-1)-abs(camera_score+lidar_score-1)*(2*master_score-1))-(1-(1-((camera_score-lidar_score)**2 if voxelcam is not None and voxellid is not None else 0)))*(2*master_score-1))
+                    fused_score=master_score+self.lr/2*((1-((camera_score-lidar_score)**2 if camera_present and lidar_present else 0))*((int(camera_present)+int(lidar_present))/2*(camera_score+lidar_score-1)-abs(camera_score+lidar_score-1)*(2*master_score-1))-(1-(1-((camera_score-lidar_score)**2 if camera_present and lidar_present else 0)))*(2*master_score-1))
                     with self._lock:
                         if master_voxel is None:
-                            source_voxel=next(source for source in (voxelcam,voxellid) if source is not None)
-                            master_voxel=Voxel(position=deepcopy(source_voxel.position),state=None)
+                            position=Position(x=grid_origin.x+voxel[0]*voxel_size,y=grid_origin.y+voxel[1]*voxel_size,z=grid_origin.z+voxel[2]*voxel_size)
+                            master_voxel=Voxel(position=position,state=None)
                             self._voxel_lookup[voxel]=master_voxel
                             self.voxelmap.voxels.append(master_voxel)
                         master_voxel.score=fused_score

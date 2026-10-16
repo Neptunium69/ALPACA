@@ -121,10 +121,7 @@ class RiskCal():
 
     def checkcmd(self,command:Command,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None,allow_scan:bool=False,completed_views:list[tuple[Position,float]] | None=None)->dict[str,Any]:
         state=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data
-        safe,reason=self._hardsafetyfilter(command,state,destination,orientation,frame_id)
-        if not safe:
-            return {"Safe":False,"Reason":reason}
-
+        reason="Safe"
         if command.command_type=="navigate":
             if destination is None or orientation is None or frame_id is None:
                 return {"Safe":False,"Reason":"Missing Arguments"}
@@ -196,53 +193,6 @@ class RiskCal():
                 raise ValueError("Planned path contains a non-finite position.")
             positions.append(wm.Position(x=float(values[0]),y=float(values[1]),z=float(values[2])))
         return positions
-    def _hardsafetyfilter(self,cmd:Command,state:State,destination:Position | None=None,orientation:Orientation | None=None,frame_id:str | None=None)->tuple[bool,str]:
-        # Battery enforcement is temporarily disabled because this UGV's MAVROS
-        # percentage estimate is intermittent and has rejected otherwise safe commands.
-        # if cmd.command_type in {"scan","navigate","inspect"}:
-        #     if not state.data["armed"]:
-        #         return False,"Vehicle is not armed."
-        #     if state.data["mode"]!="OFFBOARD":
-        #         return False,f"Vehicle is in {state.data['mode'] or 'an unknown mode'}, not OFFBOARD."
-        # if(cmd.command_type=="scan" or cmd.command_type=="image"):
-        #     try:
-        #         clutter=rospy.wait_for_message("clutter_level",Float64,timeout=5)
-        #         if clutter is None:
-        #             return False,"Sensor unresponsive."
-        #         if not math.isfinite(clutter.data):
-        #             return False,"Clutter sensor returned an invalid value."
-        #         if(clutter.data>=0.7):
-        #             return False,"Vehicle was unable to scan because the clutter level is too high."
-        #     except rospy.ROSException:
-        #         return False,"Sensor unresponsive."
-
-        # if(cmd.command_type=="navigate"):
-        #     if destination is None or orientation is None or frame_id is None:
-        #         return False,"Navigation goal has not been validated."
-        #     try:
-        #         vehicle_pose,vehicle_min,vehicle_max=self.vainterface.execute(FCExecute(function="get_collision_geometry",arguments={})).data
-        #     except (AttributeError,NotImplementedError,ValueError):
-        #         return False,"Vehicle adapter does not provide collision geometry."
-        #     if vehicle_pose is None:
-        #         return False,"Vehicle localization is not ready."
-        #     pose_frame=vehicle_pose.header.frame_id
-        #     voxel_frame=self.wminterface.execute(FCExecute(function="get_voxel_map_frame",arguments={}),submodel="voxels_master").data
-        #     if not pose_frame or voxel_frame is None:
-        #         return False,"Vehicle localization or voxel map is not ready."
-        #     navigation_frame=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
-        #     if frame_id!=navigation_frame or frame_id!=pose_frame or frame_id!=voxel_frame:
-        #         return False,f"Navigation frame mismatch: goal={frame_id!r}, adapter={navigation_frame!r}, pose={pose_frame!r}, voxel_map={voxel_frame!r}."
-        #     try:
-        #         occupancy_min=vehicle_min.copy()
-        #         occupancy_min[2]+=0.03
-        #         target_voxels=self.wminterface.execute(FCExecute(function="footprint_at",arguments={"position":destination,"orientation":orientation,"vehicle_min":occupancy_min,"vehicle_max":vehicle_max}),submodel="voxels_master").data
-        #         target_observations=self.wminterface.execute(FCExecute(function="states_scores",arguments={"indices":target_voxels}),submodel="voxels_master").data
-        #     except (TypeError,ValueError):
-        #         return False,"Vehicle collision map is not ready or contains invalid data."
-        #     occupied_count=sum(observation is not None and observation[0]==1 and observation[1]>=self.occupied_confidence_threshold for observation in target_observations)
-        #     if occupied_count>=self.minimum_persistent_occupied_voxels:
-        #         return False,f"Target footprint intersects {occupied_count} persistent occupied voxel(s)."
-        return True,"Command is safe to execute."
 
     def center(self,assessment:PathVoxelAssessment)->tuple[int,int,int]:
         """Find a voxel approximately at the center of all voxels."""
@@ -406,17 +356,11 @@ class RiskCal():
 
             candidate_positions=np.array([(p.x,p.y,p.z) for _,_,p in known_free_candidates],dtype=float).reshape(-1,3)
             offsets=coordinates[None,:,:]-candidate_positions[:,None,:]
-            within_range=np.sum(offsets*offsets,axis=2)<=sensor_range**2
-            candidate_visible=np.zeros(within_range.shape,dtype=bool)
-            for candidate_index,position in enumerate(candidate_positions):
-                ray_origin=(float(position[0]),float(position[1]),float(position[2]))
-                ray_start=tuple(math.floor((ray_origin[i]-visibility_origin[i])/visibility_size) for i in range(3))
-                for voxel_index in np.flatnonzero(within_range[candidate_index]):
-                    candidate_visible[candidate_index,voxel_index]=self._raycast_voxeels(ray_origin,coordinates[voxel_index],visibility_origin,visibility_size,visibility_occupied,ray_start)
+            candidate_visible_gpu=self._raycast_voxeels(candidate_positions,coordinates,visibility_origin,visibility_size,visibility_occupied,sensor_range)
 
             bearings=torch.as_tensor(np.arctan2(offsets[:,:,1],offsets[:,:,0]),dtype=torch.float32,device=self.device)
             uncertainty=torch.as_tensor(camera_uncertainty,dtype=torch.float32,device=self.device)
-            visible=torch.as_tensor(candidate_visible&(np.sum(offsets[:,:,:2]**2,axis=2)>1e-18),dtype=torch.bool,device=self.device)
+            visible=candidate_visible_gpu&torch.as_tensor(np.sum(offsets[:,:,:2]**2,axis=2)>1e-18,dtype=torch.bool,device=self.device)
             yaw=torch.tensor(np.arctan2(center_position.y-candidate_positions[:,1],center_position.x-candidate_positions[:,0]),dtype=torch.float32,device=self.device,requires_grad=True)
             evidence=uncertainty[None,:]*visible
             scale=evidence.sum(dim=1).clamp_min(1.0)
@@ -439,6 +383,7 @@ class RiskCal():
                     optimizer.step()
             best_yaw=torch.atan2(torch.sin(best_yaw),torch.cos(best_yaw)).cpu().numpy()
             camera_rewards=best_reward.cpu().numpy()
+            candidate_visible=candidate_visible_gpu.cpu().numpy()
 
             for candidate_index,(_,vantage_voxel,vantage_position) in enumerate(known_free_candidates):
                 candidate_counts["evaluated"]+=1
@@ -518,36 +463,79 @@ class RiskCal():
 
         return {"Safe":True,"Reason":"Route accepted.","Prediction":prediction,"Assessment":pathvoxel}
         
-    def _raycast_voxeels(self,origin_world:tuple[float,float,float],endpoint_world:np.ndarray,grid_origin:tuple[float,float,float],voxel_size:float,occupied:set[tuple[int,int,int]],start_voxel:tuple[int,int,int])->bool:
-        """Check a prepared ray, excluding its origin and endpoint cells."""
-        ox,oy,oz=origin_world
-        px,py,pz=(float(value) for value in endpoint_world)
-        gx,gy,gz=grid_origin
-        x,y,z=start_voxel
-        target=(math.floor((px-gx)/voxel_size),math.floor((py-gy)/voxel_size),math.floor((pz-gz)/voxel_size))
-        if start_voxel==target:
-            return True
-        dx,dy,dz=px-ox,py-oy,pz-oz
-        sx,sy,sz=(1 if delta>0 else -1 if delta<0 else 0 for delta in (dx,dy,dz))
-        tx=math.inf if dx==0 else (gx+(x+(sx>0))*voxel_size-ox)/dx
-        ty=math.inf if dy==0 else (gy+(y+(sy>0))*voxel_size-oy)/dy
-        tz=math.inf if dz==0 else (gz+(z+(sz>0))*voxel_size-oz)/dz
-        dtx,dty,dtz=(voxel_size/abs(delta) if delta else math.inf for delta in (dx,dy,dz))
-        for _ in range(abs(target[0]-x)+abs(target[1]-y)+abs(target[2]-z)+3):
-            crossing=min(tx,ty,tz)
-            if abs(tx-crossing)<=1e-12:
-                x+=sx
-                tx+=dtx
-            if abs(ty-crossing)<=1e-12:
-                y+=sy
-                ty+=dty
-            if abs(tz-crossing)<=1e-12:
-                z+=sz
-                tz+=dtz
-            index=(x,y,z)
-            if index==target:
-                return True
-            if index in occupied:
-                return False
-        raise RuntimeError("Voxel ray-casting exceeded its expected step count")
-
+    def _raycast_voxeels(self,origins_world:np.ndarray,endpoints_world:np.ndarray,grid_origin:tuple[float,float,float],voxel_size:float,occupied:set[tuple[int,int,int]],sensor_range:float)->torch.Tensor:
+        """Traverse bounded batches of rays with PyTorch on either CPU or CUDA."""
+        origins=np.asarray(origins_world,dtype=np.float64).reshape(-1,3)
+        endpoints=np.asarray(endpoints_world,dtype=np.float64).reshape(-1,3)
+        if not np.isfinite(origins).all() or not np.isfinite(endpoints).all() or not np.isfinite(grid_origin).all():
+            raise ValueError("Ray coordinates must be finite.")
+        if not math.isfinite(voxel_size) or voxel_size<=0 or not math.isfinite(sensor_range) or sensor_range<0:
+            raise ValueError("Voxel size must be positive and sensor range non-negative and finite.")
+        visible=torch.zeros((len(origins),len(endpoints)),dtype=torch.bool,device=self.device)
+        if not visible.numel():
+            return visible
+        starts=np.floor((origins-grid_origin)/voxel_size).astype(np.int64)
+        targets=np.floor((endpoints-grid_origin)/voxel_size).astype(np.int64)
+        origins_t=torch.as_tensor(origins,device=self.device)
+        endpoints_t=torch.as_tensor(endpoints,device=self.device)
+        starts_t=torch.as_tensor(starts,device=self.device)
+        targets_t=torch.as_tensor(targets,device=self.device)
+        grid_t=torch.tensor(grid_origin,dtype=torch.float64,device=self.device)
+        if occupied:
+            cells=np.asarray(sorted(occupied),dtype=np.int64)
+            lower=cells.min(axis=0)
+            upper=cells.max(axis=0)
+            shape=tuple(int(upper[i])-int(lower[i])+1 for i in range(3))
+            if math.prod(shape)>np.iinfo(np.int64).max:
+                raise ValueError("Occupied voxel index range exceeds int64 lookup capacity.")
+            local=cells-lower
+            # Sorted scalar keys allow GPU membership checks without a dense voxel grid.
+            keys=torch.as_tensor((local[:,0]*shape[1]+local[:,1])*shape[2]+local[:,2],device=self.device)
+            lower_t=torch.as_tensor(lower,device=self.device)
+            upper_t=torch.as_tensor(upper,device=self.device)
+        unfinished=torch.zeros((),dtype=torch.bool,device=self.device)
+        for offset in range(0,visible.numel(),4096):
+            end=min(offset+4096,visible.numel())
+            ray_ids=np.arange(offset,end)
+            candidate_ids=ray_ids//len(endpoints)
+            target_ids=ray_ids%len(endpoints)
+            bounds=np.abs(targets[target_ids]-starts[candidate_ids]).sum(axis=1)+3
+            candidate_ids_t=torch.as_tensor(candidate_ids,device=self.device)
+            target_ids_t=torch.as_tensor(target_ids,device=self.device)
+            origin=origins_t[candidate_ids_t]
+            target=targets_t[target_ids_t]
+            current=starts_t[candidate_ids_t].clone()
+            direction=endpoints_t[target_ids_t]-origin
+            step=torch.sign(direction).long()
+            delta=torch.where(direction!=0,voxel_size/torch.abs(direction),torch.inf)
+            boundary=grid_t+(current+(step>0).long()).to(torch.float64)*voxel_size
+            crossing=torch.where(direction!=0,(boundary-origin)/direction,torch.inf)
+            in_range=(direction*direction).sum(dim=1)<=sensor_range**2
+            arrived=torch.all(current==target,dim=1)
+            batch_visible=visible.view(-1)[offset:end]
+            batch_visible.copy_(in_range&arrived)
+            active=in_range&~arrived
+            bounds_t=torch.as_tensor(bounds,device=self.device)
+            # In-range rays cannot cross more than this many cell boundaries.
+            maximum_steps=min(int(bounds.max()),math.ceil(math.sqrt(3)*sensor_range/voxel_size)+6)
+            for iteration in range(maximum_steps):
+                next_crossing=crossing.amin(dim=1,keepdim=True)
+                crossed=(torch.abs(crossing-next_crossing)<=1e-12)&active[:,None]
+                current=current+crossed.long()*step
+                crossing=torch.where(crossed,crossing+delta,crossing)
+                arrived=active&torch.all(current==target,dim=1)
+                batch_visible|=arrived
+                active&=~arrived
+                if occupied:
+                    inside=torch.all((current>=lower_t)&(current<=upper_t),dim=1)
+                    local=torch.minimum(torch.maximum(current,lower_t),upper_t)-lower_t
+                    query=(local[:,0]*shape[1]+local[:,1])*shape[2]+local[:,2]
+                    match=torch.searchsorted(keys,query).clamp_max(len(occupied)-1)
+                    active&=~(inside&(keys[match]==query))
+                exhausted=active&(bounds_t<=iteration+1)
+                unfinished|=exhausted.any()
+                active&=~exhausted
+            unfinished|=active.any()
+        if bool(unfinished):
+            raise RuntimeError("Voxel ray-casting exceeded its expected step count")
+        return visible
