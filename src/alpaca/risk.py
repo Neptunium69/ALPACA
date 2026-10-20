@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING,Any,Protocol
 from sensor_msgs.msg import CameraInfo
 import numpy as np
 import rospy
-from std_msgs.msg import Float64
 from dataclasses import dataclass
 from . import worldmodel as wm
 from .dataclasses import FCExecute
@@ -78,7 +77,7 @@ class RiskCal():
         self.minimum_persistent_occupied_voxels=10
         self.vantage_prediction_speed=0.3
         self.k=50
-        self.turn_cost_wgt=0.2
+        self.turn_cost_wgt=0.07
         self.move_cost_wgt=0.3
         self.frustration=0
         self.frustration_max=6
@@ -87,6 +86,7 @@ class RiskCal():
         self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.optim_iterations=81
         self.cs_occ_ratio=0.5 # Fraction of a route cross-section (50%).
+        self.occupied_cs_ratio=0.05
 
     
     def _actually_smart_vantage_reward(self,observable_voxels)->int:
@@ -214,6 +214,8 @@ class RiskCal():
         self_voxels=self.wminterface.execute(FCExecute(function="get_vehicle_voxels",arguments={"vehicle_pose":vehicle_pose,"vehicle_min":np.asarray(vehicle_min)-voxel_size,"vehicle_max":np.asarray(vehicle_max)+voxel_size}),submodel="voxels_master").data
         ignored_unknown={index for index in self_voxels if map_states.get(index) is None}
         unknown_check_voxels=potential_voxels-ignored_unknown
+        ignored_occupied={index for index in self_voxels if map_states.get(index)==1}
+        occupied_check_voxels=potential_voxels-ignored_occupied
         voxel_states=[map_states.get(index) for index in potential_voxels]
         clusters,unclustered=self.wminterface.execute(FCExecute(function="cluster_voxels",arguments={"indices":{index for index,state in map_states.items() if state==1 and index[2] in route_heights},"voxel_size":voxel_size,"gap":0.1}),submodel="voxels_master").data
         for voxel,state in zip(potential_voxels,voxel_states):
@@ -229,26 +231,33 @@ class RiskCal():
         pathvoxel=PathVoxelAssessment(occupied_voxels=occupied_voxels,unknown_voxels=unknown_voxels,free_voxels=free_voxels)
         if not potential_voxels:
             raise ValueError("Navigation prediction contains no voxels.")
-        blocking_clusters=[cluster for cluster in clusters if not cluster.isdisjoint(potential_voxels)]
+        blocking_clusters=[cluster for cluster in clusters if not cluster.isdisjoint(occupied_check_voxels) and self.route_cs(occupied_check_voxels,[cluster])]
         if blocking_clusters:
             return pathvoxel,blocking_clusters,[],False
 
         unknown_clusters,_=self.wminterface.execute(FCExecute(function="cluster_voxels",arguments={"indices":({index for index,state in map_states.items() if state is None and index[2] in route_heights} | unknown_voxels)-ignored_unknown,"voxel_size":voxel_size,"gap":0.1,"min_samples":1}),submodel="voxels_master").data
         unknown_clusters=[cluster for cluster in unknown_clusters if not cluster.isdisjoint(unknown_check_voxels)]
+        needs_information=self.route_cs(unknown_check_voxels,unknown_clusters)
+
+        return pathvoxel,blocking_clusters,unknown_clusters,needs_information
+
+    def route_cs(self,voxels,clusters)->bool:
         path_sections={}
-        for x,y,z in unknown_check_voxels:
+        for x,y,z in voxels:
             path_sections.setdefault(x,set()).add((y,z))
 
         needs_information=False
-        for unknown_cluster in unknown_clusters:
+        for unknown_cluster in clusters:
             cluster_sections={}
-            for x,y,z in unknown_cluster & unknown_check_voxels:
+            for x,y,z in unknown_cluster & voxels:
                 cluster_sections.setdefault(x,set()).add((y,z))
+            if not cluster_sections:
+                continue
             area=max(len(cells)/len(path_sections[x]) for x,cells in cluster_sections.items())
             if area>=self.cs_occ_ratio:
                 needs_information=True
                 break
-        return pathvoxel,blocking_clusters,unknown_clusters,needs_information
+        return needs_information
 
     def _camera_missing(self,unknown_voxels:set[tuple[int,int,int]],sensor_range:float)->int:
         indices=list(unknown_voxels)
@@ -264,7 +273,7 @@ class RiskCal():
         return missing
 
     def navigate(self,command:Command,destination:Position,orientation:Orientation,frame_id:str,sensor_range:float=5.0,observation_probability:float=0.7,distance_cost_weight:float=0.2,allow_scan:bool=False,completed_views:list[tuple[Position,float]] | None=None)->dict[str,Any]:
-        self.camea_info=rospy.wait_for_message("camera_info",CameraInfo,timeout=2.0)
+        self.camea_info=rospy.wait_for_message("camera_info",CameraInfo,timeout=10.0)
         try:
             prediction=self.predict_navigation(command,destination,orientation,frame_id)
         except (RuntimeError,TypeError,ValueError) as error:
@@ -397,6 +406,10 @@ class RiskCal():
                 if any(math.hypot(vantage_position.x-p.x,vantage_position.y-p.y)<0.10 and abs(math.atan2(math.sin(vantage_yaw-yaw),math.cos(vantage_yaw-yaw)))<math.radians(15) for p,yaw in (completed_views or [])):
                     candidate_counts["already_observed"]+=1
                     continue
+                information_reward=self.lid_wgt*float(lidar_uncertainty[in_range].sum())+self.cam_wgt*float(camera_rewards[candidate_index])
+                upper_bound=0.7*information_reward/((self.lid_wgt+self.cam_wgt)*total_unknown_value)
+                if options and upper_bound<=max(option["Profit"] for option in options):
+                    continue
                 vantage_orientation=wm.Orientation(pitch=0.0,yaw=vantage_yaw,roll=0.0)
                 try:
                     occupancy_min=vehicle_min.copy()
@@ -430,9 +443,6 @@ class RiskCal():
                     candidate_counts["path_unknown_cluster"]+=1
                     continue
 
-                lidar_reward=self.lid_wgt*float(lidar_uncertainty[in_range].sum())
-                camera_reward=self.cam_wgt*float(camera_rewards[candidate_index])
-                information_reward=lidar_reward+camera_reward
                 novelty=self.wminterface.execute(FCExecute(function="get_observation_novelty",arguments={"position":vantage_position,"arrival_seconds":vantage_prediction.distance/self.vantage_prediction_speed}),submodel="voxels_master").data
                 path_cost=distance_cost_weight*(vantage_prediction.distance/reference_distance)
                 normlaiz=0.7/((self.lid_wgt+self.cam_wgt)*total_unknown_value)
@@ -464,7 +474,7 @@ class RiskCal():
         return {"Safe":True,"Reason":"Route accepted.","Prediction":prediction,"Assessment":pathvoxel}
         
     def _raycast_voxeels(self,origins_world:np.ndarray,endpoints_world:np.ndarray,grid_origin:tuple[float,float,float],voxel_size:float,occupied:set[tuple[int,int,int]],sensor_range:float)->torch.Tensor:
-        """Traverse bounded batches of rays with PyTorch on either CPU or CUDA."""
+        """Traverse all rays in one batch with PyTorch on either CPU or CUDA."""
         origins=np.asarray(origins_world,dtype=np.float64).reshape(-1,3)
         endpoints=np.asarray(endpoints_world,dtype=np.float64).reshape(-1,3)
         if not np.isfinite(origins).all() or not np.isfinite(endpoints).all() or not np.isfinite(grid_origin).all():
@@ -494,8 +504,8 @@ class RiskCal():
             lower_t=torch.as_tensor(lower,device=self.device)
             upper_t=torch.as_tensor(upper,device=self.device)
         unfinished=torch.zeros((),dtype=torch.bool,device=self.device)
-        for offset in range(0,visible.numel(),4096):
-            end=min(offset+4096,visible.numel())
+        for offset in range(0,visible.numel(),visible.numel()):
+            end=visible.numel()
             ray_ids=np.arange(offset,end)
             candidate_ids=ray_ids//len(endpoints)
             target_ids=ray_ids%len(endpoints)

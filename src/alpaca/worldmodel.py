@@ -152,6 +152,7 @@ class VoxelWorldModel(Submodel):
         self.activity_decay_seconds=30.0
         self.activity_increment=0.1
         self.correlation_strength=1.0
+        self._observation_listeners=[]
         self._lock=RLock()
 
     def initwm(self)->None:
@@ -433,6 +434,38 @@ class MasterVoxelWorldModel(VoxelWorldModel):
                 self.vwms[wm.name]=wm
             else:
                 raise RuntimeError(f"World model {wm.name} is already added.")
+        self.observation_pair_slop=0.1
+        self.observation_pairs=0
+        self._pending_observations={name:[] for name in important_wms}
+        self._last_activity_stamps={}
+        self._activity_last_time=0.0
+        for name in important_wms:
+            if name in self.vwms:
+                self.vwms[name]._observation_listeners.append(lambda message,now,name=name:self.record_observation(name,message,now))
+
+    def record_observation(self,sensor:str,message:SpatialObservationFrame,now:float)->None:
+        """Deposit once per accepted camera/LiDAR pair, never per fusion iteration."""
+        if sensor not in self._pending_observations or len(self._pending_observations)!=2:
+            return
+        stamp=message.header.stamp.to_nsec(); position=message.sensor_position
+        if stamp<=0 or not message.header.frame_id or not all(math.isfinite(value) for value in (now,position.x,position.y,position.z)):
+            return
+        with self._lock:
+            key=(sensor,message.source_id)
+            if stamp<=self._last_activity_stamps.get(key,-1):
+                return
+            self._last_activity_stamps[key]=stamp
+            other=next(name for name in self._pending_observations if name!=sensor); pending=self._pending_observations[other]
+            matches=[(abs(item[0]-stamp),index) for index,item in enumerate(pending) if item[1]==message.header.frame_id and abs(item[0]-stamp)<=round(self.observation_pair_slop*1e9)]
+            if not matches:
+                queue=self._pending_observations[sensor]; queue.append((stamp,message.header.frame_id,Position(position.x,position.y,position.z),now)); del queue[:-100]
+                return
+            _,index=min(matches); _,_,previous,received=pending.pop(index)
+            origin=Position((previous.x+position.x)/2,(previous.y+position.y)/2,(previous.z+position.z)/2)
+            now=max(now,received,self._activity_last_time)
+            self._observation_activity(origin,now,deposit=True)
+            self._activity_last_time=now; self.observation_pairs+=1
+
     def initwm(self):
         if not self.thread.is_alive():
             self.thread.start()
@@ -567,6 +600,7 @@ class CameraVoxelWorldModel(VoxelWorldModel):
             if updated:
                 self._observation_activity(sensor_position,now,deposit=True)
                 self._last_voxel_stamps[message.source_id]=stamp
+                for listener in self._observation_listeners: listener(message,now)
 
 class LiDARVoxelWorldModel(VoxelWorldModel):
     """Populate a voxel model from the adapter's LiDAR observations."""
@@ -650,6 +684,7 @@ class LiDARVoxelWorldModel(VoxelWorldModel):
             if updated:
                 self._observation_activity(sensor_position,now,deposit=True)
                 self._last_voxel_stamps[message.source_id]=stamp
+                for listener in self._observation_listeners: listener(message,now)
 
     def _lidar_transform(self,observation: ObservationFrame,flag: int=0)->np.ndarray:
         """Return the body-to-world transform or its inverse for body-frame LiDAR points."""

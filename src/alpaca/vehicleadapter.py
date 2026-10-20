@@ -11,7 +11,7 @@ from math import pi,isfinite
 import actionlib
 from actionlib_msgs.msg import GoalStatus
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
-from std_msgs.msg import Float64,Header
+from std_msgs.msg import Header
 import sensor_msgs.point_cloud2 as pc2
 import rospy
 import message_filters
@@ -125,11 +125,6 @@ class UGVAdapter(VehicleAdapter):
         self.height_margin = 0.05
         self.search_offset = np.array([0.30, 0.30, 0.05])
         self.roi_min = self.vehicle_min - self.search_offset
-        self.roi_max = self.vehicle_max + self.search_offset
-        self.ground_z = -0.05
-        self.ground_margin = 0.06
-        self.N_open = 5
-        self.N_dense = 20
         self.lidar_to_body_translation = np.array([-0.011, -0.02329, 0.04412],dtype=np.float64)
         self.lidar_to_body_rotation = np.eye(3,dtype=np.float64)
         self.whereitisnt:PoseStamped|None=None
@@ -138,6 +133,8 @@ class UGVAdapter(VehicleAdapter):
         self.moveflag=False
         self.theta=None
         self.current_yawrate=None
+        self.num_lid_vox=500
+        self.cam_stride=3
 
     @property
     def navigation_frame(self)->str:
@@ -176,7 +173,6 @@ class UGVAdapter(VehicleAdapter):
         self.battery_publisher = rospy.Publisher("battery_level",BatteryState,queue_size=1)
         self.color_publisher = rospy.Publisher("camera_color",Image,queue_size=1)
         self.depth_publisher = rospy.Publisher("camera_depth",Image,queue_size=1)
-        self.clutter_publisher = rospy.Publisher("clutter_level",Float64,queue_size=1)
         if not self.client.wait_for_server(rospy.Duration(secs=5)):
             raise RuntimeError("The move_base action server is unavailable.")
         try:
@@ -429,7 +425,7 @@ class UGVAdapter(VehicleAdapter):
             if depth_msg.header.stamp.to_nsec()<=0 or vehicle_pose.header.stamp.to_nsec()<=0 or abs((depth_msg.header.stamp-vehicle_pose.header.stamp).to_sec())>0.05:
                 raise ValueError("Camera depth and vehicle pose timestamps must be valid and within 0.05 seconds.")
             depth=self.camera_bridge.imgmsg_to_cv2(depth_msg,desired_encoding="passthrough")
-            points=depth_points(depth,depth_msg.encoding,camera_info)
+            points=depth_points(depth,depth_msg.encoding,camera_info,pixel_stride=self.cam_stride)
             points_body=points@self.camera_to_body_rotation.T+self.camera_to_body_translation
             points_body=points_body[(points_body[:,2]>=self.vehicle_min[2]-self.height_margin)&(points_body[:,2]<=self.vehicle_max[2]+self.height_margin)]
             # if len(points_body)>300:
@@ -468,23 +464,9 @@ class UGVAdapter(VehicleAdapter):
         points_body=points_body[(points_body[:,2]>=self.vehicle_min[2]-self.height_margin)&(points_body[:,2]<=self.vehicle_max[2]+self.height_margin)]
         self.lidar_points_world,self.lidar_origin_world=self._lidar_to_world(points_body,vehicle_pose)
 
-        clutter_points=points_body[np.all((points_body>=self.roi_min) & (points_body<self.roi_max),axis=1)]
-        clutter_points=clutter_points[~np.all((clutter_points>=self.vehicle_min) & (clutter_points<=self.vehicle_max),axis=1)]
-        clutter_points=clutter_points[np.abs(clutter_points[:,2]-self.ground_z)>=self.ground_margin]
-        if len(clutter_points)==0:
-            occupied_count=0
-        else:
-            clutter_voxel_indices=np.floor((clutter_points-self.roi_min)/self.voxel_size).astype(np.int32)
-            occupied_count=len(np.unique(clutter_voxel_indices,axis=0))
-        if self.N_dense<=self.N_open:
-            rospy.logerr("N_dense must be greater than N_open.")
-            return
-        clutter_level=float(np.clip((occupied_count-self.N_open)/(self.N_dense-self.N_open),0.0,1.0))
-        self.clutter_publisher.publish(Float64(data=clutter_level))
-
         selected = self.lidar_points_world.tolist()
-        if len(selected)>1000:
-            selected = random.sample(selected, 1000)
+        if len(selected)>self.num_lid_vox:
+            selected = random.sample(selected, k=self.num_lid_vox)
 
         ground_z=vehicle_pose.pose.pose.position.z+float(self.vehicle_min[2])
         selected=np.asarray(selected,dtype=np.float64).reshape(-1,3)
@@ -642,9 +624,7 @@ class UGVAdapter(VehicleAdapter):
             return {}
         start=np.floor((origin-grid_origin)/voxel_size).astype(np.int64)
         targets=np.floor((endpoint-grid_origin)/voxel_size).astype(np.int64)
-        step_bounds=np.abs(targets-start).sum(axis=1)+3
-        # Bound traversal storage, without dropping rays or changing their counts.
-        batch_size=max(1,min(16384,2000000//int(step_bounds.max())))
+        batch_size=len(endpoint)
         origin_t=torch.as_tensor(origin,dtype=torch.float64,device=self.device)
         grid_t=torch.as_tensor(grid_origin,dtype=torch.float64,device=self.device)
         start_t=torch.as_tensor(start,dtype=torch.int64,device=self.device)
@@ -652,38 +632,39 @@ class UGVAdapter(VehicleAdapter):
         targets_t=torch.as_tensor(targets,dtype=torch.int64,device=self.device)
         occupied_t=torch.as_tensor(occupied_mask,dtype=torch.bool,device=self.device)
         batches=[]
-        unfinished=torch.zeros((),dtype=torch.bool,device=self.device)
         for offset in range(0,len(endpoint),batch_size):
             target=targets_t[offset:offset+batch_size]
-            current=start_t.expand_as(target).clone()
             direction=endpoints_t[offset:offset+batch_size]-origin_t
-            step=torch.sign(direction).to(torch.int64)
-            t_delta=torch.where(direction!=0,voxel_size/torch.abs(direction),torch.inf)
-            boundary=grid_t+(current+(step>0).to(torch.int64)).to(torch.float64)*voxel_size
-            t_max=torch.where(direction!=0,(boundary-origin_t)/direction,torch.inf)
-            active=torch.any(current!=target,dim=1)
-            maximum_steps=int(step_bounds[offset:offset+batch_size].max())
-            traversed=torch.empty((maximum_steps,len(target),3),dtype=torch.int64,device=self.device)
-            valid=torch.empty((maximum_steps,len(target)),dtype=torch.bool,device=self.device)
-            for index in range(maximum_steps):
-                traversed[index]=current
-                valid[index]=active
-                next_crossing=t_max.amin(dim=1,keepdim=True)
-                crossed=(torch.abs(t_max-next_crossing)<=1e-12)&active[:,None]
-                current=current+crossed.to(torch.int64)*step
-                t_max=torch.where(crossed,t_max+t_delta,t_max)
-                active=active&torch.any(current!=target,dim=1)
-            unfinished=unfinished|active.any()
-            free=traversed[valid]
+            crossings=[torch.zeros((len(target),1),dtype=torch.float64,device=self.device),torch.ones((len(target),1),dtype=torch.float64,device=self.device)]
+            for axis in range(3):
+                lower=torch.minimum(start_t[axis],target[:,axis])
+                upper=torch.maximum(start_t[axis],target[:,axis])
+                plane_count=int(np.abs(targets[offset:offset+batch_size,axis]-start[axis]).max())
+                planes=lower[:,None]+1+torch.arange(plane_count,device=self.device)[None,:]
+                boundaries=grid_t[axis]+planes.to(torch.float64)*voxel_size
+                delta=direction[:,axis,None]
+                times=(boundaries-origin_t[axis])/torch.where(delta!=0,delta,1.0)
+                valid=(delta!=0)&(planes<=upper[:,None])&(times>0)&(times<1)
+                crossings.append(torch.where(valid,times,torch.ones_like(times)))
+            times=torch.cat(crossings,dim=1).sort(dim=1).values
+            valid=times[:,1:]-times[:,:-1]>1e-12
+            midpoints=(times[:,1:]+times[:,:-1])*0.5
+            cells=torch.floor((origin_t+midpoints[:,:,None]*direction[:,None,:]-grid_t)/voxel_size).long()
+            cells=torch.where(direction[:,None,:]==0,start_t,cells)
+            valid=valid&torch.any(cells!=target[:,None,:],dim=2)
             if single:
-                if bool(unfinished):
-                    raise RuntimeError("Voxel ray-casting exceeded its expected step count")
+                free=torch.cat((start_t[None,:],cells[valid]),dim=0)
+                free=torch.unique_consecutive(free[torch.any(free!=target[0],dim=1)],dim=0)
                 return [tuple(voxel) for voxel in free.cpu().tolist()],tuple(target[0].cpu().tolist())
-            free,free_counts=torch.unique(free,dim=0,return_counts=True)
+            owners=torch.arange(len(target),device=self.device)
+            ray_ids=owners[:,None].expand_as(valid)
+            pairs=torch.cat((ray_ids[valid][:,None],cells[valid]),dim=1)
+            origins=torch.cat((owners[:,None],start_t.expand(len(target),3)),dim=1)
+            pairs=torch.cat((pairs,origins[torch.any(target!=start_t,dim=1)]),dim=0)
+            pairs=torch.unique(pairs,dim=0)
+            free,free_counts=torch.unique(pairs[:,1:],dim=0,return_counts=True)
             occupied,occupied_counts=torch.unique(target[occupied_t[offset:offset+len(target)]],dim=0,return_counts=True)
             batches.append(torch.cat((torch.cat((free,free_counts[:,None],torch.zeros_like(free_counts[:,None])),dim=1),torch.cat((occupied,torch.zeros_like(occupied_counts[:,None]),occupied_counts[:,None]),dim=1)),dim=0))
-        if bool(unfinished):
-            raise RuntimeError("Voxel ray-casting exceeded its expected step count")
         observations=torch.cat(batches,dim=0)
         indices,inverse=torch.unique(observations[:,:3],dim=0,return_inverse=True)
         counts=torch.zeros((len(indices),2),dtype=torch.int64,device=self.device)
@@ -711,8 +692,6 @@ class UGVAdapter(VehicleAdapter):
             raise NavigationReadinessError(f"Cannot {action_name}: vehicle is not armed.")
         if state.data["mode"]!="OFFBOARD":
             raise NavigationReadinessError(f"Cannot {action_name}: vehicle is in {state.data['mode'] or 'an unknown mode'}, not OFFBOARD.")
-        if last_pose_monotonic is None or now-last_pose_monotonic>self.max_pose_age:
-            raise NavigationReadinessError(f"Cannot {action_name}: vehicle localization is unavailable or stale.")
     def require_navigation_ready(self,action_name:str)->None:
         self._require_vehicle_ready(action_name)
 
@@ -966,8 +945,6 @@ class UGVAdapter(VehicleAdapter):
                         target=PoseStamped()
                         target.header.stamp = rospy.Time.now()
                         target.pose=deepcopy(pose.pose)
-                        self.whereitisnt=target
-                        self.moveflag=True
 
                         distance=np.sqrt((state.data["position"].x-tagret.pose.position.x)**2+(state.data["position"].y-tagret.pose.position.y)**2)
                         yaw_error = (orientation.yaw - self.state.data["orientation"].yaw + pi) % (2*pi) - pi
@@ -982,6 +959,12 @@ class UGVAdapter(VehicleAdapter):
                         if i==len(path.poses)-1:
                             if distance<=arrival_tolerance:
                                 flag=True
+                            else:
+                                scale=max(distance,0.20)/distance
+                                target.pose.position.x=state.data["position"].x+(tagret.pose.position.x-state.data["position"].x)*scale
+                                target.pose.position.y=state.data["position"].y+(tagret.pose.position.y-state.data["position"].y)*scale
+                        self.whereitisnt=target
+                        self.moveflag=not flag
                         if dist2nextwp<=self.intermediate_wp_marg:
                             i+=1
                         if i>len(path.poses)-1:

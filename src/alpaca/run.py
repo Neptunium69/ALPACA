@@ -26,7 +26,6 @@ import math
 import os
 import time
 from threading import RLock
-from std_msgs.msg import Float64
 from std_srvs.srv import Trigger,TriggerResponse
 from mavros_msgs.msg import State as MavrosState
 from mavros_msgs.srv import CommandBool
@@ -56,7 +55,7 @@ def start_world_model_logging(model:worldmodel.ObjectWorldModel,log_dir:Path):
     return rospy.Timer(rospy.Duration(1),log_objects)
 
 def wait_for_runtime_inputs(timeout_seconds:float=30.0)->None:
-    required_topics=[("voxel_observations",SpatialObservationFrame,timeout_seconds),("clutter_level",Float64,timeout_seconds),("detections",ObservationFrame,max(timeout_seconds,90.0))]
+    required_topics=[("voxel_observations",SpatialObservationFrame,timeout_seconds),("detections",ObservationFrame,max(timeout_seconds,90.0))]
     for topic,message_type,topic_timeout in required_topics:
         rospy.loginfo("Waiting for ALPACA runtime data on /%s...",topic)
         try:
@@ -64,7 +63,7 @@ def wait_for_runtime_inputs(timeout_seconds:float=30.0)->None:
         except rospy.ROSException as error:
             message=f"No ALPACA runtime data on /{topic} within {topic_timeout:.0f} seconds."
             raise RuntimeError(message) from error
-    rospy.loginfo("Voxel, clutter, and detection pipelines are live.")
+    rospy.loginfo("Voxel and detection pipelines are live.")
 
 def main():
     # Initialize stuff

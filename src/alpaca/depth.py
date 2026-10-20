@@ -39,11 +39,14 @@ def pixel_points(pixels:np.ndarray,depths:np.ndarray,camera_info)->np.ndarray:
     return np.column_stack((normalized*depths[:,None],depths))
 
 
-def depth_points(depth:np.ndarray,encoding:str,camera_info)->np.ndarray:
+def depth_points(depth:np.ndarray,encoding:str,camera_info,pixel_stride:int=1)->np.ndarray:
     """Convert valid depth pixels using the existing detector's 0.1–10 m range."""
     depth=to_meters(depth,encoding)
     if depth.ndim!=2 or depth.shape!=(camera_info.height,camera_info.width):
         raise ValueError("CameraInfo and depth image dimensions do not match.")
     valid=np.isfinite(depth)&(depth>0.1)&(depth<10.0)
     v,u=np.nonzero(valid)
-    return pixel_points(np.column_stack((u,v)),depth[valid],camera_info).astype(np.float32)
+    if pixel_stride>1:
+        selected=(u+v)%pixel_stride==0
+        v,u=v[selected],u[selected]
+    return pixel_points(np.column_stack((u,v)),depth[v,u],camera_info).astype(np.float32)

@@ -6,6 +6,7 @@ from nav_msgs.msg import Odometry
 from alpaca_msgs.msg import ObservationFrame, ObjectDetection
 from typing import Any, Sequence
 from threading import Lock
+from collections import deque
 from copy import deepcopy
 import time
 import os
@@ -33,6 +34,7 @@ class YOLOAdapter():
         self.classes=self.model.names.values()
         self.pose_lock=Lock()
         self.inference_lock=Lock()
+        self.pending_frames=deque(maxlen=1)
         self.latest_pose:Odometry | None=None
         self.latest_pose_monotonic:float | None=None
         self.max_pose_age=0.5
@@ -52,12 +54,13 @@ class YOLOAdapter():
         self.detection_logger.addHandler(handler)
         self.last_detection_status_time=float("-inf")
 
-        self.color_subscriber = message_filters.Subscriber("camera_color", Image)
-        self.camera_info_subscriber = message_filters.Subscriber("camera_info", CameraInfo)
-        self.depth_subscriber = message_filters.Subscriber("camera_depth", Image)
+        self.color_subscriber = message_filters.Subscriber("camera_color",Image,queue_size=1,buff_size=2**24)
+        self.camera_info_subscriber = message_filters.Subscriber("camera_info",CameraInfo,queue_size=1)
+        self.depth_subscriber = message_filters.Subscriber("camera_depth",Image,queue_size=1,buff_size=2**24)
         self.pose_subscriber=message_filters.Subscriber("vehicle_pose",Odometry,queue_size=1)
-        self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber,self.pose_subscriber],queue_size=30,slop=0.1)
-        self.synchronizer.registerCallback(self._image_callback)
+        self.synchronizer = message_filters.ApproximateTimeSynchronizer([self.color_subscriber,self.depth_subscriber,self.camera_info_subscriber,self.pose_subscriber],queue_size=10,slop=0.1)
+        self.synchronizer.registerCallback(lambda *messages:self.pending_frames.append(messages))
+        self.inference_timer=rospy.Timer(rospy.Duration(1/15),self._image_callback)
 
     def _pose_callback(self,pose_msg:Odometry)->None:
         if rospy.is_shutdown():
@@ -131,13 +134,14 @@ class YOLOAdapter():
             raise TypeError(f"YOLO returned an unexpected result type: {type(result).__name__}")
         return result
 
-    def _image_callback(self,color_msg,depth_msg,camera_info_msg,pose_msg):
+    def _image_callback(self,_event=None):
         if not self.inference_lock.acquire(blocking=False):
             return
         inference_started=time.monotonic()
         try:
-            if rospy.is_shutdown():
+            if rospy.is_shutdown() or not self.pending_frames:
                 return
+            color_msg,depth_msg,camera_info_msg,pose_msg=self.pending_frames.pop()
             rospy.loginfo_once("YOLO received synchronized camera data; running the first inference.")
             frame=self.bridge.imgmsg_to_cv2(color_msg,desired_encoding="bgr8")
             depth=self.bridge.imgmsg_to_cv2(depth_msg,desired_encoding="passthrough")

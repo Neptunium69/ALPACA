@@ -17,7 +17,7 @@ class Navigate(Tool):
         self.vainterface=vainterface
         self.risk=risk
         self.redirects_left=3
-        self.replans=5
+        self.replans=10
         self.frustration=0
         self.risk_bypass_distance=0.10 # Horizontal metres; 0 disables the bypass.
         self.vantage_tolerance=0.05
