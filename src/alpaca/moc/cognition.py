@@ -8,9 +8,11 @@ from torch import nn
 import asyncio
 
 class Cognition(nn.Module):
-    def __init__(self, model: nn.Module,name:str, interval:float):
+    def __init__(self, model: nn.Module,name:str, interval:float, shape:dict[str,int]|None=None):
         super().__init__()
         self.model = model
+        # Destination cognition name -> width of the output sent to it.
+        self.shape:dict[str,int]={} if shape is None else shape.copy()
         self.gates:dict[str,nn.Module]={}
         self.entry:dict[str,Any]={}
         self.name=name
@@ -26,15 +28,15 @@ class Cognition(nn.Module):
     def _unfuse(self,input:torch.Tensor)->tuple[dict[str,Any],Any]:
         raise NotImplementedError
     def forward(self,X:dict[str,Any]):
-        y=self._unfuse(self.model.forward(self._fuse(X,self.hidden)))
+        y=self._unfuse(self.model(self._fuse(X,self.hidden)))
         self.hidden=y[1]
         for a,b in y[0].items():
-            y[0][a]=self.gates[a].forward(b)
-        return y
+            y[0][a]=self.gates[a](b)
+        return y[0]
 
     async def run(self, stopflag:asyncio.Event):
-        X=self.entry.copy()
-        while not stopflag.is_set:
+        while not stopflag.is_set():
+            X=self.entry.copy()
             self.y = await asyncio.to_thread(self, X)
             try:
                 await asyncio.wait_for(stopflag.wait(), timeout=self.interval)
