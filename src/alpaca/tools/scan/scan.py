@@ -30,10 +30,10 @@ class Scan(Tool):
             risk_result=self.risk.checkcmd(command)
             if risk_result.get("Safe") is False:
                 return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":risk_result.get("Reason","Command failed the safety check.")})
-            self.wminterface.execute(FCExecute(function="record",arguments={}))
+            self.wminterface.execute(FCExecute(function="record",arguments={}),submodel="objects")
             recording_started=True
             _=self.vainterface.execute(FCExecute(function="scan",arguments={"yaw_margin":float(np.deg2rad(45))}))
-            changes=self.wminterface.execute(FCExecute(function="stop_record",arguments={})).data
+            changes=self.wminterface.execute(FCExecute(function="stop_record",arguments={}),submodel="objects").data
             recording_started=False
         except rospy.ROSInterruptException as error:
             return Return(
@@ -52,7 +52,7 @@ class Scan(Tool):
         finally:
             if recording_started:
                 try:
-                    self.wminterface.execute(FCExecute(function="stop_record",arguments={}))
+                    self.wminterface.execute(FCExecute(function="stop_record",arguments={}),submodel="objects")
                 except RuntimeError:
                     pass
 

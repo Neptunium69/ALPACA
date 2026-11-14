@@ -35,7 +35,7 @@ class Query(Tool):
                 },
             )
         else:
-            objects = self.interface.execute(FCExecute(function="query_world",arguments={"object_id":object_id,"class_name":class_name})).data
+            objects = self.interface.execute(FCExecute(function="query_world",arguments={"object_id":object_id,"class_name":class_name}),submodel="objects").data
 
         if len(objects) == 0:
             return Return(

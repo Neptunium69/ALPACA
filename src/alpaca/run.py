@@ -1,4 +1,7 @@
-from . import vlminterface
+if __package__ == "alpaca":
+    from cria import cria_vlminterface as vlminterface
+else:
+    from ..cria import cria_vlminterface as vlminterface
 from . import worldmodel
 from . import userinterface
 from . import vehicleadapter
@@ -20,28 +23,31 @@ from .wmtools import WorldModelInterface
 
 import rospy
 from pathlib import Path
+from importlib.resources import files
 from dataclasses import asdict
 import json
+import math
 import os
 import time
 from threading import RLock
-from std_msgs.msg import Float64
 from std_srvs.srv import Trigger,TriggerResponse
 from mavros_msgs.msg import State as MavrosState
 from mavros_msgs.srv import CommandBool
-from ...deploy.px4_shutdown import run_shutdown
 from alpaca_msgs.msg import ObservationFrame,SpatialObservationFrame
 
 # Prompts and stuff
-prompt_path=Path(__file__).resolve().parents[2]/"system_prompt_master.md"
-system_prompt_master=prompt_path.read_text(encoding="utf-8").strip()
+prompt_path=Path(os.environ.get("ALPACA_SYSTEM_PROMPT",Path(__file__).resolve().parents[2]/"system_prompt_master.txt"))
+if "ALPACA_SYSTEM_PROMPT" in os.environ or prompt_path.is_file():
+    system_prompt_master=prompt_path.read_text(encoding="utf-8").strip()
+else:
+    system_prompt_master=files(__package__).joinpath("resources/mission_prompt.txt").read_text(encoding="utf-8").strip()
 system_prompt_think="\nEnter PLANNING MODE. Think of a plan of what you should do next but don't write commands yet."
 system_prompt_act="\nEnter ACTION MODE. Return exactly one raw JSON object following the command format for the next step. Your first character must be { and your last character must be }. Never wrap the JSON in Markdown, backticks, or code fences; never add a json language label, explanation, or other text outside the object. ALPACA parses the entire response as JSON and rejects wrappers. Check the response boundaries before sending."
-# user_prompt="Find the apple behind the board."
-user_prompt="Survey the accessible forest with the UGV and inspect standing trees for basal and root damage. Use the tree class to locate trees, including trees with no visible damage, and inspect their trunk bases and visible roots from safe viewpoints. Look for basal_damage and root_damage near each tree; a tree may have neither, either, or both damage classes. Associate each damage observation with a tree using visual evidence and world-model positions, and flag uncertain associations. Keep clear of trunks, roots, and other obstacles, and avoid repeatedly inspecting the same tree. Send me the IDs and locations of damaged trees, the observed damage classes, and supporting images. Do not treat missing detections as proof that a tree is healthy. When the accessible survey is complete or further inspection is blocked, summarize the findings, identify uninspected or uncertain areas, and finish the mission."
+user_prompt="Find the apple behind the board."
+# user_prompt="Survey the accessible forest with the UGV and inspect standing trees for basal and root damage. Use the tree class to locate trees, including trees with no visible damage, and inspect their trunk bases and visible roots from safe viewpoints. Look for basal_damage and root_damage near each tree; a tree may have neither, either, or both damage classes. Associate each damage observation with a tree using visual evidence and world-model positions, and flag uncertain associations. Keep clear of trunks, roots, and other obstacles, and avoid repeatedly inspecting the same tree. Send me the IDs and locations of damaged trees, the observed damage classes, and supporting images. Do not treat missing detections as proof that a tree is healthy. When the accessible survey is complete or further inspection is blocked, summarize the findings, identify uninspected or uncertain areas, and finish the mission."
 project_root=Path(__file__).resolve().parents[3]
-model_path=str(project_root/"Models"/"Qwen3-VL-4B-Instruct")
-yolo_path="./ALPACA/yolomodel/best.engine"
+model_path=os.environ.get("ALPACA_MODEL_PATH",str(project_root/"Models"/"Qwen3-VL-4B-Instruct"))
+yolo_path=os.environ.get("ALPACA_YOLO_MODEL","./ALPACA/yolomodel/best.engine")
 
 def start_world_model_logging(model:worldmodel.ObjectWorldModel,log_dir:Path):
     log_path=log_dir/"world_model_objects.jsonl"
@@ -56,7 +62,7 @@ def start_world_model_logging(model:worldmodel.ObjectWorldModel,log_dir:Path):
     return rospy.Timer(rospy.Duration(1),log_objects)
 
 def wait_for_runtime_inputs(timeout_seconds:float=30.0)->None:
-    required_topics=[("voxel_observations",SpatialObservationFrame,timeout_seconds),("clutter_level",Float64,timeout_seconds),("detections",ObservationFrame,max(timeout_seconds,90.0))]
+    required_topics=[("voxel_observations",SpatialObservationFrame,timeout_seconds),("detections",ObservationFrame,max(timeout_seconds,90.0))]
     for topic,message_type,topic_timeout in required_topics:
         rospy.loginfo("Waiting for ALPACA runtime data on /%s...",topic)
         try:
@@ -64,23 +70,35 @@ def wait_for_runtime_inputs(timeout_seconds:float=30.0)->None:
         except rospy.ROSException as error:
             message=f"No ALPACA runtime data on /{topic} within {topic_timeout:.0f} seconds."
             raise RuntimeError(message) from error
-    rospy.loginfo("Voxel, clutter, and detection pipelines are live.")
+    rospy.loginfo("Voxel and detection pipelines are live.")
 
 def main():
     # Initialize stuff
     rospy.init_node("alpaca", anonymous=True)
+    cria_host=os.environ.get("CRIA_URL","http://192.168.31.242:8765").strip()
+    if not cria_host:
+        rospy.logerr("Set CRIA_URL to the laptop CRIA host URL, e.g. http://192.168.1.50:8765")
+        return 1
     log_dir=Path(os.environ.get("ALPACA_LOG_DIR","/tmp/alpaca_runtime"))
     log_dir.mkdir(parents=True,exist_ok=True)
     observations=worldmodel.Model()
-    model=worldmodel.ObjectWorldModel(observations,["apple","board"])
+    model=worldmodel.WorldModel()
+    object_model=worldmodel.ObjectWorldModel(observations,["apple","board"])
+    voxel_model=worldmodel.LiDARVoxelWorldModel(name="voxels_lidar")
+    camera_model=worldmodel.CameraVoxelWorldModel()
+    master_voxel_model=worldmodel.MasterVoxelWorldModel(
+        [camera_model,voxel_model],
+        important_wms=(camera_model.name,voxel_model.name),
+    )
+    model.add([object_model,voxel_model,camera_model,master_voxel_model])
+    wminterface=WorldModelInterface(model,"primary")
     adapter=vehicleadapter.UGVAdapter(model,None)
     vainterface=VAInterface(adapter,"primary")
-    rcm=risk.RiskCal(model,vainterface)
+    rcm=risk.RiskCal(wminterface,vainterface)
     adapter.riskcal=rcm
-    detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=True)
-    vlm_interface=vlminterface.VLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None)
+    detector=yolo.YOLOAdapter(model_path=yolo_path,sitl=rospy.get_param("~sitl",False))
+    vlm_interface=vlminterface.CRIAVLMInterface(system_prompt_think=system_prompt_think, system_prompt_master=system_prompt_master,system_prompt_act=system_prompt_act,model_path=model_path,toolexe=None,host=cria_host,model_name=os.environ.get("CRIA_MODEL","qwen3-vl:4b-instruct-q4_K_M"),request_timeout=float(os.environ.get("CRIA_TIMEOUT","600")),token=os.environ.get("CRIA_TOKEN"))
     vlm_interface.init_vlm()
-    wminterface=WorldModelInterface(model,"primary")
     observe_tool=Observe()
     navigate_tool=Navigate(vainterface,rcm)
     scan_tool=Scan(wminterface,vainterface,rcm)
@@ -104,7 +122,7 @@ def main():
 
     # Initialize the stuff that just got initialized
     model.initwm()
-    world_model_log_timer=start_world_model_logging(model,log_dir)
+    world_model_log_timer=start_world_model_logging(object_model,log_dir)
     detector.init_yolo()
     vainterface.execute(FCExecute(function="init_sensordata",arguments={}))
     shutdown_lock=RLock()
@@ -119,7 +137,16 @@ def main():
             shutdown_hold()
             while not rospy.is_shutdown():
                 try:
-                    if run_shutdown(rospy,MavrosState,CommandBool,Trigger,initialize_node=False)==0:
+                    state=rospy.wait_for_message("/mavros/state",MavrosState,timeout=2.0)
+                    if not state.connected:
+                        raise RuntimeError("MAVROS is disconnected; disarm cannot be confirmed.")
+                    if state.armed:
+                        rospy.wait_for_service("/mavros/cmd/arming",timeout=2.0)
+                        response=rospy.ServiceProxy("/mavros/cmd/arming",CommandBool)(value=False)
+                        if not response.success:
+                            raise RuntimeError("PX4 rejected the disarm request.")
+                        state=rospy.wait_for_message("/mavros/state",MavrosState,timeout=2.0)
+                    if state.connected and not state.armed:
                         adapter.timer.shutdown()
                         adapter.stopped=True
                         return
@@ -130,7 +157,23 @@ def main():
     rospy.on_shutdown(stop_adapter)
     try:
         ui.initui()
+        rospy.set_param("/alpaca/runtime_ready",False)
         wait_for_runtime_inputs()
+        rospy.loginfo("Waiting for the fused master voxel grid...")
+        deadline=time.monotonic()+90.0
+        while not rospy.is_shutdown() and not adapter.stopping:
+            with master_voxel_model._lock:
+                grid=master_voxel_model.voxelmap
+                if grid.frame_id and grid.grid_origin is not None and math.isfinite(grid.voxelsize) and grid.voxelsize>0 and all(math.isfinite(value) for value in (grid.grid_origin.x,grid.grid_origin.y,grid.grid_origin.z)):
+                    break
+            if not master_voxel_model.thread.is_alive():
+                raise RuntimeError("Master voxel fusion stopped before the grid was initialized.")
+            if time.monotonic()>=deadline:
+                raise RuntimeError("Fused master voxel grid was not initialized within 90 seconds.")
+            time.sleep(0.1)
+        else:
+            return 0
+        rospy.loginfo("Fused master voxel grid is ready.")
         rospy.set_param("/alpaca/runtime_ready",True)
         if rospy.get_param("~wait_for_start",False):
             rospy.loginfo("Adapter streaming; waiting for launcher authorization after armed OFFBOARD.")

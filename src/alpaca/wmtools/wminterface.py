@@ -5,11 +5,11 @@ from typing import TYPE_CHECKING
 from ..dataclasses import FCExecute,FCReturn
 
 if TYPE_CHECKING:
-    from ..worldmodel import ObjectWorldModel
+    from ..worldmodel import WorldModel
 
 
 class WorldModelInterface():
-    def __init__(self,world_model:ObjectWorldModel,wmname:str):
+    def __init__(self,world_model:WorldModel,wmname:str):
         self.world_model=world_model
         self.wmname=wmname
 
@@ -23,13 +23,14 @@ class WorldModelInterface():
         }
         return expected_type in actual_type_names
 
-    def execute(self,cmd:FCExecute)->FCReturn:
+    def execute(self,cmd:FCExecute,submodel:str)->FCReturn:
         if not isinstance(cmd.arguments,dict):
             raise ValueError("World model command arguments must be a dictionary.")
 
-        functions=self.world_model.registry.tools
+        model=self.world_model.get(submodel)
+        functions=self.world_model.registry[submodel].tools
         if cmd.function not in [fcn.name for fcn in functions]:
-            raise ValueError(f"{cmd.function} is not valid for world model {self.wmname}.")
+            raise ValueError(f"{cmd.function} is not valid for submodel {submodel!r} in world model {self.wmname}.")
         functionschema=next(fcn for fcn in functions if fcn.name==cmd.function)
 
         for name,specification in functionschema.arguments.items():
@@ -50,9 +51,9 @@ class WorldModelInterface():
             if not self._matches_type(data,expected_type):
                 raise ValueError(f"{name} must be of type {expected_type} for {functionschema.name}.")
 
-        function=getattr(self.world_model,cmd.function,None)
+        function=getattr(model,cmd.function,None)
         if not callable(function):
-            raise ValueError(f"Registered function {cmd.function!r} is not callable on world model {self.wmname}.")
+            raise ValueError(f"Registered function {cmd.function!r} is not callable on submodel {submodel!r} in world model {self.wmname}.")
 
         returned_data=function(**cmd.arguments)
         return FCReturn(function=cmd.function,data=returned_data)

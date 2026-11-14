@@ -1,4 +1,5 @@
 import math
+import rospy
 try:
     from importlib.resources import files
 except ImportError:
@@ -16,6 +17,10 @@ class Navigate(Tool):
         self.vainterface=vainterface
         self.risk=risk
         self.redirects_left=3
+        self.replans=10
+        self.frustration=0
+        self.risk_bypass_distance=0.10 # Horizontal metres; 0 disables the bypass.
+        self.vantage_tolerance=0.05
         self.specification=ToolSpecification(
             name="Navigate",
             description=files(__name__.rsplit(".",1)[0]).joinpath("specification.md").read_text(encoding="utf-8"),
@@ -27,56 +32,89 @@ class Navigate(Tool):
             tag="action",
         )
 
-    def run(self,command:Command)->Return:
-        retryable_markers=("move_base returned an empty path","target footprint intersects","path contains excessive obstacles","route requires more information","no vantage points","expected value greater than cost","navigation failed with action status 4","navigation timed out")
+    def run(self,command:Command,scan_budget=None,completed_views=None,arrival_tolerance=None)->Return:
+        scan_budget=[1] if scan_budget is None else scan_budget
+        completed_views=[] if completed_views is None else completed_views
+        replans_left=self.replans
+        retryable_markers=("move_base returned an empty path","target footprint intersects","path contains excessive obstacles","path intersects an occupied cluster","route requires more information","no vantage points","expected value greater than cost","navigation failed with action status 4","navigation timed out")
         try:
-            destination_data=command.arguments.get("destination")
-            orientation_data=command.arguments.get("orientation")
-            if not isinstance(destination_data,dict) or not isinstance(orientation_data,dict):
-                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Destination and orientation must be dictionaries."})
-            if set(destination_data)!={"x","y","z"} or set(orientation_data)!={"pitch","yaw","roll"}:
-                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Destination must contain exactly x, y, and z; orientation must contain exactly pitch, yaw, and roll."})
-            goal_values=[destination_data["x"],destination_data["y"],destination_data["z"],orientation_data["roll"],orientation_data["pitch"],orientation_data["yaw"]]
-            if any(not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) for value in goal_values):
-                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Destination and orientation values must be finite numbers."})
-            frame_id=command.arguments.get("frame_id")
-            if frame_id is None:
-                frame_id=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
-            if not isinstance(frame_id,str) or not frame_id.strip():
-                return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"frame_id must be a non-empty string."})
-            destination=va.Position(x=float(destination_data["x"]),y=float(destination_data["y"]),z=float(destination_data["z"]))
-            orientation=va.Orientation(pitch=float(orientation_data["pitch"]),yaw=float(orientation_data["yaw"]),roll=float(orientation_data["roll"]))
-            self.vainterface.execute(FCExecute(function="require_navigation_ready",arguments={"action_name":"navigate"}))
-            risk_result=self.risk.checkcmd(command,destination,orientation,frame_id)
-            if risk_result.get("Safe") is not True:
-                reason=risk_result.get("Reason","Command failed the safety check.")
-                if "move_base returned an empty path" in reason:
-                    reason+=" The exact destination is not traversable. If it was copied from a known object's position, use inspect with that object's ID instead; object coordinates describe occupied geometry, not a safe waypoint."
-                best_vantage=risk_result.get("Best Vantage Point")
-                if risk_result.get("Needs Information") is not True or best_vantage is None:
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":reason,"Inform User":risk_result.get("Inform User",False),"Retryable":any(marker in reason.lower() for marker in retryable_markers)})
-                if self.redirects_left<=0:
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Maximum number of vantage-point redirects reached.","Original Reason":reason,"Retryable":True})
-                if not isinstance(best_vantage,dict):
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned an invalid vantage-point record.","Retryable":False})
-                destination_new=best_vantage.get("Position")
-                orientation_new=best_vantage.get("Orientation")
-                if not isinstance(destination_new,va.Position) or not isinstance(orientation_new,va.Orientation):
-                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned invalid vantage-point coordinates.","Retryable":False})
-                cmd_new=Command(f"{command.id}_vantage","navigate",{
-                    "destination":{"x":destination_new.x,"y":destination_new.y,"z":destination_new.z},
-                    "orientation":{"pitch":orientation_new.pitch,"yaw":orientation_new.yaw,"roll":orientation_new.roll},
-                    "frame_id":frame_id,
-                })
-                self.redirects_left-=1
-                try:
-                    result=self.run(cmd_new)
+            fl=True
+            while fl==True:
+                fl=False
+                destination_data=command.arguments.get("destination")
+                orientation_data=command.arguments.get("orientation")
+                if not isinstance(destination_data,dict) or not isinstance(orientation_data,dict):
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Destination and orientation must be dictionaries."})
+                if set(destination_data)!={"x","y","z"} or set(orientation_data)!={"pitch","yaw","roll"}:
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Destination must contain exactly x, y, and z; orientation must contain exactly pitch, yaw, and roll."})
+                goal_values=[destination_data["x"],destination_data["y"],destination_data["z"],orientation_data["roll"],orientation_data["pitch"],orientation_data["yaw"]]
+                if any(not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) for value in goal_values):
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"Destination and orientation values must be finite numbers."})
+                frame_id=command.arguments.get("frame_id")
+                if frame_id is None:
+                    frame_id=self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data
+                if not isinstance(frame_id,str) or not frame_id.strip():
+                    return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"frame_id must be a non-empty string."})
+                destination=va.Position(x=float(destination_data["x"]),y=float(destination_data["y"]),z=float(destination_data["z"]))
+                orientation=va.Orientation(pitch=float(orientation_data["pitch"]),yaw=float(orientation_data["yaw"]),roll=float(orientation_data["roll"]))
+                self.vainterface.execute(FCExecute(function="require_navigation_ready",arguments={"action_name":"navigate"}))
+                position=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data.data["position"]
+                if frame_id==self.vainterface.execute(FCExecute(function="get_navigation_frame",arguments={})).data and math.hypot(destination.x-position.x,destination.y-position.y)<self.risk_bypass_distance:
+                    path=self.vainterface.execute(FCExecute(function="plan_path",arguments={"destination":destination,"orientation":orientation,"frame_id":frame_id})).data
+                    self.vainterface.execute(FCExecute(function="navigate",arguments={"destination":destination,"orientation":orientation,"frame_id":frame_id,"path":path,"arrival_tolerance":arrival_tolerance}))
+                    continue
+                risk_result=self.risk.checkcmd(command,destination,orientation,frame_id,allow_scan=scan_budget[0]>0,completed_views=completed_views)
+                if risk_result.get("Safe") is not True:
+                    reason=risk_result.get("Reason","Command failed the safety check.")
+                    if "move_base returned an empty path" in reason:
+                        reason+=" The exact destination is not traversable. If it was copied from a known object's position, use inspect with that object's ID instead; object coordinates describe occupied geometry, not a safe waypoint."
+                    best_vantage=risk_result.get("Best Vantage Point")
+                    if risk_result.get("Needs Replan")==True:
+                        if replans_left<=0:
+                            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Maximum number of route replans reached.","Original Reason":reason,"Retryable":False})
+                        self.vainterface.execute(FCExecute("send_occ",{"voxels":risk_result.get("Blocked Clusters")}))
+                        fl=True
+                        replans_left-=1
+                        continue
+                    if risk_result.get("Needs Scan") is True and scan_budget[0]>0:
+                        scan_command=Command(f"{command.id}_coverage","scan",{})
+                        scan_check=self.risk.checkcmd(scan_command)
+                        if scan_check.get("Safe") is not True:
+                            return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Camera coverage scan failed the safety check.","Scan Reason":scan_check.get("Reason"),"Retryable":False})
+                        scan_budget[0]-=1
+                        rospy.loginfo("Navigation camera coverage: %d unknown route voxels lack camera observations; scanning once before reassessment.",risk_result.get("Missing Camera Voxels",0))
+                        self.vainterface.execute(FCExecute(function="scan",arguments={}))
+                        rospy.loginfo("Navigation camera coverage scan completed; reassessing the route.")
+                        fl=True
+                        continue
+                    if risk_result.get("Needs Information") is not True or best_vantage is None:
+                        return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":reason,"Inform User":risk_result.get("Inform User",False),"Retryable":any(marker in reason.lower() for marker in retryable_markers)})
+                    if self.redirects_left<=0:
+                        return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Maximum recursive vantage-point depth reached.","Original Reason":reason,"Retryable":True})
+                    if not isinstance(best_vantage,dict):
+                        return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned an invalid vantage-point record.","Retryable":False})
+                    destination_new=best_vantage.get("Position")
+                    orientation_new=best_vantage.get("Orientation")
+                    if not isinstance(destination_new,va.Position) or not isinstance(orientation_new,va.Orientation):
+                        return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":"The risk model returned invalid vantage-point coordinates.","Retryable":False})
+                    cmd_new=Command(f"{command.id}_vantage","navigate",{
+                        "destination":{"x":destination_new.x,"y":destination_new.y,"z":destination_new.z},
+                        "orientation":{"pitch":orientation_new.pitch,"yaw":orientation_new.yaw,"roll":orientation_new.roll},
+                        "frame_id":frame_id,
+                    })
+                    self.redirects_left-=1
+                    try:
+                        result=self.run(cmd_new,scan_budget,completed_views,self.vantage_tolerance)
+                    finally:
+                        self.redirects_left+=1
                     if result.status!="Success":
                         return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Reason":"Unable to navigate to a safe vantage point.","Original Reason":reason,"Vantage Result":result.results,"Retryable":result.results.get("Retryable") is True})
-                    return self.run(command)
-                finally:
-                    self.redirects_left+=1
-            self.vainterface.execute(FCExecute(function="navigate",arguments={"destination":destination,"orientation":orientation,"frame_id":frame_id}))
+                    arrival=self.vainterface.execute(FCExecute(function="get_state",arguments={})).data.data
+                    completed_views.extend([(destination_new,orientation_new.yaw),(arrival["position"],arrival["orientation"].yaw)])
+                    fl=True
+                    continue
+                self.risk.frustration+=1
+                self.vainterface.execute(FCExecute(function="navigate",arguments={"destination":destination,"orientation":orientation,"frame_id":frame_id,"path":risk_result["Prediction"].path,"arrival_tolerance":arrival_tolerance}))
         except va.NavigationReadinessError as error:
             return Return(id=command.id,command_type=command.command_type,status="Failed",results={"Error":str(error),"Category":"navigation_not_ready","Retryable":False})
         except Exception as error:

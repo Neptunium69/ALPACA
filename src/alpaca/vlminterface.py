@@ -23,6 +23,7 @@ class VLMInterface():
         self.model_name="qwen3-vl:4b-instruct-q4_K_M"
         self.ollama_url="http://127.0.0.1:11434"
         self.request_timeout=600.0
+        self.context_size=int(os.environ.get("ALPACA_VLM_CONTEXT","16384"))
         self.system_prompt_master=system_prompt_master
         self.toolexe=toolexe
         self.user_reply=None
@@ -53,6 +54,9 @@ class VLMInterface():
     def _load_model(self):
         version=self._request_json("/api/version",method="GET",timeout=5.0)
         self._request_json("/api/show",payload={"model":self.model_name},timeout=30.0)
+        response=self._request_json("/api/chat",payload={"model":self.model_name,"messages":[{"role":"user","content":"Reply OK."}],"stream":False,"keep_alive":"30m","options":{"num_ctx":self.context_size,"num_predict":1,"temperature":0.0}})
+        if response.get("done") is not True or not isinstance(response.get("message",{}).get("content"),str):
+            raise RuntimeError("VLM startup inference did not complete successfully.")
         rospy.loginfo("Connected to Ollama %s using model %s",version.get("version","unknown"),self.model_name)
 
     def step(self):
@@ -134,7 +138,7 @@ class VLMInterface():
             "stream":False,
             "keep_alive":"30m",
             "options":{
-                "num_ctx":8192,
+                "num_ctx":self.context_size,
                 "num_predict":max_tok,
                 "temperature":0.0,
                 "seed":0,

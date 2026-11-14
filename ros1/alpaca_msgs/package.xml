@@ -5,7 +5,7 @@
   <description>ROS 1 message definitions for timestamped ALPACA perception observations.</description>
 
   <maintainer email="HP@todo.todo">HP</maintainer>
-  <license>TODO</license>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>catkin</buildtool_depend>
   <build_depend>message_generation</build_depend>
