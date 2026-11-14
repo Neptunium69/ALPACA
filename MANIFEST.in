@@ -1,0 +1,10 @@
+include LICENSE README.md install.py requirements-ros.txt
+recursive-include src/alpaca *.py specification.md
+recursive-include src/alpaca/resources *.txt
+recursive-include src/cria *.py
+recursive-include ros1/alpaca_msgs *.xml *.txt *.msg
+prune src/alpaca/legacy
+prune examples
+prune testing
+prune tests
+global-exclude __pycache__ *.py[cod]

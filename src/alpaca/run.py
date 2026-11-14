@@ -1,4 +1,7 @@
-from ..cria import cria_vlminterface as vlminterface
+if __package__ == "alpaca":
+    from cria import cria_vlminterface as vlminterface
+else:
+    from ..cria import cria_vlminterface as vlminterface
 from . import worldmodel
 from . import userinterface
 from . import vehicleadapter
@@ -20,6 +23,7 @@ from .wmtools import WorldModelInterface
 
 import rospy
 from pathlib import Path
+from importlib.resources import files
 from dataclasses import asdict
 import json
 import math
@@ -32,15 +36,18 @@ from mavros_msgs.srv import CommandBool
 from alpaca_msgs.msg import ObservationFrame,SpatialObservationFrame
 
 # Prompts and stuff
-prompt_path=Path(__file__).resolve().parents[2]/"system_prompt_master.txt"
-system_prompt_master=prompt_path.read_text(encoding="utf-8").strip()
+prompt_path=Path(os.environ.get("ALPACA_SYSTEM_PROMPT",Path(__file__).resolve().parents[2]/"system_prompt_master.txt"))
+if "ALPACA_SYSTEM_PROMPT" in os.environ or prompt_path.is_file():
+    system_prompt_master=prompt_path.read_text(encoding="utf-8").strip()
+else:
+    system_prompt_master=files(__package__).joinpath("resources/mission_prompt.txt").read_text(encoding="utf-8").strip()
 system_prompt_think="\nEnter PLANNING MODE. Think of a plan of what you should do next but don't write commands yet."
 system_prompt_act="\nEnter ACTION MODE. Return exactly one raw JSON object following the command format for the next step. Your first character must be { and your last character must be }. Never wrap the JSON in Markdown, backticks, or code fences; never add a json language label, explanation, or other text outside the object. ALPACA parses the entire response as JSON and rejects wrappers. Check the response boundaries before sending."
 user_prompt="Find the apple behind the board."
 # user_prompt="Survey the accessible forest with the UGV and inspect standing trees for basal and root damage. Use the tree class to locate trees, including trees with no visible damage, and inspect their trunk bases and visible roots from safe viewpoints. Look for basal_damage and root_damage near each tree; a tree may have neither, either, or both damage classes. Associate each damage observation with a tree using visual evidence and world-model positions, and flag uncertain associations. Keep clear of trunks, roots, and other obstacles, and avoid repeatedly inspecting the same tree. Send me the IDs and locations of damaged trees, the observed damage classes, and supporting images. Do not treat missing detections as proof that a tree is healthy. When the accessible survey is complete or further inspection is blocked, summarize the findings, identify uninspected or uncertain areas, and finish the mission."
 project_root=Path(__file__).resolve().parents[3]
-model_path=str(project_root/"Models"/"Qwen3-VL-4B-Instruct")
-yolo_path="./ALPACA/yolomodel/best.engine"
+model_path=os.environ.get("ALPACA_MODEL_PATH",str(project_root/"Models"/"Qwen3-VL-4B-Instruct"))
+yolo_path=os.environ.get("ALPACA_YOLO_MODEL","./ALPACA/yolomodel/best.engine")
 
 def start_world_model_logging(model:worldmodel.ObjectWorldModel,log_dir:Path):
     log_path=log_dir/"world_model_objects.jsonl"

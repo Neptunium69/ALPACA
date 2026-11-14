@@ -14,3 +14,7 @@ backups
 math.md
 visualization
 certification.py
+build/
+dist/
+*.egg-info/
+.venv/

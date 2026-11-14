@@ -3,8 +3,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..alpaca.vlminterface import VLMInterface
-from ..alpaca.tools import ToolExecutor
+if __package__ == "cria":
+    from alpaca.vlminterface import VLMInterface
+    from alpaca.tools import ToolExecutor
+else:
+    from ..alpaca.vlminterface import VLMInterface
+    from ..alpaca.tools import ToolExecutor
 from .localrillm import DEFAULT_MODEL,VLMReciever
 
 
