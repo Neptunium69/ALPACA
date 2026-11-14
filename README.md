@@ -43,7 +43,7 @@ The active entry point uses `CRIAVLMInterface`. CRIA provides HTTP transport bet
 
 ## Installation
 
-Use Python 3.11 or newer for development installs, plus pip and Git. The v0.3 release supports Python 3.10 or newer. The distribution is named `alpaca-robotics`; import it in Python as `alpaca`. The core installation includes the tool framework and CRIA transport. Add `--rover` for the Python dependencies used by perception and navigation.
+Use Python 3.10 or newer, pip, and Git. The distribution is named `alpaca-robotics`; import it in Python as `alpaca`. The core installation includes the tool framework and CRIA transport. Add `--rover` for the Python dependencies used by perception and navigation.
 
 Download the installer and run it in your chosen Python environment:
 
@@ -212,7 +212,7 @@ install.py                 Latest-release, tag and commit installer
 
 MoC is an experimental effort exploring cognition and memory through PyTorch-based `Cognition` and spatial spiking `Memory` components, coordinated asynchronously. It is under development and is not part of the rover mission loop.
 
-Development packages include MoC and its PyTorch dependency. **MoC is excluded from v0.3.** Prepare the separate release source with `python scripts/prepare_v03_release.py ../ALPACA-v0.3`; build and tag that snapshot rather than the development checkout.
+Development packages include MoC and its PyTorch dependency. **MoC is excluded from v0.3.** Release preparation is maintained on the `dev` branch.
 
 ## Versions and contributions
 
