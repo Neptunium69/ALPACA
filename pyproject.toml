@@ -39,3 +39,10 @@ alpaca = ["resources/*.txt"]
 [tool.setuptools.data-files]
 "share/alpaca_msgs" = ["ros1/alpaca_msgs/package.xml", "ros1/alpaca_msgs/CMakeLists.txt"]
 "share/alpaca_msgs/msg" = ["ros1/alpaca_msgs/msg/*.msg"]
+
+[tool.basedpyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+executionEnvironments = [
+    { root = "src/alpaca/moc", reportUnusedParameter = "none" },
+]

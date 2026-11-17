@@ -4,19 +4,26 @@ from torch import nn
 import asyncio
 
 class Memory(nn.Module):
-    """Spatial SNN with fixed, disjoint input and output groups per cognition."""
+    """Spatial SNN with recurrent edges formed within a fixed Euclidean radius.
 
-    mask: torch.Tensor
+    Positions are trainable in training mode and frozen in evaluation mode.
+    Each step discovers neighbors from the current positions.
+    """
+
     input_mask: torch.Tensor
     voltage: torch.Tensor
     spikes: torch.Tensor
 
-    def __init__(self,high,low,dims,size,device,interval,shape:dict[str,int],name:str) -> None:
+    def __init__(self, high: float, low: float, dims: int, size: int, device, interval: float,shape: dict[str, int], name: str, *, connection_radius: float | None = None,) -> None:
         super().__init__()
         if not math.isfinite(low) or not math.isfinite(high) or high <= low:
             raise ValueError("Position bounds must be finite and high must exceed low.")
         if dims <= 0 or size <= 0:
             raise ValueError("Spatial dimensions and neuron count must be positive.")
+        if connection_radius is None:
+            connection_radius = 0.3 * (high - low)
+        if not math.isfinite(connection_radius) or connection_radius <= 0:
+            raise ValueError("Connection radius must be finite and positive.")
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("Interval must be finite and positive.")
         if any(not isinstance(key, str) or type(width) is not int or width <= 0 for key, width in shape.items()):
@@ -37,38 +44,82 @@ class Memory(nn.Module):
             output_offset += width
 
         self.positions = nn.Parameter(torch.rand(size, dims, device=device) * (high - low) + low)
-        self.weights = nn.Parameter(0.2 * torch.randn(size, size, device=device) / math.sqrt(size))
-        self.register_buffer("mask", 1 - torch.eye(size, device=device))
+        self.weights = nn.Parameter(0.2 * torch.randn(size, device=device) / math.sqrt(size))
+        self.receive_weights = nn.Parameter(torch.ones(size, device=device))
         self.register_buffer("input_mask", torch.arange(size, device=device) < port_size)
         self.register_buffer("voltage", tensor=torch.zeros(size, device=device), persistent=False)
         self.register_buffer("spikes", torch.zeros(size, device=device), persistent=False)
 
         self.tau = 0.020
         self.threshold = 1.0
-        self.sigma = 0.3 * (high - low)
+        self.connection_radius = connection_radius
         self.interval=interval
         self.entry:dict[str,torch.Tensor]={}
         self.y:dict[str,torch.Tensor]={key:self.voltage.new_zeros(width) for key, width in self.shape.items()}
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.positions.requires_grad_(mode)
+        if not mode:
+            self.positions.grad = None
+        return self
+
+    @torch.no_grad()
+    def _neighbor_pairs(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sweep the widest axis, then test candidate pairs in bounded batches."""
+        extent = positions.amax(dim=0) - positions.amin(dim=0)
+        axis = int(extent.argmax().item())
+        coordinates, order = positions[:, axis].sort()
+        rows = torch.arange(positions.size(0), device=positions.device)
+        ends = torch.searchsorted(coordinates, coordinates + self.connection_radius, right=True)
+        counts = ends - rows - 1
+        offsets = counts.cumsum(dim=0)
+        starts = offsets - counts
+
+        sources: list[torch.Tensor] = []
+        targets: list[torch.Tensor] = []
+        batch_size = 65536
+        candidate_count = int(offsets[-1].item())
+        for start in range(0, candidate_count, batch_size):
+            candidates = torch.arange(start, min(start + batch_size, candidate_count), device=positions.device)
+            row = torch.searchsorted(offsets, candidates, right=True)
+            col = row + 1 + candidates - starts[row]
+            source, target = order[row], order[col]
+            delta = (positions[source] - positions[target]) / self.connection_radius
+            connected = delta.square().sum(dim=-1) <= 1
+            sources.append(source[connected])
+            targets.append(target[connected])
+        if not sources:
+            return order[:0], order[:0]
+        return torch.cat(sources), torch.cat(targets)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs,) -> None:
+        # Approximate legacy per-edge weights by averaging each neuron's outgoing edges.
+        weights = state_dict.get(prefix + "weights")
+        positions = state_dict.get(prefix + "positions")
+        size = self.positions.size(0)
+        if (weights is not None and weights.shape == (size, size)and positions is not None and positions.shape == self.positions.shape):
+            source, target = self._neighbor_pairs(positions)
+            first = torch.cat((source, target)).to(weights.device)
+            second = torch.cat((target, source)).to(weights.device)
+            outgoing = weights[second, first]
+            sums = weights.new_zeros(size).index_add_(0, first, outgoing)
+            counts = weights.new_zeros(size).index_add_(0, first, torch.ones_like(outgoing)).clamp_min(1)
+            state_dict[prefix + "weights"] = sums / counts
+            state_dict[prefix + "receive_weights"] = weights.new_ones(size)
+            state_dict.pop(prefix + "mask", None)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
     def step(self, inputs: torch.Tensor, dt: float = 0.001) -> None:
-        """Publish firing neurons' pre-reset voltages in ``y``; silent outputs are zero.
+        source, target = self._neighbor_pairs(self.positions)
+        delta = (self.positions[source] - self.positions[target]) / self.connection_radius
+        proximity = torch.exp(-0.5 * delta.square().sum(dim=-1))
+        outgoing = self.spikes * self.weights
+        recurrent = torch.zeros_like(self.voltage)
+        recurrent.index_add_(0, target, proximity * outgoing[source])
+        recurrent.index_add_(0, source, proximity * outgoing[target])
+        recurrent = recurrent * self.receive_weights
 
-        ``inputs`` has one slot per neuron, but external stimulation is applied
-        only to the designated input groups. ``dt`` is simulated time in seconds.
-        """
-        if not math.isfinite(dt) or dt <= 0:
-            raise ValueError("dt must be finite and positive.")
-        if inputs.shape != self.voltage.shape:
-            raise ValueError("inputs must contain one stimulation value per neuron.")
-        if inputs.device != self.voltage.device or inputs.dtype != self.voltage.dtype:
-            raise ValueError("inputs must match the network's device and dtype.")
-
-        delta = self.positions[:, None, :] - self.positions[None, :, :]
-        distance_sq = delta.square().sum(dim=-1)
-        proximity = torch.exp(-distance_sq / (2 * self.sigma**2))
-        connections = self.weights * proximity * self.mask
-
-        recurrent = connections @ self.spikes
         decay = math.exp(-dt / self.tau)
         voltage = decay * self.voltage + (1 - decay) * (inputs * self.input_mask + recurrent)
 
@@ -81,19 +132,11 @@ class Memory(nn.Module):
         self.y = {key:fired_voltage[indices] for key, indices in self.output_slices.items()}
 
     def _fuse(self,X:dict[str,torch.Tensor])->torch.Tensor:
-        """Map named inputs to fixed neuron slots; missing inputs supply zero drive."""
-        unknown = X.keys() - self.shape.keys()
-        if unknown:
-            raise ValueError(f"Unknown input cognitions: {sorted(unknown)}")
         fused = torch.zeros_like(self.voltage)
         for key, indices in self.input_slices.items():
             if key not in X:
                 continue
             data = X[key]
-            if data.shape != (self.shape[key],):
-                raise ValueError(f"Input {key!r} must have shape ({self.shape[key]},).")
-            if data.device != self.voltage.device or data.dtype != self.voltage.dtype:
-                raise ValueError(f"Input {key!r} must match the network's device and dtype.")
             fused[indices] = data
         return fused
 
