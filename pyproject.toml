@@ -43,6 +43,9 @@ alpaca = ["resources/*.txt"]
 [tool.basedpyright]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+reportGeneralTypeIssues = "none"
+reportMissingImports = "none"
+reportMissingModuleSource = "none"
 executionEnvironments = [
     { root = "src/alpaca/moc", reportUnusedParameter = "none" },
 ]

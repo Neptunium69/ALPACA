@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 import torch
 from torch import nn
 import asyncio
@@ -26,27 +27,11 @@ class Memory(nn.Module):
             raise ValueError("Connection radius must be finite and positive.")
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("Interval must be finite and positive.")
-        if any(not isinstance(key, str) or type(width) is not int or width <= 0 for key, width in shape.items()):
-            raise ValueError("shape must map cognition names to positive integer widths.")
-        port_size = sum(shape.values())
-        if 2 * port_size > size:
-            raise ValueError(f"Separate input and output groups require at least {2 * port_size} neurons.")
-
         self.name=name
-        self.shape:dict[str,int]=shape.copy()
-        self.input_slices:dict[str,slice]={}
-        self.output_slices:dict[str,slice]={}
-        input_offset, output_offset = 0, size - port_size
-        for key, width in self.shape.items():
-            self.input_slices[key] = slice(input_offset, input_offset + width)
-            self.output_slices[key] = slice(output_offset, output_offset + width)
-            input_offset += width
-            output_offset += width
-
         self.positions = nn.Parameter(torch.rand(size, dims, device=device) * (high - low) + low)
         self.weights = nn.Parameter(0.2 * torch.randn(size, device=device) / math.sqrt(size))
         self.receive_weights = nn.Parameter(torch.ones(size, device=device))
-        self.register_buffer("input_mask", torch.arange(size, device=device) < port_size)
+        self.register_buffer("input_mask", torch.empty(size, dtype=torch.bool, device=device))
         self.register_buffer("voltage", tensor=torch.zeros(size, device=device), persistent=False)
         self.register_buffer("spikes", torch.zeros(size, device=device), persistent=False)
 
@@ -55,7 +40,28 @@ class Memory(nn.Module):
         self.connection_radius = connection_radius
         self.interval=interval
         self.entry:dict[str,torch.Tensor]={}
-        self.y:dict[str,torch.Tensor]={key:self.voltage.new_zeros(width) for key, width in self.shape.items()}
+        self.set_ports(shape)
+
+    def set_ports(self, shape: dict[str, int]) -> None:
+        """Allocate paired input and output slices while MoC is stopped."""
+        if any(not isinstance(key, str) or type(width) is not int or width <= 0 for key, width in shape.items()):
+            raise ValueError("shape must map cognition names to positive integer widths.")
+        size = self.voltage.numel()
+        port_size = sum(shape.values())
+        if 2 * port_size > size:
+            raise ValueError(f"Separate input and output groups require at least {2 * port_size} neurons.")
+
+        self.shape = shape.copy()
+        self.input_slices: dict[str, slice] = {}
+        self.output_slices: dict[str, slice] = {}
+        input_offset, output_offset = 0, size - port_size
+        for key, width in self.shape.items():
+            self.input_slices[key] = slice(input_offset, input_offset + width)
+            self.output_slices[key] = slice(output_offset, output_offset + width)
+            input_offset += width
+            output_offset += width
+        self.input_mask = torch.arange(size, device=self.voltage.device) < port_size
+        self.y = {key: self.voltage.new_zeros(width) for key, width in self.shape.items()}
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -140,10 +146,12 @@ class Memory(nn.Module):
             fused[indices] = data
         return fused
 
-    async def run(self, stopflag:asyncio.Event):
+    async def run(self, stopflag: asyncio.Event, on_step: Callable[[str], None] | None = None):
         while not stopflag.is_set():
             X=self.entry.copy()
             await asyncio.to_thread(self.step, self._fuse(X))
+            if on_step is not None:
+                on_step(self.name)
             try:
                 await asyncio.wait_for(stopflag.wait(), timeout=self.interval)
             except TimeoutError:
